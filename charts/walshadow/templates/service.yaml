@@ -1,0 +1,22 @@
+# Headless: gives the StatefulSet its network identity and lets Prometheus
+# find the metrics port. The pod serves no other traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "walshadow.fullname" . }}
+  labels:
+    {{- include "walshadow.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "walshadow.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP

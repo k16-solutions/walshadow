@@ -1,0 +1,96 @@
+# Used by .github/workflows/chart.yml to lint and render the chart. One source
+# cluster with one Snowflake tenant, credentials from mounted files.
+image:
+  repository: 123456789012.dkr.ecr.us-east-2.amazonaws.com/walshadow
+  tag: sha-0000000-pg17
+
+config: |
+  [source]
+  host = "source.example.internal"
+  port = 5432
+  user = "walshadow_repl"
+  dbname = "postgres"
+  sslmode = "verify-full"
+  slot = "walshadow_cluster"
+
+  [bootstrap]
+  mode = "direct"
+
+  [tenants]
+  stall_timeout_secs = 300
+  bridge_workers = 2
+  capacity = 64
+
+tenants:
+  acme: |
+    [tenant.acme]
+    dbname = "acme"
+    initial_load = "copy"
+
+    [tenant.acme.destination]
+    kind = "snowflake"
+
+    [tenant.acme.snowflake]
+    account_url = "https://org-acct.snowflakecomputing.com/"
+    user = "WALSHADOW_ACME"
+    role = "WALSHADOW_ACME"
+    warehouse = "WALSHADOW_WH"
+    database = "ACME"
+    ack_after = "apply"
+
+    [tenant.acme.snowflake.auth]
+    method = "jwt"
+    account = "ORG-ACCT"
+    private_key_file = "/run/secrets/walshadow/acme.p8"
+    public_key_fingerprint = "SHA256:AAAA"
+
+    [tenant.acme.snowflake.state]
+    directory = "/var/lib/walshadow/snowflake/acme"
+    max_bytes = 10737418240
+
+    [tenant.acme.snowflake.stage]
+    bucket = "walshadow-stage"
+    prefix = "acme"
+    region = "us-east-2"
+    name = "ACME.WALSHADOW_INTERNAL.WALSHADOW_STAGE"
+
+    [tenant.acme.stream]
+    replicate_all = true
+
+env:
+  - name: WALSHADOW_PG_URL
+    valueFrom:
+      secretKeyRef:
+        name: walshadow-source
+        key: url
+
+secrets:
+  sources:
+    - secret:
+        name: walshadow-acme-snowflake
+        items:
+          - key: private-key
+            path: acme.p8
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/walshadow
+
+persistence:
+  storageClassName: walshadow-gp3
+
+nodeSelector:
+  karpenter.sh/nodepool: walshadow
+tolerations:
+  - key: walshadow.k16.io/dedicated
+    operator: Exists
+    effect: NoSchedule
+
+podAnnotations:
+  karpenter.sh/do-not-disrupt: "true"
+
+metrics:
+  podMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack

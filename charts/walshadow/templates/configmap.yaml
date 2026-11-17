@@ -1,0 +1,20 @@
+{{- include "walshadow.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "walshadow.fullname" . }}
+  labels:
+    {{- include "walshadow.labels" . | nindent 4 }}
+data:
+  # The init container copies these into the writable /etc/walshadow at every
+  # pod start: walshadow.toml as the root config, the rest into walshadow.d/.
+  walshadow.toml: |
+    {{- .Values.config | nindent 4 }}
+  {{- range $id, $spec := .Values.tenants }}
+  60-tenant-{{ $id }}.toml: |
+    {{- $spec | nindent 4 }}
+  {{- end }}
+  {{- range $name, $body := .Values.extraFragments }}
+  {{ $name }}: |
+    {{- $body | nindent 4 }}
+  {{- end }}
