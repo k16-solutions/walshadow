@@ -58,7 +58,8 @@ daemon:
   # In-memory transaction buffer budget in bytes, shared across open
   # transactions. Counts against the memory limit.
   xactBufferMax: 1073741824
-  # Filtered-WAL retention in bytes. Empty keeps the binary's default.
+  # Filtered-WAL retention in bytes. Empty keeps the binary's default; 0
+  # turns trimming off.
   retentionBytes: ""
   # Tokio worker threads. Empty uses one per CPU of the limit.
   workerThreads: ""
@@ -93,6 +94,10 @@ persistence:
   # filtered WAL, the spill directory and manifests, and the Snowflake state.
   # They are only consistent as a set, so they share a volume and a snapshot.
   # Put [snowflake.state] directory under /var/lib/walshadow/snowflake/.
+  #
+  # Fixed at install: Kubernetes won't change a StatefulSet's volume
+  # template, so changing anything here makes helm upgrade fail. To grow the
+  # volume, resize the claim itself (see the chart README, Storage).
   storageClassName: ""
   accessModes:
     - ReadWriteOncePod

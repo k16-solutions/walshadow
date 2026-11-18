@@ -21,7 +21,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only for pull requests: a cancelled run on main could skip publishing a
+  # version that a later push has already moved past.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -37,6 +39,30 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+
+      # main publishes once per version, so a chart change that keeps the
+      # version would merge green and never ship.
+      - name: Chart changes bump the version
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          if ! git cat-file -e "$BASE:$CHART_DIR/Chart.yaml" 2>/dev/null; then
+            echo "No chart on the base branch yet"
+            exit 0
+          fi
+          if git diff --quiet "$BASE" HEAD -- "$CHART_DIR" ":(exclude)$CHART_DIR/ci"; then
+            echo "Chart unchanged"
+            exit 0
+          fi
+          old=$(git show "$BASE:$CHART_DIR/Chart.yaml" | awk '/^version:/ {print $2}')
+          new=$(awk '/^version:/ {print $2}' "$CHART_DIR/Chart.yaml")
+          if [ "$old" = "$new" ]; then
+            echo "::error file=$CHART_DIR/Chart.yaml::The chart changed but version is still $old. Bump it, or main never publishes the change."
+            exit 1
+          fi
+          echo "Version $old -> $new"
 
       - uses: azure/setup-helm@v4
         with:
@@ -92,8 +118,10 @@ jobs:
         id: chart
         run: |
           test -n "$REGISTRY" || { echo "CHART_REGISTRY is not set" >&2; exit 1; }
-          version=$(helm show chart "$CHART_DIR" | awk '$1 == "version:" {print $2}')
-          name=$(helm show chart "$CHART_DIR" | awk '$1 == "name:" {print $2}')
+          # Top-level keys only: dependencies have their own name and version.
+          chart=$(helm show chart "$CHART_DIR")
+          version=$(awk '/^version:/ {print $2}' <<<"$chart")
+          name=$(awk '/^name:/ {print $2}' <<<"$chart")
           region=${REGISTRY#*.dkr.ecr.}
           region=${region%%.*}
           echo "version=$version" >> "$GITHUB_OUTPUT"

@@ -112,6 +112,16 @@ already acknowledged to the source. So:
 
 The volume is pinned to one availability zone, so the pod is too.
 
+The `persistence` values are fixed at install. Kubernetes won't change a
+StatefulSet's volume template, so changing them makes `helm upgrade` fail. To
+grow the volume, leave `persistence.size` alone and resize the claim, which
+works online when the storage class allows expansion:
+
+```bash
+kubectl -n walshadow patch pvc data-walshadow-0 \
+  -p '{"spec":{"resources":{"requests":{"storage":"500Gi"}}}}'
+```
+
 ## Operations
 
 ```bash

@@ -10,7 +10,11 @@ spec:
   # directory corrupt each other.
   replicas: 1
   serviceName: {{ include "walshadow.fullname" . }}
-  podManagementPolicy: OrderedReady
+  # With OrderedReady, an upgrade waits for a pod that never becomes Ready, so
+  # a release that fixes a crash-looping pod never replaces it. Parallel
+  # replaces it. With one replica nothing else changes: the new pod still
+  # starts only after the old one is gone.
+  podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   persistentVolumeClaimRetentionPolicy:
@@ -96,16 +100,17 @@ spec:
             - --walsender-bind=127.0.0.1:5433
             - --metrics-bind=0.0.0.0:{{ .Values.metrics.port }}
             - --control-socket={{ include "walshadow.controlSocket" . }}
-            - --status-interval={{ .Values.daemon.statusInterval }}
-            - --xact-buffer-max={{ int64 .Values.daemon.xactBufferMax }}
+            - --status-interval={{ include "walshadow.uint" (list .Values.daemon.statusInterval "daemon.statusInterval") }}
+            - --xact-buffer-max={{ include "walshadow.uint" (list .Values.daemon.xactBufferMax "daemon.xactBufferMax") }}
             {{- with .Values.daemon.bootstrapMode }}
             - --bootstrap-mode={{ . }}
             {{- end }}
-            {{- with .Values.daemon.retentionBytes }}
-            - --retention-bytes={{ int64 . }}
+            {{- /* 0 is meaningful here (it turns trimming off), so only "" means unset. */}}
+            {{- if ne (toString .Values.daemon.retentionBytes) "" }}
+            - --retention-bytes={{ include "walshadow.uint" (list .Values.daemon.retentionBytes "daemon.retentionBytes") }}
             {{- end }}
             {{- with .Values.daemon.workerThreads }}
-            - --worker-threads={{ int64 . }}
+            - --worker-threads={{ include "walshadow.uint" (list . "daemon.workerThreads") }}
             {{- end }}
             {{- range .Values.daemon.extraArgs }}
             - {{ . | quote }}
