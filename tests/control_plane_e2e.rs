@@ -1031,51 +1031,20 @@ async fn ctl_introspects_source_catalog() {
             &["id integer not null", "v text"],
         )?;
 
-        // Reload only learns which databases are followed once the session
-        // wires its resolvers, after bootstrap lands
+        // Replicating another database takes a tenant (multi_tenant_e2e), so
+        // here it is only read: unselected
+        ensure_lines(
+            "tables other",
+            &h.ctl(&["tables", "app", "--database", "other"])?,
+            &["app t no row key"],
+        )?;
+
+        // Reloads below run once bootstrap has landed
         h.wait_log(
             "parallel decode+insert pipeline starting",
             Duration::from_secs(30),
         )
         .await?;
-        let added = h.ctl(&[
-            "add",
-            "app",
-            "t",
-            "--database",
-            "other",
-            "--initial-load",
-            "none",
-        ])?;
-        ensure!(
-            added == "config names other this process does not follow; restart to replicate",
-            "add other: {added}"
-        );
-        ensure_lines(
-            "tables other",
-            &h.ctl(&["tables", "app", "--database", "other"])?,
-            &["* app t no row key"],
-        )?;
-        let status: toml::Table = h.ctl(&["status"])?.parse()?;
-        let other: Vec<&str> = status
-            .get("databases")
-            .and_then(toml::Value::as_array)
-            .context("no databases in status")?
-            .iter()
-            .filter(|db| db.get("dbname").and_then(toml::Value::as_str) == Some("other"))
-            .filter_map(|db| db.get("tables").and_then(toml::Value::as_array))
-            .flatten()
-            .filter_map(|t| t.get("source_table").and_then(toml::Value::as_str))
-            .collect();
-        ensure!(other == ["other.app.t"], "status other tables: {status}");
-
-        h.sighup()?;
-        h.wait_log(
-            "config names databases this process does not follow",
-            Duration::from_secs(10),
-        )
-        .await?;
-        h.ctl(&["remove", "app", "t", "--database", "other"])?;
 
         let show: toml::Table = h.ctl(&["show"])?.parse()?;
         let replicate_all = show
