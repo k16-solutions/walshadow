@@ -1,0 +1,230 @@
+{{- $data := include "walshadow.dataDir" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "walshadow.fullname" . }}
+  labels:
+    {{- include "walshadow.labels" . | nindent 4 }}
+spec:
+  # Never more than one: two daemons on one slot, destination or state
+  # directory corrupt each other.
+  replicas: 1
+  serviceName: {{ include "walshadow.fullname" . }}
+  # With OrderedReady, an upgrade waits for a pod that never becomes Ready, so
+  # a release that fixes a crash-looping pod never replaces it. Parallel
+  # replaces it. With one replica nothing else changes: the new pod still
+  # starts only after the old one is gone.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  persistentVolumeClaimRetentionPolicy:
+    {{- toYaml .Values.persistence.retentionPolicy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "walshadow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "walshadow.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Config fragments are copied at pod start, so a config change rolls
+        # the pod. It drains first, within terminationGracePeriodSeconds.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "walshadow.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # Prepares what the image's entrypoint would: state directories, the
+        # shadow data directory's 0700 mode (PostgreSQL refuses anything looser,
+        # and fsGroup can loosen it), and a writable copy of the config so `ctl`
+        # can write fragments next to it.
+        - name: prepare
+          image: {{ include "walshadow.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              mkdir -p {{ $data }}/shadow-data {{ $data }}/out {{ $data }}/spill
+              chmod 700 {{ $data }}/shadow-data
+              cp -L /etc/walshadow-chart/walshadow.toml {{ include "walshadow.configPath" . }}
+              mkdir -p {{ include "walshadow.fragmentDir" . }}
+              for f in /etc/walshadow-chart/*.toml; do
+                [ "${f##*/}" = walshadow.toml ] && continue
+                cp -L "$f" {{ include "walshadow.fragmentDir" . }}/
+              done
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.initContainer.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $data }}
+            - name: config
+              mountPath: /etc/walshadow
+            - name: config-source
+              mountPath: /etc/walshadow-chart
+              readOnly: true
+      containers:
+        - name: walshadow
+          image: {{ include "walshadow.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Runs the daemon directly rather than through docker/entrypoint.sh,
+          # which forces --bootstrap-mode direct and ClickHouse-era paths.
+          command:
+            - walshadow-stream
+          args:
+            - --config={{ include "walshadow.configPath" . }}
+            - --out-dir={{ $data }}/out
+            - --spill-dir={{ $data }}/spill
+            - --bootstrap-shadow-data-dir={{ $data }}/shadow-data
+            - --shadow-socket-dir=/run/postgresql
+            # The shadow's sender trusts its client and has no TLS: loopback only.
+            - --walsender-bind=127.0.0.1:5433
+            - --metrics-bind=0.0.0.0:{{ .Values.metrics.port }}
+            - --control-socket={{ include "walshadow.controlSocket" . }}
+            - --status-interval={{ include "walshadow.uint" (list .Values.daemon.statusInterval "daemon.statusInterval") }}
+            - --xact-buffer-max={{ include "walshadow.uint" (list .Values.daemon.xactBufferMax "daemon.xactBufferMax") }}
+            {{- with .Values.daemon.bootstrapMode }}
+            - --bootstrap-mode={{ . }}
+            {{- end }}
+            {{- /* 0 is meaningful here (it turns trimming off), so only "" means unset. */}}
+            {{- if ne (toString .Values.daemon.retentionBytes) "" }}
+            - --retention-bytes={{ include "walshadow.uint" (list .Values.daemon.retentionBytes "daemon.retentionBytes") }}
+            {{- end }}
+            {{- with .Values.daemon.workerThreads }}
+            - --worker-threads={{ include "walshadow.uint" (list . "daemon.workerThreads") }}
+            {{- end }}
+            {{- range .Values.daemon.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            # Lets `kubectl exec ... walshadow-stream ctl ...` find the daemon.
+            - name: WALSHADOW_CONTROL_SOCKET
+              value: {{ include "walshadow.controlSocket" . }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- with .Values.probes.startup }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.liveness }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.readiness }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $data }}
+            - name: config
+              mountPath: /etc/walshadow
+            - name: pg-socket
+              mountPath: /run/postgresql
+            - name: control
+              mountPath: /run/walshadow
+            - name: tmp
+              mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm
+            {{- if .Values.secrets.sources }}
+            - name: secrets
+              mountPath: /run/secrets/walshadow
+              readOnly: true
+            {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config-source
+          configMap:
+            name: {{ include "walshadow.fullname" . }}
+        - name: config
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: pg-socket
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: control
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shm.sizeLimit }}
+        {{- with .Values.secrets.sources }}
+        - name: secrets
+          projected:
+            defaultMode: {{ $.Values.secrets.defaultMode }}
+            sources:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "walshadow.selectorLabels" . | nindent 10 }}
+          {{- with .Values.persistence.labels }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

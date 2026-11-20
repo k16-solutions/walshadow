@@ -1,0 +1,22 @@
+apiVersion: v2
+name: walshadow
+description: >-
+  walshadow-stream for one source PostgreSQL cluster: a single-replica
+  StatefulSet running the daemon and its managed shadow PostgreSQL, with all
+  durable state on one persistent volume.
+type: application
+# Bump on every chart change. CI publishes each new version once; a version
+# that already exists in the registry is never overwritten.
+version: 0.1.0
+appVersion: "0.1.7"
+# ReadWriteOncePod is GA from 1.29
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/k16-solutions/walshadow
+sources:
+  - https://github.com/k16-solutions/walshadow
+keywords:
+  - postgresql
+  - wal
+  - cdc
+  - snowflake
+  - clickhouse

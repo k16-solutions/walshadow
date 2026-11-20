@@ -1,0 +1,152 @@
+name: Chart
+
+# Lints and renders charts/walshadow on pull requests. On main, publishes the
+# chart to ECR as an OCI artifact, once per Chart.yaml version.
+#
+# Repository variables:
+#   CHART_REGISTRY          ECR registry host, eg 123456789012.dkr.ecr.us-east-2.amazonaws.com
+#   CHART_PUBLISH_ROLE_ARN  IAM role GitHub OIDC assumes to push to <registry>/charts/walshadow
+
+on:
+  pull_request:
+    paths:
+      - charts/**
+      - .github/workflows/chart.yml
+  push:
+    branches: [main]
+    paths:
+      - charts/**
+      - .github/workflows/chart.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only for pull requests: a cancelled run on main could skip publishing a
+  # version that a later push has already moved past.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CHART_DIR: charts/walshadow
+  HELM_VERSION: v3.17.3
+  KUBECONFORM_VERSION: v0.6.7
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # main publishes once per version, so a chart change that keeps the
+      # version would merge green and never ship.
+      - name: Chart changes bump the version
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          if ! git cat-file -e "$BASE:$CHART_DIR/Chart.yaml" 2>/dev/null; then
+            echo "No chart on the base branch yet"
+            exit 0
+          fi
+          if git diff --quiet "$BASE" HEAD -- "$CHART_DIR" ":(exclude)$CHART_DIR/ci"; then
+            echo "Chart unchanged"
+            exit 0
+          fi
+          old=$(git show "$BASE:$CHART_DIR/Chart.yaml" | awk '/^version:/ {print $2}')
+          new=$(awk '/^version:/ {print $2}' "$CHART_DIR/Chart.yaml")
+          if [ "$old" = "$new" ]; then
+            echo "::error file=$CHART_DIR/Chart.yaml::The chart changed but version is still $old. Bump it, or main never publishes the change."
+            exit 1
+          fi
+          echo "Version $old -> $new"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /usr/local/bin kubeconform
+
+      - name: Lint
+        run: |
+          for values in "$CHART_DIR"/ci/*-values.yaml; do
+            helm lint --strict "$CHART_DIR" -f "$values"
+          done
+
+      - name: Validate rendered manifests
+        run: |
+          for values in "$CHART_DIR"/ci/*-values.yaml; do
+            echo "::group::$values"
+            helm template walshadow "$CHART_DIR" --namespace walshadow -f "$values" \
+              | kubeconform -strict -summary \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+      - name: Required values are enforced
+        run: |
+          if helm template walshadow "$CHART_DIR" >/dev/null 2>&1; then
+            echo "rendering with no values should fail" >&2
+            exit 1
+          fi
+
+  publish:
+    needs: lint
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGISTRY: ${{ vars.CHART_REGISTRY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Read chart version
+        id: chart
+        run: |
+          test -n "$REGISTRY" || { echo "CHART_REGISTRY is not set" >&2; exit 1; }
+          # Top-level keys only: dependencies have their own name and version.
+          chart=$(helm show chart "$CHART_DIR")
+          version=$(awk '/^version:/ {print $2}' <<<"$chart")
+          name=$(awk '/^name:/ {print $2}' <<<"$chart")
+          region=${REGISTRY#*.dkr.ecr.}
+          region=${region%%.*}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CHART_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ steps.chart.outputs.region }}
+
+      - name: Push unless this version exists
+        env:
+          VERSION: ${{ steps.chart.outputs.version }}
+          NAME: ${{ steps.chart.outputs.name }}
+        run: |
+          if out=$(aws ecr describe-images --repository-name "charts/$NAME" \
+                --image-ids "imageTag=$VERSION" 2>&1); then
+            echo "charts/$NAME:$VERSION is already published; bump version in Chart.yaml to publish"
+            exit 0
+          elif ! grep -q ImageNotFoundException <<<"$out"; then
+            echo "$out" >&2
+            exit 1
+          fi
+          aws ecr get-login-password | helm registry login --username AWS --password-stdin "$REGISTRY"
+          helm package "$CHART_DIR" --destination dist
+          helm push "dist/$NAME-$VERSION.tgz" "oci://$REGISTRY/charts"
+          echo "Published oci://$REGISTRY/charts/$NAME:$VERSION" >> "$GITHUB_STEP_SUMMARY"
