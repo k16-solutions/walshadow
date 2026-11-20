@@ -95,24 +95,17 @@ enum CtlCommand {
         database: Option<String>,
     },
     /// Start replicating one table
+    ///
+    /// A table in another database belongs to that database's tenant: name it
+    /// with `--tenant`
     Add {
         schema: String,
         table: String,
         #[arg(long, value_enum)]
         initial_load: Option<InitialLoad>,
-        /// Nest under `[database.<dbname>]` to name another source database
-        /// Defaults to `[source] dbname`
-        #[arg(long)]
-        database: Option<String>,
     },
     /// Stop replicating one table, retain ClickHouse table
-    Remove {
-        schema: String,
-        table: String,
-        /// Name another source database, see `add --database`
-        #[arg(long)]
-        database: Option<String>,
-    },
+    Remove { schema: String, table: String },
     /// Freeze WAL consumption
     Pause,
     /// Resume WAL consumption
@@ -227,27 +220,16 @@ impl CtlCommand {
                 schema,
                 table,
                 initial_load,
-                database,
             } => {
                 let mut block = pair("replicate", true.into());
                 if let Some(mode) = initial_load {
                     block.insert("initial_load".into(), mode.as_str().into());
                 }
-                Ok(sugar(
-                    "apply",
-                    table_block(database.as_deref(), &schema, &table, block),
-                ))
+                Ok(sugar("apply", table_block(&schema, &table, block)))
             }
-            Self::Remove {
-                schema,
-                table,
-                database,
-            } => {
+            Self::Remove { schema, table } => {
                 let block = pair("replicate", false.into());
-                Ok(sugar(
-                    "apply",
-                    table_block(database.as_deref(), &schema, &table, block),
-                ))
+                Ok(sugar("apply", table_block(&schema, &table, block)))
             }
             Self::Source { url } => Ok(sugar(
                 "apply",
@@ -517,13 +499,9 @@ fn db_body(db: Option<&str>) -> Table {
     body
 }
 
-/// Keep database, schema, and table names as separate TOML keys
-fn table_block(db: Option<&str>, ns: &str, rel: &str, block: Table) -> Table {
-    let scoped = section("table", section(ns, pair(rel, Value::Table(block))));
-    let Some(db) = db else {
-        return scoped;
-    };
-    section("database", section(db, scoped))
+/// Keep schema and table names as separate TOML keys
+fn table_block(ns: &str, rel: &str, block: Table) -> Table {
+    section("table", section(ns, pair(rel, Value::Table(block))))
 }
 
 #[cfg(test)]
@@ -549,19 +527,17 @@ mod tests {
         );
     }
 
-    /// Nest entries under `[database.<dbname>]` to name another database
+    /// The daemon refuses `[database.<dbname>]` sections, so add and remove
+    /// can't write one; another database's tables go through `--tenant`
     #[test]
-    fn add_can_name_the_source_database() {
-        let c = cmd(&["add", "public", "users", "--database", "app"]);
-        assert_eq!(
-            toml::to_string(&c.body).unwrap(),
-            "[database.app.table.public.users]\nreplicate = true\n"
-        );
-        let c = cmd(&["remove", "public", "users", "--database", "app"]);
-        assert_eq!(
-            toml::to_string(&c.body).unwrap(),
-            "[database.app.table.public.users]\nreplicate = false\n"
-        );
+    fn add_and_remove_take_no_database() {
+        for verb in ["add", "remove"] {
+            let error = err(&[verb, "public", "users", "--database", "app"]);
+            assert!(
+                error.contains("unexpected argument '--database'"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

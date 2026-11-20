@@ -35,9 +35,14 @@ jobs:
           path: walshadow
           submodules: recursive
 
+      # Pinned below 1.100 until cargo-llvm-cov reads Cargo 1.100's build-dir
+      # layout from nextest archives (taiki-e/cargo-llvm-cov#538). On 1.100 the
+      # report silently drops every test binary and coverage falls under the
+      # ceiling. Unpin once a release has that fix.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: llvm-tools-preview
 
       # Test jobs install this exact version, profraw format follows LLVM
