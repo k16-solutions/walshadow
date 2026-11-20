@@ -121,7 +121,9 @@ impl Harness {
         let spill_dir = tmp.path().join("spill");
         fs::create_dir_all(&spill_dir).unwrap();
         let control_socket = tmp.path().join("control.sock");
-        let bin = env!("CARGO_BIN_EXE_walshadow-stream").to_string();
+        // Read at runtime: nextest points this at the binary extracted from its
+        // archive, while env!() would bake in the build job's path
+        let bin = std::env::var("CARGO_BIN_EXE_walshadow-stream").unwrap();
         let pgext_dir = fx::pgext_dir();
         let stderr_path = tmp.path().join("daemon.stderr.log");
         let metrics_addr: SocketAddr = format!("127.0.0.1:{}", ports.metrics).parse().unwrap();
