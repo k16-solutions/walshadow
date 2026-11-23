@@ -1,4 +1,4 @@
-//! HTTP/OpenMetrics metrics surface.
+//! HTTP/OpenMetrics metrics surface, plus the probes an orchestrator needs.
 //!
 //! `/metrics` over plain TCP, encoded by `prometheus-client` as
 //! [OpenMetrics text](https://github.com/prometheus/OpenMetrics/blob/v1.0.0/specification/OpenMetrics.md#text-format):
@@ -11,6 +11,21 @@
 //! Registry is `Arc`-cloneable: daemon's main loop writes at status-tick
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
+//!
+//! Paths, all `GET` or `HEAD`; anything else is 404, or 405 on a known path:
+//!
+//! - `/metrics`: the scrape.
+//! - `/healthz`: liveness, 200 whenever the daemon's runtime answers. A TCP
+//!   check cannot tell that much: the kernel completes the handshake from the
+//!   listen backlog even when the process is wedged. Pipeline progress stays
+//!   out of it on purpose: a long bootstrap, an initial load or a destination
+//!   outage is something to alert on, not to restart over.
+//! - `/readyz`: 200 once bootstrap is done and the session streams, while the
+//!   shadow postmaster is up; 503 naming the first unmet condition otherwise.
+//!   A destination outage leaves it ready. See [`Health`].
+//! - `/status`: the control socket's `status`, as JSON. Off unless the daemon
+//!   hands [`serve`] a control context, because it names databases, tables
+//!   and destinations on an unauthenticated port.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -18,6 +33,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use prometheus_client::collector::Collector;
@@ -670,11 +686,17 @@ db_snapshot! {
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
     inner: Arc<RwLock<MetricsSnapshot>>,
+    health: Arc<Health>,
 }
 
 impl MetricsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Readiness inputs `/readyz` answers from
+    pub fn health(&self) -> &Arc<Health> {
+        &self.health
     }
 
     /// Single writer (status-line loop), so the write lock is uncontended.
@@ -688,6 +710,54 @@ impl MetricsRegistry {
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
         self.inner.read().await.clone()
+    }
+}
+
+/// What `/readyz` answers from. Beside the snapshot rather than in it: the
+/// publishers replace the snapshot wholesale, and these flags have one owner
+/// each, the session and the shadow supervisor
+#[derive(Debug, Default)]
+pub struct Health {
+    /// Bootstrap is done and the session's pump loop runs
+    streaming: AtomicBool,
+    /// The daemon-owned shadow postmaster answered its supervisor's last probe
+    shadow_up: AtomicBool,
+}
+
+impl Health {
+    /// Reads as streaming until the guard drops, which every exit from the
+    /// pump loop does, error and panic included
+    pub fn streaming(self: &Arc<Self>) -> StreamingGuard {
+        self.streaming.store(true, Ordering::Relaxed);
+        StreamingGuard(self.clone())
+    }
+
+    pub fn set_shadow_up(&self, up: bool) {
+        self.shadow_up.store(up, Ordering::Relaxed);
+    }
+
+    /// `Err` names the first condition keeping the daemon from ready. Only the
+    /// daemon's own state counts: a paused pump, an unreachable source or a
+    /// destination outage leaves it ready, since a restart fixes none of them
+    pub fn readiness(&self) -> Result<(), &'static str> {
+        if !self.streaming.load(Ordering::Relaxed) {
+            return Err("not streaming yet: bootstrap or startup still running");
+        }
+        if !self.shadow_up.load(Ordering::Relaxed) {
+            return Err("shadow postmaster is down");
+        }
+        Ok(())
+    }
+}
+
+/// Clears [`Health`]'s streaming flag on drop
+#[must_use = "the session reads as streaming only while the guard lives"]
+#[derive(Debug)]
+pub struct StreamingGuard(Arc<Health>);
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.0.streaming.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1148,9 +1218,12 @@ pub fn render(snap: MetricsSnapshot) -> String {
 
 /// Returns the bound address (resolves `:0` ephemeral ports) and join handle.
 /// Task runs until `listener.accept` errors or the runtime tears down.
+/// `status` serves `/status` off the control socket's context; `None` leaves
+/// the path unserved
 pub async fn serve(
     addr: SocketAddr,
     registry: MetricsRegistry,
+    status: Option<crate::ops::control::SharedCtx>,
 ) -> Result<(SocketAddr, JoinHandle<()>), MetricsError> {
     let listener = TcpListener::bind(addr)
         .await
@@ -1159,6 +1232,7 @@ pub async fn serve(
             source: e,
         })?;
     let local = listener.local_addr()?;
+    let endpoints = Arc::new(Endpoints { registry, status });
     let handle = tokio::spawn(async move {
         loop {
             let (mut socket, _peer) = match listener.accept().await {
@@ -1172,9 +1246,9 @@ pub async fn serve(
                     return;
                 }
             };
-            let reg = registry.clone();
+            let endpoints = endpoints.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(&mut socket, &reg).await {
+                if let Err(e) = handle_client(&mut socket, &endpoints).await {
                     tracing::debug!(
                         target: "walshadow::metrics",
                         error = %e,
@@ -1188,26 +1262,180 @@ pub async fn serve(
     Ok((local, handle))
 }
 
+struct Endpoints {
+    registry: MetricsRegistry,
+    status: Option<crate::ops::control::SharedCtx>,
+}
+
+/// Probes and scrapers send a few hundred bytes of request head
+const MAX_REQUEST_HEAD: usize = 8 << 10;
+
+/// A client that has not finished its request head by then gets no answer, so
+/// a stalled connection cannot hold a task
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+const TEXT: &str = "text/plain; charset=utf-8";
+const JSON: &str = "application/json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Metrics,
+    Healthz,
+    Readyz,
+    Status,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Response {
+    status: u16,
+    content_type: &'static str,
+    body: String,
+}
+
+impl Response {
+    fn new(status: u16, content_type: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            content_type,
+            body: body.into(),
+        }
+    }
+
+    fn text(status: u16, body: impl Into<String>) -> Self {
+        Self::new(status, TEXT, body)
+    }
+
+    fn not_found() -> Self {
+        Self::text(404, "not found\n")
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "",
+        }
+    }
+
+    /// HTTP/1.0, one response per connection. `HEAD` gets the headers alone,
+    /// `Content-Length` included
+    fn encode(&self, head_only: bool) -> Vec<u8> {
+        let allow = if self.status == 405 {
+            "Allow: GET, HEAD\r\n"
+        } else {
+            ""
+        };
+        let mut out = format!(
+            "HTTP/1.0 {} {}\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             {allow}\
+             Connection: close\r\n\
+             \r\n",
+            self.status,
+            self.reason(),
+            self.content_type,
+            self.body.len(),
+        )
+        .into_bytes();
+        if !head_only {
+            out.extend_from_slice(self.body.as_bytes());
+        }
+        out
+    }
+}
+
+/// Whether a request line is a `HEAD`, and the route it names or the error to
+/// answer with. A query string is ignored; an unknown path is 404 whatever the
+/// method, a known one 405 for anything but `GET` and `HEAD`
+fn route(request_line: &str) -> (bool, Result<Route, Response>) {
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        return (false, Err(Response::text(400, "bad request\n")));
+    };
+    let head_only = method == "HEAD";
+    let path = target.split_once('?').map_or(target, |(p, _)| p);
+    let route = match path {
+        "/metrics" => Route::Metrics,
+        "/healthz" => Route::Healthz,
+        "/readyz" => Route::Readyz,
+        "/status" => Route::Status,
+        _ => return (head_only, Err(Response::not_found())),
+    };
+    if !matches!(method, "GET" | "HEAD") {
+        return (false, Err(Response::text(405, "method not allowed\n")));
+    }
+    (head_only, Ok(route))
+}
+
+async fn respond(route: Route, endpoints: &Endpoints) -> Response {
+    match route {
+        Route::Metrics => Response::new(
+            200,
+            OPENMETRICS,
+            render(endpoints.registry.snapshot().await),
+        ),
+        Route::Healthz => Response::text(200, "ok\n"),
+        Route::Readyz => match endpoints.registry.health().readiness() {
+            Ok(()) => Response::text(200, "ok\n"),
+            Err(why) => Response::text(503, format!("not ready: {why}\n")),
+        },
+        Route::Status => {
+            let Some(ctx) = &endpoints.status else {
+                return Response::not_found();
+            };
+            match crate::ops::control::status_table(ctx).await {
+                Ok(table) => match serde_json::to_string(&table) {
+                    Ok(json) => Response::new(200, JSON, json),
+                    Err(e) => Response::text(500, format!("encode status: {e}\n")),
+                },
+                Err(e) => Response::text(500, format!("{e:#}\n")),
+            }
+        }
+    }
+}
+
+/// Request head up to its blank line, the size cap, or the client's EOF
+async fn read_head(socket: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = socket.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(head);
+        }
+        head.extend_from_slice(&chunk[..n]);
+        let ended =
+            head.windows(4).any(|w| w == b"\r\n\r\n") || head.windows(2).any(|w| w == b"\n\n");
+        if ended || head.len() >= MAX_REQUEST_HEAD {
+            return Ok(head);
+        }
+    }
+}
+
 async fn handle_client(
     socket: &mut tokio::net::TcpStream,
-    registry: &MetricsRegistry,
+    endpoints: &Endpoints,
 ) -> io::Result<()> {
-    // Don't parse the request; serve the same body for any path, so even
-    // `curl http://host:port/` works
-    let mut buf = [0u8; 1024];
-    let n = socket.read(&mut buf).await?;
-    let _ = n;
-    let body = render(registry.snapshot().await);
-    let resp = format!(
-        "HTTP/1.0 200 OK\r\n\
-         Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    );
-    socket.write_all(resp.as_bytes()).await?;
+    let Ok(head) = tokio::time::timeout(REQUEST_HEAD_TIMEOUT, read_head(socket)).await else {
+        return Ok(());
+    };
+    let head = head?;
+    let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let (head_only, routed) = match std::str::from_utf8(line) {
+        Ok(line) => route(line.trim_end_matches('\r')),
+        Err(_) => (false, Err(Response::text(400, "bad request\n"))),
+    };
+    let resp = match routed {
+        Ok(route) => respond(route, endpoints).await,
+        Err(resp) => resp,
+    };
+    socket.write_all(&resp.encode(head_only)).await?;
     socket.flush().await?;
     Ok(())
 }
@@ -1755,7 +1983,9 @@ mod tests {
             ..MetricsSnapshot::default()
         };
         reg.set(snap).await;
-        let (addr, _handle) = serve("127.0.0.1:0".parse().unwrap(), reg).await.unwrap();
+        let (addr, _handle) = serve("127.0.0.1:0".parse().unwrap(), reg, None)
+            .await
+            .unwrap();
 
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         sock.write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
@@ -1767,5 +1997,214 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Content-Type: application/openmetrics-text"));
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
+    }
+
+    #[test]
+    fn route_serves_known_paths_and_refuses_the_rest() {
+        let ok = |line: &str| route(line).1.unwrap();
+        let err = |line: &str| route(line).1.unwrap_err().status;
+        assert_eq!(ok("GET /metrics HTTP/1.1"), Route::Metrics);
+        assert_eq!(ok("GET /healthz HTTP/1.1"), Route::Healthz);
+        assert_eq!(ok("GET /readyz HTTP/1.0"), Route::Readyz);
+        assert_eq!(ok("GET /status HTTP/1.1"), Route::Status);
+        assert_eq!(ok("GET /metrics?debug=1 HTTP/1.1"), Route::Metrics);
+        // No HTTP version is still a request line
+        assert_eq!(ok("GET /healthz"), Route::Healthz);
+        assert_eq!(route("HEAD /readyz HTTP/1.1"), (true, Ok(Route::Readyz)));
+        assert!(!route("GET /readyz HTTP/1.1").0);
+
+        // The scrape used to answer on every path; now only on its own
+        assert_eq!(err("GET / HTTP/1.1"), 404);
+        assert_eq!(err("GET /metrics/ HTTP/1.1"), 404);
+        assert_eq!(err("GET /quit HTTP/1.1"), 404);
+        assert_eq!(err("POST /nope HTTP/1.1"), 404);
+        assert_eq!(err("POST /metrics HTTP/1.1"), 405);
+        assert_eq!(err("DELETE /healthz HTTP/1.1"), 405);
+        assert_eq!(
+            err("get /metrics HTTP/1.1"),
+            405,
+            "methods are case-sensitive"
+        );
+        assert_eq!(err(""), 400);
+        assert_eq!(err("GET"), 400);
+        // A HEAD gets no body, whatever the answer
+        assert!(route("HEAD /nope HTTP/1.1").0);
+    }
+
+    #[test]
+    fn encode_writes_status_headers_and_body_except_for_head() {
+        let resp = Response::text(503, "not ready: x\n");
+        let full = String::from_utf8(resp.encode(false)).unwrap();
+        assert_eq!(
+            full,
+            "HTTP/1.0 503 Service Unavailable\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: 13\r\n\
+             Connection: close\r\n\
+             \r\n\
+             not ready: x\n"
+        );
+        let head = String::from_utf8(resp.encode(true)).unwrap();
+        assert!(
+            head.ends_with("Content-Length: 13\r\nConnection: close\r\n\r\n"),
+            "{head}"
+        );
+        let refused = String::from_utf8(Response::text(405, "").encode(false)).unwrap();
+        assert!(refused.contains("\r\nAllow: GET, HEAD\r\n"), "{refused}");
+    }
+
+    #[test]
+    fn readiness_needs_streaming_and_the_shadow_up() {
+        let health = Arc::new(Health::default());
+        assert!(
+            health.readiness().unwrap_err().contains("not streaming"),
+            "a fresh daemon is still starting"
+        );
+        health.set_shadow_up(true);
+        assert!(health.readiness().is_err(), "a shadow up is not enough");
+        let guard = health.streaming();
+        assert_eq!(health.readiness(), Ok(()));
+        // The supervisor saw the postmaster stop, then brought it back
+        health.set_shadow_up(false);
+        assert_eq!(health.readiness(), Err("shadow postmaster is down"));
+        health.set_shadow_up(true);
+        assert_eq!(health.readiness(), Ok(()));
+        // Leaving the pump loop, by any path, ends ready
+        drop(guard);
+        assert!(health.readiness().unwrap_err().contains("not streaming"));
+    }
+
+    /// One request over a fresh connection, write side closed after it, so a
+    /// head without its blank line still ends: status code, headers, body
+    async fn request(addr: SocketAddr, raw: &str) -> (u16, String, String) {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(raw.as_bytes()).await.unwrap();
+        sock.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+        let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, head.to_owned(), body.to_owned())
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let (status, _, body) =
+            request(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
+        (status, body)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probes_answer_over_http_and_unknown_paths_do_not_scrape() {
+        let reg = MetricsRegistry::new();
+        let (addr, _handle) = serve("127.0.0.1:0".parse().unwrap(), reg.clone(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(get(addr, "/healthz").await, (200, "ok\n".into()));
+        let (status, body) = get(addr, "/readyz").await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.starts_with("not ready: not streaming"), "{body}");
+
+        let health = reg.health().clone();
+        health.set_shadow_up(true);
+        let streaming = health.streaming();
+        assert_eq!(get(addr, "/readyz").await, (200, "ok\n".into()));
+        health.set_shadow_up(false);
+        assert_eq!(
+            get(addr, "/readyz").await,
+            (503, "not ready: shadow postmaster is down\n".into())
+        );
+        health.set_shadow_up(true);
+        assert_eq!(get(addr, "/readyz").await.0, 200);
+        drop(streaming);
+        assert_eq!(get(addr, "/readyz").await.0, 503);
+
+        for path in ["/", "/index.html", "/status"] {
+            let (status, body) = get(addr, path).await;
+            assert_eq!(status, 404, "{path}");
+            assert!(
+                !body.contains("walshadow_"),
+                "{path} leaked the scrape: {body}"
+            );
+        }
+        let (status, head, body) =
+            request(addr, "POST /metrics HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await;
+        assert_eq!(status, 405);
+        assert!(head.contains("Allow: GET, HEAD"), "{head}");
+        assert!(!body.contains("walshadow_"));
+
+        let (status, head, body) = request(addr, "HEAD /metrics HTTP/1.1\r\n\r\n").await;
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "HEAD carries no body: {body}");
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(length > 0, "HEAD reports the body it would send");
+
+        // A request line with no blank line after it is answered at EOF
+        let (status, _, body) = request(addr, "GET /healthz").await;
+        assert_eq!((status, body.as_str()), (200, "ok\n"));
+        let (status, _, _) = request(addr, "\u{0}\u{1}garbage\r\n\r\n").await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_serves_ctl_status_as_json_when_enabled() {
+        use crate::ops::control::{Reloader, SharedCtx, fragment_path, status_table};
+        let dir = tempfile::tempdir().unwrap();
+        let ch_config = dir.path().join("ch-config.toml");
+        std::fs::write(
+            &ch_config,
+            "[source]\ndbname = \"app\"\n[ch]\ndatabase = \"cdc\"\n[stream]\npaused = true\n\
+             [table.public.orders]\nreplicate = true\n",
+        )
+        .unwrap();
+        let reg = MetricsRegistry::new();
+        reg.set(MetricsSnapshot {
+            emitter_rows_total: 42,
+            source_system_id: u64::MAX,
+            ..MetricsSnapshot::default()
+        })
+        .await;
+        let ctx = SharedCtx {
+            fragment: fragment_path(&ch_config, crate::ops::control::DEFAULT_FRAGMENT).unwrap(),
+            ch_config,
+            cli_base: toml::Table::new(),
+            metrics: reg.clone(),
+            reloader: Arc::new(Reloader::default()),
+            frag_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (addr, _handle) = serve("127.0.0.1:0".parse().unwrap(), reg, Some(ctx.clone()))
+            .await
+            .unwrap();
+
+        let (status, head, body) = request(addr, "GET /status HTTP/1.1\r\n\r\n").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(head.contains("Content-Type: application/json"), "{head}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["paused"], serde_json::json!(true));
+        assert_eq!(json["dbname"], serde_json::json!("app"));
+        assert_eq!(json["ch_database"], serde_json::json!("cdc"));
+        assert_eq!(json["rows_synced"], serde_json::json!(42));
+        // Kept a string, as in `ctl status`, so no JSON reader rounds it
+        assert_eq!(
+            json["source_system_id"],
+            serde_json::json!(u64::MAX.to_string())
+        );
+        assert_eq!(
+            json["tables"][0]["source_table"],
+            serde_json::json!("app.public.orders")
+        );
+        // Same document `ctl status` prints, field for field
+        let table = status_table(&ctx).await.unwrap();
+        assert_eq!(json, serde_json::to_value(&table).unwrap());
+
+        // A config the daemon cannot read is the status's error, not a hang
+        std::fs::write(&ctx.ch_config, "not = [valid").unwrap();
+        assert_eq!(get(addr, "/status").await.0, 500);
     }
 }

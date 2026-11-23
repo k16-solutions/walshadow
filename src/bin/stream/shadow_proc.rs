@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::EmitterConfig;
+use walshadow::metrics::Health;
 use walshadow::pg::socket_conninfo;
 use walshadow::shadow::{ResumeOutcome, Shadow, ShadowConfig};
 
@@ -187,12 +188,15 @@ pub(crate) struct ShadowLifecycle {
 }
 
 impl ShadowLifecycle {
-    pub(crate) fn spawn(guard: OwnedShadow, conninfo: String) -> Self {
+    /// `guard`'s shadow is started; `health` hears whether it stays up
+    pub(crate) fn spawn(guard: OwnedShadow, conninfo: String, health: Arc<Health>) -> Self {
         let cancel = CancellationToken::new();
+        health.set_shadow_up(true);
         let supervisor = tokio::spawn(Self::supervise(
             guard.shadow.clone(),
             conninfo,
             cancel.clone(),
+            health,
         ));
         Self {
             guard,
@@ -201,10 +205,13 @@ impl ShadowLifecycle {
         }
     }
 
+    /// Publishes each probe's answer to `health`, which `/readyz` reads. A
+    /// probe that fails to run leaves the last answer standing
     pub(crate) async fn supervise(
         shadow: Arc<Shadow>,
         conninfo: String,
         cancel: CancellationToken,
+        health: Arc<Health>,
     ) {
         let mut backoff = Duration::from_secs(1);
         // Edge-trigger the foreign-pause log so a held operator pause does
@@ -217,6 +224,7 @@ impl ShadowLifecycle {
             }
             match probe_blocking(&shadow, |s| s.is_running()).await {
                 Some(true) => {
+                    health.set_shadow_up(true);
                     backoff = Duration::from_secs(1);
                     // Higher GUC requirement pauses active hot standby
                     // Resume forces shutdown, then restart uses new values
@@ -248,6 +256,7 @@ impl ShadowLifecycle {
                     }
                 }
                 Some(false) => {
+                    health.set_shadow_up(false);
                     tracing::warn!(
                         target: "walshadow::shadow",
                         "shadow postmaster stopped, restarting",
@@ -259,6 +268,7 @@ impl ShadowLifecycle {
                     })
                     .await;
                     if restarted.is_some() {
+                        health.set_shadow_up(true);
                         tracing::info!(target: "walshadow::shadow", "shadow restarted");
                         backoff = Duration::from_secs(1);
                     } else {

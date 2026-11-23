@@ -548,6 +548,11 @@ fn status_tables(
 }
 
 async fn stream_status(ctx: &SharedCtx) -> Result<String> {
+    Ok(ok_toml(&status_table(ctx).await?))
+}
+
+/// What `ctl status` prints, and `/status` on the metrics port serves as JSON
+pub async fn status_table(ctx: &SharedCtx) -> Result<Table> {
     let root = get_config(ctx).await?;
     let paused = root
         .get("stream")
@@ -699,7 +704,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
     ] {
         out.insert(key.into(), format_pg_lsn(lsn).to_string().into());
     }
-    Ok(ok_toml(&out))
+    Ok(out)
 }
 
 async fn config_show(ctx: &SharedCtx) -> Result<String> {

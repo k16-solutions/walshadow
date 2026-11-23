@@ -562,6 +562,28 @@ pub fn http_get(addr: std::net::SocketAddr, path: &str) -> Result<String> {
     Ok(txt[body_start..].to_string())
 }
 
+/// [`http_get`] for any method, with the status code: what a probe or a
+/// non-scrape request sees
+pub fn http_request(addr: std::net::SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .with_context(|| format!("connect {addr}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    sock.write_all(format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())?;
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf)?;
+    let txt = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = txt
+        .split_once("\r\n\r\n")
+        .with_context(|| format!("{method} {path}: no response head in {txt:?}"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("{method} {path}: no status in {head:?}"))?;
+    Ok((status, body.to_string()))
+}
+
 /// Parse a single Prometheus gauge / counter value out of a `/metrics`
 /// body. Returns `None` when absent or unparseable. Matches `name <v>`
 /// or `name{label=...} <v>`.
