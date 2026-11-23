@@ -30,7 +30,7 @@ use walshadow::filter::shadow_relations::ShadowHeld;
 use walshadow::pg::socket_conninfo;
 use walshadow::pipeline::ack::AckSnapshot;
 use walshadow::pipeline::{Fatal, PipelineConfig, PipelineHandle, TailKind};
-use walshadow::pos::{Durable, EmitterAck, FilterDurable, Floor, Monotone, Pos, RawStart};
+use walshadow::pos::{Durable, EmitterAck, FilterDurable, Floor, Gate, Monotone, Pos, RawStart};
 use walshadow::queueing_record_sink::QueueingRecordSink;
 use walshadow::record::WAL_SEG_SIZE;
 use walshadow::schema::RelName;
@@ -42,7 +42,7 @@ use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
 
 use crate::args::{Args, TENANT_BRIDGES, build_emitter_config, positive_usize};
-use crate::housekeeping::{spawn_desc_log_gc, spawn_snowflake_maintenance};
+use crate::housekeeping::spawn_desc_log_gc;
 use crate::metrics_publish::DbMetricSources;
 use crate::session::SessionTasks;
 use crate::shadow_proc::{ShadowLifecycle, open_shadow_sql_client};
@@ -1763,4 +1763,32 @@ async fn prewarm_start_tables(t: &Tenant, tables: &[walshadow::tenants::StartTab
         elapsed_secs = started.elapsed().as_secs_f64(),
         "start tables prewarmed",
     );
+}
+
+const SNOWFLAKE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reclaim Snowflake state below each persisted resume floor, at most once
+/// per [`SNOWFLAKE_MAINTENANCE_INTERVAL`]. Failures only delay reclamation
+fn spawn_snowflake_maintenance(
+    runtime: Arc<walshadow::destination::snowflake::runtime::SnowflakeRuntime>,
+    floor: Gate<Floor>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cut = floor.current();
+        loop {
+            tokio::time::sleep(SNOWFLAKE_MAINTENANCE_INTERVAL).await;
+            let Ok(next) = floor.advance(cut).await else {
+                return;
+            };
+            cut = next;
+            if let Err(e) = runtime.maintain(cut.get()).await {
+                tracing::warn!(
+                    target: "walshadow::snowflake",
+                    floor = %cut,
+                    error = %format!("{e:#}"),
+                    "Snowflake state maintenance failed; retrying next interval",
+                );
+            }
+        }
+    })
 }

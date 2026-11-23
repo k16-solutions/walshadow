@@ -1,6 +1,7 @@
 //! Snowflake delivery, materialization and durable recovery primitives.
 pub mod generation;
 pub mod http;
+pub mod prewarm;
 pub mod runtime;
 pub mod sql;
 pub mod stage;

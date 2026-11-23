@@ -42,6 +42,9 @@ pub mod destination;
 pub mod dsn;
 pub mod emit;
 pub mod filter;
+/// k16 fork: shared fork-only helpers. Other files under `src/fork/` extend
+/// the upstream module at the same path; see FORK.md
+pub(crate) mod fork;
 pub mod fs;
 pub mod mapping;
 pub mod ops;
