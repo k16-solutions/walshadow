@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahash::HashSet;
 use anyhow::Context;
+use foldhash::HashSet;
 use tokio::sync::Mutex;
 use walrus::pg::backup::format_pg_lsn;
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats};
@@ -23,6 +23,8 @@ use crate::session::SessionTasks;
 pub(crate) struct SourceDbInputs<'a> {
     pub(crate) args: &'a Args,
     pub(crate) conn: &'a DbLink,
+    /// `conn`'s `[ch]` view
+    pub(crate) cfg: EmitterConfig,
     /// `[source] dbname`: the one database a cluster backup can load
     pub(crate) primary: bool,
     pub(crate) desc_log: &'a Arc<walshadow::desc_log::DescriptorLog>,
@@ -51,8 +53,9 @@ pub(crate) struct SourceDbInputs<'a> {
 
 pub(crate) struct BuiltSourceDb {
     pub(crate) db: Arc<SourceDb>,
-    pub(crate) applicator: Option<walshadow::ch_ddl::DdlApplicator>,
-    pub(crate) backfiller: Option<Arc<walshadow::copy_backfill::CopyBackfiller>>,
+    pub(crate) resolver: Arc<ConfigResolver>,
+    pub(crate) applicator: walshadow::ch_ddl::DdlApplicator,
+    pub(crate) backfiller: Arc<walshadow::copy_backfill::CopyBackfiller>,
 }
 
 /// Wire one database's routing map, config resolver, DDL applicator and
@@ -62,13 +65,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     let conn = input.conn;
     let desc_log = input.desc_log;
     let raw_start = input.raw_start;
-    let Some(mut cfg) = conn.emitter.clone() else {
-        return Ok(BuiltSourceDb {
-            db: Arc::new(metrics_only_db(conn, desc_log)),
-            applicator: None,
-            backfiller: None,
-        });
-    };
+    let mut cfg = input.cfg;
     // A tenant's ClickHouse scopes come from its whole file config, before
     // priming narrows the table rules
     let reserved = (input.tenant.is_some() && cfg.snowflake.is_none())
@@ -226,8 +223,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         .with_replica(replica)
         .with_backup_loads(input.primary),
     );
-    let backfiller_effects: Option<Arc<dyn walshadow::opt_in::Backfiller>> =
-        Some(backfiller.clone() as _);
+    let backfiller_effects: Arc<dyn walshadow::opt_in::Backfiller> = backfiller.clone();
     // Re-materialise per-table opt-in scope from the seeded config_table
     // rows. Live edits arrive off WAL via the reorder coordinator, but a
     // restart replays WAL from past these rows' commit LSN, so the seed
@@ -253,14 +249,14 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
-                backfiller_effects.as_ref(),
+                &backfiller_effects,
                 rel,
                 row,
                 raw_start.get(),
                 &mut deferred,
             )
             .await
-            .with_context(|| format!("seed opt-in for {rel}"))?;
+            .context(format!("seed opt-in for {rel}"))?;
         }
     }
     for (rel, row) in &cfg.table_opt_ins {
@@ -269,14 +265,14 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
                 &resolver,
                 &mut applicator,
                 &conn.catalog,
-                backfiller_effects.as_ref(),
+                &backfiller_effects,
                 rel,
                 row,
                 raw_start.get(),
                 &mut deferred,
             )
             .await
-            .with_context(|| format!("config opt-in for {rel}"))?;
+            .context(format!("config opt-in for {rel}"))?;
         }
     }
     let pattern_scoped: Vec<(RelName, walshadow::runtime_config::TableRow)> = {
@@ -292,18 +288,18 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             &resolver,
             &mut applicator,
             &conn.catalog,
-            backfiller_effects.as_ref(),
+            &backfiller_effects,
             rel,
             row,
             raw_start.get(),
             &mut deferred,
         )
         .await
-        .with_context(|| format!("pattern opt-in for {rel}"))?;
+        .context(format!("pattern opt-in for {rel}"))?;
     }
     // Every mapping is in place: start the loads without each waiting on
     // the next opt-in's mapping publication
-    deferred.start(backfiller_effects.as_ref()).await;
+    deferred.start(&backfiller_effects).await;
     let sql_scoped_tables: HashSet<RelName> = seeded_table_rows
         .iter()
         .filter(|(_, row)| row.replicate.is_some() && !row.is_pattern())
@@ -313,7 +309,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     let active_tables: HashSet<RelName> = config_rx.borrow().tables.keys().cloned().collect();
     apply_toml_initial_loads(
         &conn.catalog,
-        Some(&backfiller),
+        &backfiller,
         &cfg.table_initial_loads,
         &active_tables,
         &sql_scoped_tables,
@@ -327,8 +323,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         let has_initial_load = cfg
             .table_initial_loads
             .get(*rel)
-            .and_then(|mode| mode.parse::<InitialLoadMode>().ok())
-            .is_some_and(|m| m != InitialLoadMode::None);
+            .is_some_and(|m| *m != InitialLoadMode::None);
         !sql_scoped_tables.contains(*rel) && !has_initial_load
     });
     let descs = conn
@@ -339,10 +334,8 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         .await
         .context("resolve descriptors for pinned mappings")?;
     for desc in descs {
-        applicator
-            .add(&desc)
-            .await
-            .with_context(|| format!("ensure CH dest for pinned mapping {}", desc.rel_name))?;
+        let what = format!("ensure CH dest for pinned mapping {}", desc.rel_name);
+        applicator.add(&desc).await.context(what)?;
     }
     Ok(BuiltSourceDb {
         db: Arc::new(SourceDb::new(
@@ -350,10 +343,11 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
             desc_log.clone(),
             cfg,
             mapping,
-            Some((resolver, config_rx)),
+            Some((resolver.clone(), config_rx)),
         )),
-        applicator: Some(applicator),
-        backfiller: Some(backfiller),
+        resolver,
+        applicator,
+        backfiller,
     })
 }
 
@@ -426,24 +420,10 @@ pub(crate) async fn open_db_desc_log(
     let desc_log = Arc::new(
         walshadow::desc_log::DescriptorLog::open_on_branch(dir, input.identity, input.lineage)
             .await
-            .with_context(|| format!("open descriptor log for database {}", input.dbname))?,
+            .context(format!("open descriptor log for database {}", input.dbname))?,
     );
     if let Some(lsn) = input.start_lsn_override {
-        anyhow::ensure!(
-            lsn.get() >= desc_log.floor_at_write().get(),
-            "--start-lsn {} below descriptor log floor {}; no shape history \
-             survives there — --ignore-cursor or re-bootstrap",
-            lsn,
-            desc_log.floor_at_write(),
-        );
-        let head = desc_log.head();
-        anyhow::ensure!(
-            head == 0 || lsn.get() <= head,
-            "--start-lsn {} beyond descriptor log head {}; boundaries in \
-             between were never captured — --ignore-cursor re-baselines",
-            lsn,
-            format_pg_lsn(head),
-        );
+        check_start_lsn(lsn, desc_log.floor_at_write(), desc_log.head())?;
     }
     if desc_log.is_empty() {
         // Baseline snapshot: every eligible rel as of shadow's position,
@@ -456,7 +436,7 @@ pub(crate) async fn open_db_desc_log(
             .await
             .fetch_all_descriptors()
             .await
-            .with_context(|| format!("descriptor log boot seed for {}", input.dbname))?;
+            .context(format!("descriptor log boot seed for {}", input.dbname))?;
         let covered_through = input.raw_start.get().max(replay_lsn);
         let entries = descs
             .into_iter()
@@ -481,7 +461,7 @@ pub(crate) async fn open_db_desc_log(
                 covered_through,
             )
             .await
-            .with_context(|| format!("seed descriptor log for {}", input.dbname))?;
+            .context(format!("seed descriptor log for {}", input.dbname))?;
         tracing::info!(
             target: "walshadow::desc_log",
             dbname = %input.dbname,
@@ -492,16 +472,32 @@ pub(crate) async fn open_db_desc_log(
     if attaching {
         tokio::fs::remove_file(dir.join(ATTACH_MARKER))
             .await
-            .with_context(|| format!("clear attach marker in {}", dir.display()))?;
+            .context(format!("clear attach marker in {}", dir.display()))?;
     }
     Ok(desc_log)
+}
+
+/// `--start-lsn` must land where the descriptor log holds shape history
+fn check_start_lsn(lsn: Pos<RawStart>, floor: Pos<Floor>, head: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        lsn.get() >= floor.get(),
+        "--start-lsn {lsn} below descriptor log floor {floor}; no shape history \
+         survives there — --ignore-cursor or re-bootstrap",
+    );
+    let head_lsn = format_pg_lsn(head);
+    anyhow::ensure!(
+        head == 0 || lsn.get() <= head,
+        "--start-lsn {lsn} beyond descriptor log head {head_lsn}; boundaries in \
+         between were never captured — --ignore-cursor re-baselines",
+    );
+    Ok(())
 }
 
 pub(crate) const ATTACH_MARKER: &str = "attach-pending";
 
 pub(crate) async fn list_databases(
     client: &tokio_postgres::Client,
-) -> anyhow::Result<ahash::HashMap<String, u32>> {
+) -> anyhow::Result<foldhash::HashMap<String, u32>> {
     let rows = client
         .query("SELECT datname::text, oid::int8 FROM pg_database", &[])
         .await?;
@@ -520,6 +516,33 @@ pub(crate) async fn open_source_sql_client(
     cfg.database = dbname.to_string();
     let client = walshadow::source_feed::open_sql_client(&cfg)
         .await
-        .with_context(|| format!("open sql client for database {dbname}"))?;
+        .context(format!("open sql client for database {dbname}"))?;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_lsn_must_sit_inside_descriptor_history() {
+        let (floor, head) = (Pos::new(0x100), 0x300);
+        assert!(check_start_lsn(Pos::new(0x200), floor, head).is_ok());
+        assert!(
+            check_start_lsn(Pos::new(0x400), floor, 0).is_ok(),
+            "empty log has no head"
+        );
+        let below = check_start_lsn(Pos::new(0x80), floor, head).unwrap_err();
+        assert!(
+            below.to_string().contains("below descriptor log floor"),
+            "{below}"
+        );
+        let beyond = check_start_lsn(Pos::new(0x400), floor, head).unwrap_err();
+        assert!(
+            beyond
+                .to_string()
+                .contains("beyond descriptor log head 0/300"),
+            "{beyond}"
+        );
+    }
 }

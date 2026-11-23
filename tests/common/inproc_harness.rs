@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 
+use walshadow::bridge::Bridge;
 use walshadow::ch::CompressionChoice;
 use walshadow::ch_ddl::{DdlApplicator, DdlConfig};
 use walshadow::ch_emitter::{EmitterConfig, EmitterStats, InstanceConfig};
@@ -53,7 +54,7 @@ use walshadow::record::{
 use walshadow::schema::RelName;
 use walshadow::segment_sink::DirSegmentSink;
 use walshadow::shadow::{Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog, ShadowCatalogConfig};
+use walshadow::shadow_catalog::{ParkedAt, ShadowCatalog};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::wal_stream::WalStream;
 use walshadow::xact_buffer::{BufferingDecoderSink, SubxactTracker, XactBuffer, XactBufferConfig};
@@ -520,7 +521,7 @@ pub struct BuildPipelineArgs<'a> {
 
 #[derive(Default)]
 pub struct DdlPipelineArgs {
-    pub namespaces: ahash::HashMap<String, NamespaceMapping>,
+    pub namespaces: foldhash::HashMap<String, NamespaceMapping>,
     pub drop_table_strategy: Option<DropTableStrategy>,
     /// Source-PG schema holding the `config_*` runtime-config overlay tables
     /// (TOML `[runtime_config] schema`). `Some` diverts their heap writes into
@@ -529,6 +530,8 @@ pub struct DdlPipelineArgs {
     /// Install the tables on source via `sql/runtime_config_install.sql`
     /// inside the bootstrap `schema_sql`.
     pub config_schema: Option<String>,
+    /// Database a cluster backup does not cover, so backup loads refuse
+    pub non_primary: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +547,27 @@ pub struct DdlPipelineArgs {
 // epoch + baseline seeding. `ddl: None` leaves the DML-only path untouched.
 // ---------------------------------------------------------------------------
 
+/// Stands in for the COPY backfiller when no runtime config schema is set:
+/// opt-ins stream from their opt-in LSN only
+struct NoBackfill;
+
+#[async_trait::async_trait]
+impl walshadow::opt_in::Backfiller for NoBackfill {
+    async fn note_opt_in(
+        self: Arc<Self>,
+        _: Arc<walshadow::schema::RelDescriptor>,
+        _: walshadow::runtime_config::InitialLoadMode,
+        _: u64,
+    ) {
+    }
+
+    async fn note_opt_out(&self, _: &walshadow::schema::RelName) {}
+
+    fn refuses(&self, _: walshadow::runtime_config::InitialLoadMode) -> Option<&'static str> {
+        None
+    }
+}
+
 /// Record-sink chain feeding the parallel pipeline: `metrics → decoder
 /// (heaps → xact buffer) → reorder (commit → dispatch to decode pool)`.
 /// Clone of `bin/stream/sinks.rs`'s `DaemonSinks` with the reorder coordinator
@@ -554,10 +578,27 @@ pub struct PipelineSinks {
     pub reorder: ReorderSink,
     /// Descriptor capture at catalog boundaries. The daemon runs it inside
     /// the boundary hold; the synchronous harness has no gate, so
-    /// `wait_for_replay` stands in before capturing (nothing past the
+    /// [`wait_for_replay`] stands in before capturing (nothing past the
     /// commit has been pumped yet — serial record cadence)
     pub capture: walshadow::catalog_capture::CaptureSet,
-    pub catalog: Arc<Mutex<ShadowCatalog>>,
+    pub bridge: Arc<Bridge>,
+}
+
+/// Poll bridge worker until shadow replay reaches `target`. Worker reads
+/// replay position from shared memory, so polling never blocks behind a
+/// catalog AccessExclusiveLock replay holds
+async fn wait_for_replay(bridge: &Bridge, target: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let lsn = bridge.replay_lsn().await?;
+        if lsn != 0 && lsn >= target {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for shadow replay ≥ {target:#X}, last {lsn:#X}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 impl RecordSink for PipelineSinks {
@@ -573,10 +614,7 @@ impl RecordSink for PipelineSinks {
             }
             if let Some(info) = &record.boundary_info {
                 if self.capture.admits(info, record.next_lsn) {
-                    self.catalog
-                        .lock()
-                        .await
-                        .wait_for_replay(record.next_lsn)
+                    wait_for_replay(&self.bridge, record.next_lsn)
                         .await
                         .map_err(|e| SinkError::Other(format!("harness boundary wait: {e}")))?;
                     self.capture.charge_hold(info, std::time::Duration::ZERO);
@@ -729,18 +767,13 @@ async fn build_pipeline_inner(
         "postgres",
         "postgres",
     );
-    let cat_cfg = ShadowCatalogConfig {
-        replay_timeout: Duration::from_secs(60),
-        replay_poll: Duration::from_millis(50),
-        ..Default::default()
-    };
     let bridge_path = shadow.bridge_socket().expect("bridge configured");
     let bridge = Arc::new(
         walshadow::bridge::connect_with_budget(bridge_path, 1, Duration::from_secs(60))
             .await
             .unwrap_or_else(|e| panic!("bridge connect on {}: {e}", bridge_path.display())),
     );
-    let catalog = ShadowCatalog::connect(&shadow_conninfo, cat_cfg, bridge.clone())
+    let catalog = ShadowCatalog::connect(&shadow_conninfo, bridge.clone())
         .await
         .expect("connect shadow catalog");
     let catalog = Arc::new(Mutex::new(catalog));
@@ -942,7 +975,8 @@ async fn build_pipeline_inner(
                     pending_rows.clone(),
                 )
                 .await
-                .expect("load backfill ledger"),
+                .expect("load backfill ledger")
+                .with_backup_loads(!ddl.as_ref().is_some_and(|d| d.non_primary)),
             ))
         } else {
             None
@@ -965,14 +999,22 @@ async fn build_pipeline_inner(
         inserter_pool_size: 2,
         dbs: Arc::new(walshadow::source_db::SourceDbs::single(source_db)),
         oracle,
-        applicators: [(shadow_db_oid, applicator)].into_iter().collect(),
+        ddl: [(
+            shadow_db_oid,
+            walshadow::pipeline::DbDdl {
+                applicator,
+                backfiller: backfiller.unwrap_or_else(|| Arc::new(NoBackfill)),
+                resolver: config_resolver.clone(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         tail: TailKind::ClickHouse,
         buffer: xact_buffer.clone(),
         subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
         pending: pending_catalog.clone(),
         stats: stats.clone(),
         span_registry: None,
-        backfillers: backfiller.map(|b| (shadow_db_oid, b)).into_iter().collect(),
         retires,
         pending_rows,
         resume_floor: resume_floor.clone(),
@@ -984,7 +1026,7 @@ async fn build_pipeline_inner(
         .expect("spawn decode+insert pipeline");
     let reorder = booting
         .boot(
-            None,
+            &shadow.config().data_dir,
             desc_log.active_present_at(ident.xlogpos),
             ident.xlogpos,
         )
@@ -1015,7 +1057,7 @@ async fn build_pipeline_inner(
         decoder,
         reorder,
         capture,
-        catalog,
+        bridge,
     };
     let segment_sink =
         DirSegmentSink::new(shadow_filter_dir.to_path_buf()).expect("open shadow filter dir");

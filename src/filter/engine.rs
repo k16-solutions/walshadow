@@ -36,7 +36,7 @@ use crate::filter::shadow_relations::ShadowRelations;
 use crate::record::{AffectedOid, BoundaryInfo, BoundaryKind, Route, rmgr_label};
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
 use crate::toast::xid_ceiling::{XidCeiling, follows};
-use ahash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FilterStats {
@@ -1134,18 +1134,21 @@ mod tests {
         assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 20001)])), Route::ToDecoder);
         assert_eq!(f.decide(&rec(RmId::Heap, &[(5, 20000)])), Route::ToDecoder);
         assert_eq!(f.decide(&rec(RmId::Btree, &[(5, 1259)])), Route::ToShadow);
-        assert_eq!(
-            stats.skipped_by_rel.snapshot(),
-            vec![(
-                SkipKey {
-                    db_oid: 5,
-                    rel_node: 20001,
-                    op: "btree",
-                    reason: SkipReason::IndexDropped,
-                },
-                2,
-            )],
-        );
+        // Blockless REUSE_PAGE names its index in main data
+        let mut reuse = rec(RmId::Btree, &[]);
+        reuse.header.info = main_data::XLOG_BTREE_REUSE_PAGE;
+        let locator = [1663u32, 5, 20002].map(u32::to_le_bytes).concat();
+        reuse.main_data = std::borrow::Cow::Owned([&locator[..], &[0; 13]].concat());
+        assert_eq!(f.decide(&reuse), Route::ToDecoder);
+        let key = |rel_node| SkipKey {
+            db_oid: 5,
+            rel_node,
+            op: "btree",
+            reason: SkipReason::IndexDropped,
+        };
+        let mut skipped = stats.skipped_by_rel.snapshot();
+        skipped.sort_by_key(|(k, _)| k.rel_node);
+        assert_eq!(skipped, vec![(key(20001), 2), (key(20002), 1)]);
     }
 
     #[test]
@@ -2235,6 +2238,18 @@ mod tests {
         r
     }
 
+    /// `XLOG_DBASE_DROP` names a database too, but creates none
+    #[test]
+    fn only_create_records_name_a_created_database() {
+        assert_eq!(
+            created_database(&dbase_create(TARGET_DB, 7)),
+            Some(TARGET_DB)
+        );
+        let mut dropped = dbase_create(TARGET_DB, 7);
+        dropped.header.info = 0x20;
+        assert_eq!(created_database(&dropped), None);
+    }
+
     #[test]
     fn creating_the_target_database_is_not_a_foreign_scope() {
         let mut f = target_filter();
@@ -2299,5 +2314,77 @@ mod tests {
             .boundary
             .expect("boundary");
         assert_eq!(b.oids[0].oid, 16400);
+    }
+
+    #[test]
+    fn one_xact_writing_two_followed_databases_poisons() {
+        let mut f = Filter::new();
+        f.set_target_dbs([TARGET_DB, FOREIGN_DB]);
+        f.decide_record(&pg_class_write(TARGET_DB, 7, 16400), 100, 0xD116)
+            .unwrap();
+        f.decide_record(&pg_class_write(FOREIGN_DB, 7, 16401), 150, 0xD116)
+            .unwrap();
+        let err = f
+            .decide_record(&xact_end(XLOG_XACT_COMMIT, 7, &[], None), 200, 0xD116)
+            .unwrap_err();
+        let want = XactPayloadError::MixedScope {
+            first: TARGET_DB,
+            second: FOREIGN_DB,
+        };
+        assert_eq!(err.to_string(), want.to_string());
+    }
+
+    #[test]
+    fn smgr_markers_evict_oldest_unless_superseded() {
+        let rfn = |rel_node| RelFileNode {
+            spc_node: 1663,
+            db_node: TARGET_DB,
+            rel_node,
+        };
+        let cap = SMGR_MARKER_CAP as u32;
+        let mut m = SmgrMarkers::default();
+        m.insert(rfn(1), 10);
+        m.insert(rfn(1), 20);
+        m.insert(rfn(1), 20);
+        for rel in 2..=cap {
+            m.insert(rfn(rel), 30);
+        }
+        assert_eq!(m.get(rfn(1)), Some(20), "stale order entry leaves map");
+        m.insert(rfn(cap + 1), 30);
+        assert_eq!(m.get(rfn(1)), None);
+        assert_eq!(m.get(rfn(2)), Some(30));
+    }
+
+    #[tokio::test]
+    async fn persisting_without_shadow_rels_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        target_filter()
+            .persist_shadow_rels(tmp.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn skip_attribution_takes_the_full_parse() {
+        let mut bytes = vec![0; walrus::pg::walparser::X_LOG_RECORD_HEADER_SIZE];
+        bytes[17] = RmId::Btree as u8;
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        for v in [1663u32, TARGET_DB, 20001, 0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let len = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&len.to_le_bytes());
+        let mut f = target_filter();
+        f.enable_header_routing();
+        let routed = f.route_from_header(&bytes, 0xD116, 0).unwrap();
+        // No toast xid ceiling to feed, clean xid defers nothing
+        assert!(!f.decide_from_header(&routed, 0));
+        let stats = Arc::new(DecoderStats::default());
+        stats
+            .attribute_skips
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.set_skip_stats(stats);
+        assert!(f.route_from_header(&bytes, 0xD116, 0).is_none());
     }
 }

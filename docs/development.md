@@ -29,7 +29,9 @@ concurrency to limit memory and disk use
 
 ## WAL fixtures and coverage
 
-Regenerate fixtures using PostgreSQL major being tested:
+Generate WAL fixtures from SQL workloads using PostgreSQL major being tested.
+Keep captures out of Git. Encode regressions needing specific WAL bytes as
+generators or text patches applied after capture. CI generates fixtures before tests:
 
 ```bash
 WALSHADOW_USE_LOCAL=1 fixtures/wal/classify/capture.sh
@@ -52,9 +54,17 @@ make -C pgext coverage-html
 Install GCC, matching `gcov`, and `gcovr` for
 [PG module coverage](../pgext/README.md#coverage) of `pgext/*.c` and `pgext/*.h`
 
-CI merges coverage across PostgreSQL test matrix. Use fresh line-coverage
-reports to locate missing behavior; exported function counts can include generic
-instantiations. Do not disable lints or coverage to make a report pass
+CI merges coverage across PostgreSQL test matrix and requires every line hit by
+some major. Local reports also count build scripts, which nextest archives omit
+Report only profiles from current build; stale profiles misplace lines. Exported
+function counts can include generic instantiations
+
+Do not exclude code, disable lints, or disable coverage to make a report pass
+Remove dead code instead of testing it. Select branches through protocol faults,
+explicit synchronization, or direct state-transition tests rather than timing; a
+line hit only when one racer wins misses under load. Assertion arguments run only
+on failure, so keep them on asserting line. Daemons must exit cleanly to flush
+profiles
 
 Performance workloads and deployment commands live in [bench](../bench/README.md)
 Keep performance comparisons separate from correctness tests

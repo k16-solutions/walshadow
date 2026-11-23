@@ -137,8 +137,8 @@ pub(crate) struct Args {
     /// Start LSN in `X/Y` hex form. Defaults to source's current
     /// `pg_current_wal_lsn` (per `IDENTIFY_SYSTEM`), aligned down to a
     /// segment boundary.
-    #[arg(long)]
-    pub(crate) start_lsn: Option<String>,
+    #[arg(long, value_parser = walshadow::pg::parse_pg_lsn)]
+    pub(crate) start_lsn: Option<u64>,
     #[arg(long, default_value_t = 10)]
     pub(crate) status_interval: u64,
 
@@ -203,22 +203,18 @@ pub(crate) struct Args {
     /// leaves an apply LSN that never advances.
     #[arg(long, default_value_t = 60)]
     pub(crate) walsender_connect_timeout: u64,
-    /// Seconds a catalog-boundary publication hold may wait for shadow to
-    /// replay through a catalog-mutating commit before failing the daemon.
-    /// Keep well under source's `wal_sender_timeout` (default 60s): the
-    /// pump answers no source keepalives while parked.
+    /// Seconds without shadow replay progress before reporting a stalled
+    /// catalog boundary. Replay continues waiting for the boundary.
     #[arg(long, default_value_t = 30)]
     pub(crate) catalog_hold_timeout: u64,
     /// Soft cap on in-flight records for the `QueueingRecordSink` feeding
     /// the decoder / xact-drain worker. Past this watermark the pump
-    /// yields to let the worker drain; a stuck worker still surfaces via
-    /// the catalog `wait_for_replay` timeout on the err slot.
+    /// yields to let the worker drain.
     /// Overrides `[ch] decoder_queue_capacity`.
     #[arg(long)]
     pub(crate) decoder_queue_capacity: Option<usize>,
     /// Pump-side batch size for the `QueueingRecordSink`. Bigger
-    /// amortises per-send overhead but adds pump→worker latency (worker's
-    /// `wait_for_replay` lags one batch behind).
+    /// amortises per-send overhead but adds pump→worker latency.
     /// Overrides `[ch] decoder_batch_size`.
     #[arg(long)]
     pub(crate) decoder_batch_size: Option<usize>,
@@ -351,10 +347,6 @@ pub(crate) struct Args {
     /// archiving to that same bucket.
     #[arg(long, default_value_t = false)]
     pub(crate) bootstrap_wal_from_archive: bool,
-    /// Maximum seconds to wait for shadow replay after bootstrap
-    /// Abort daemon when timeout expires
-    #[arg(long, default_value_t = 300)]
-    pub(crate) bootstrap_shadow_replay_timeout: u64,
 }
 
 impl Args {
@@ -622,5 +614,46 @@ mod tests {
                 "{dir} must be rejected",
             );
         }
+    }
+
+    #[test]
+    fn start_lsn_parses_at_argv() {
+        assert_eq!(
+            args_from(&["--start-lsn", "1/A0"]).start_lsn,
+            Some(0x1_0000_00A0)
+        );
+        let argv = ["walshadow-stream", "--out-dir", "o", "--spill-dir", "s"];
+        let err = Args::try_parse_from(argv.iter().chain(&["--start-lsn", "nope"])).unwrap_err();
+        assert!(err.to_string().contains("--start-lsn"), "{err}");
+    }
+
+    #[test]
+    fn positive_usize_clamps_zero_to_one() {
+        assert_eq!(positive_usize("pool", Some(0), 4), 1);
+        assert_eq!(positive_usize("pool", None, 4), 4);
+    }
+
+    #[test]
+    fn source_url_wins_over_flags_and_blank_ch_url_reads_unset() {
+        let mut args = args_from(&[
+            "--password",
+            "flag-pw",
+            "--source-url",
+            "postgres://alice@db.example:6543/app",
+            "--ch-url",
+            " ",
+        ]);
+        args.url_base = url_base(&args).unwrap();
+        assert!(!args.url_base.contains_key("ch"));
+        let base = cli_base(&args);
+        let source = base["source"].as_table().unwrap();
+        assert_eq!(source["host"].as_str(), Some("db.example"));
+        assert_eq!(source["port"].as_integer(), Some(6543));
+        assert_eq!(source["password"].as_str(), Some("flag-pw"));
+        let args = args_from(&["--ch-url", "clickhouse://ch.example:9440/dest"]);
+        let ch = url_base(&args).unwrap();
+        assert_eq!(ch["ch"]["database"].as_str(), Some("dest"));
+        assert!(url_base(&args_from(&["--source-url", "mysql://x"])).is_err());
+        assert!(url_base(&args_from(&["--ch-url", "http://x"])).is_err());
     }
 }

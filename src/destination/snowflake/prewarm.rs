@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ahash::HashSet;
+use foldhash::HashSet;
 use tokio::sync::Mutex;
 
 use crate::catalog::shadow_catalog::ShadowCatalog;

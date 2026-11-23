@@ -44,14 +44,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use walrus::pg::backup::BACKUP_NAME_PREFIX;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
 use walrus::pg::wal::segment::SegmentName;
 use walrus::pg::walparser::{Oid, RmId};
 
-use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use crate::backfill::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
 use crate::backfill::backup_checkpoint::{self, BackupCheckpoint, WalkState};
 use crate::backfill::backup_page_walk::{
     BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap, CompleteAccums, GateAccums,
@@ -61,13 +61,13 @@ use crate::backfill::backup_sentinel::build_lsn_pair;
 use crate::backfill::backup_source::{BackupSink, BackupSource, EndInfo, StartInfo};
 use crate::backfill::backup_source_direct::DirectSource;
 use crate::backfill::backup_source_object_store::ObjectStoreSource;
-use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool, Replayable};
+use crate::backfill::spool::{DEFERRED_SPOOL_MEM_MAX, DeferredSpool, Replayable, SpoolMark};
 use crate::backfill::visibility_gate::{GateStats, resolve_phase, stream_phase};
 use crate::backfill::visibility_pending::{self, PendingSpool};
 use crate::backfill::wal_replay::{
     ReplayStats, ReplayTargets, SegmentPump, WalReplayInputs, WalReplaySink, pump_segments_through,
 };
-use crate::backfill::walk_barrier::{WALK_CHECKPOINT_PERIOD, WalkBarrier};
+use crate::backfill::walk_barrier::WalkBarrier;
 use crate::decode::heap_decoder::{XLOG_HEAP_OPMASK, XLOG_HEAP_TRUNCATE};
 use crate::decode::visibility::{PgXactPatch, SealedPatch};
 use crate::decode::wal_xact::{
@@ -90,19 +90,21 @@ use crate::source::timeline::TimelineHistory;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
-use ahash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 
 /// Run one coalesced backup pass for `reqs` (all sharing `mode`).
 pub async fn run_pass(
     ctx: &PassContext,
     mode: InitialLoadMode,
     reqs: &[BackupRequest],
-) -> Result<PassOutcome> {
+) -> Result<PassOutcome, PassError> {
     match mode {
-        InitialLoadMode::None | InitialLoadMode::Copy => {
-            bail!("backup_backfill: mode {mode:?} routes via the copy backfiller")
-        }
-        InitialLoadMode::BaseBackup => run_base_backup_pass(ctx, reqs).await,
+        InitialLoadMode::None | InitialLoadMode::Copy => Err(PassError::Preflight(anyhow!(
+            "backup_backfill: mode {mode:?} routes via the copy backfiller"
+        ))),
+        InitialLoadMode::BaseBackup => run_base_backup_pass(ctx, reqs)
+            .await
+            .map_err(PassError::Load),
         InitialLoadMode::ObjectStore => run_object_store_pass(ctx, reqs).await,
     }
 }
@@ -156,7 +158,51 @@ fn target_db_oid(reqs: &[BackupRequest]) -> Result<Oid> {
     Ok(db_oid)
 }
 
-async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Result<PassOutcome> {
+struct ObjectStorePass {
+    source: Box<dyn BackupSource>,
+    tags: HashMap<(Oid, Oid), u64>,
+    patch: SealedPatch,
+    replay: Option<ReplayLeg>,
+    outcome: PassOutcome,
+    resolved: String,
+    seg_dir: PathBuf,
+}
+
+async fn run_object_store_pass(
+    ctx: &PassContext,
+    reqs: &[BackupRequest],
+) -> Result<PassOutcome, PassError> {
+    let ObjectStorePass {
+        source,
+        tags,
+        patch,
+        replay,
+        mut outcome,
+        resolved,
+        seg_dir,
+    } = prepare_object_store_pass(ctx, reqs)
+        .await
+        .map_err(PassError::Preflight)?;
+    walk_and_ship(
+        ctx,
+        source,
+        reqs,
+        &tags,
+        patch,
+        replay,
+        &mut outcome,
+        Some(resolved),
+    )
+    .await
+    .map_err(PassError::Load)?;
+    tokio::fs::remove_dir_all(&seg_dir).await.ok();
+    Ok(outcome)
+}
+
+async fn prepare_object_store_pass(
+    ctx: &PassContext,
+    reqs: &[BackupRequest],
+) -> Result<ObjectStorePass> {
     let target_db = target_db_oid(reqs)?;
     // Archive from the `[backup]` config, never the source-PG overlay:
     // credentials in a source table is the wrong trust direction
@@ -252,20 +298,15 @@ async fn run_object_store_pass(ctx: &PassContext, reqs: &[BackupRequest]) -> Res
         .map(|r| (rfn_key(&r.desc), r.s_lsn.min(b_redo)))
         .collect();
     let had_gap = !gap_segments.is_empty();
-    walk_and_ship(
-        ctx,
+    Ok(ObjectStorePass {
         source,
-        reqs,
-        &tags,
+        tags,
         patch,
-        had_gap.then_some((gap_segments, b_redo)),
-        &mut outcome,
-        Some(resolved),
-    )
-    .await?;
-    // Fetched segments only help a *failed* pass resume; reclaim on success
-    tokio::fs::remove_dir_all(&seg_dir).await.ok();
-    Ok(outcome)
+        replay: had_gap.then_some((gap_segments, b_redo)),
+        outcome,
+        resolved,
+        seg_dir,
+    })
 }
 
 fn rfn_key(desc: &RelDescriptor) -> (Oid, Oid) {
@@ -301,7 +342,7 @@ async fn walk_and_ship(
             .await
             .toast_descriptor_for(r.desc.oid)
             .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: toast descriptor: {e}"))?;
+            .context("backup_backfill: toast descriptor")?;
         if let Some(td) = toast {
             lsn_overrides.insert(rfn_key(&td), tags[&rfn_key(&r.desc)]);
             filter.insert(td);
@@ -359,12 +400,13 @@ async fn walk_and_ship(
         }
         let (drain_outcome, pending, resumed) = if checkpoint.ready() {
             outcome.counts = checkpoint.counts;
-            let spool = DeferredSpool::resume(
-                ctx.scratch_dir.join("bootstrap_deferred.bin"),
-                checkpoint.spool,
-                checkpoint.offset,
-            )
-            .await?;
+            // A walk that deferred no referrer never created the spool
+            let spool = if checkpoint.spool == SpoolMark::default() {
+                None
+            } else {
+                let path = ctx.scratch_dir.join("bootstrap_deferred.bin");
+                Some(DeferredSpool::resume(path, checkpoint.spool, checkpoint.offset).await?)
+            };
             ctx.stats
                 .bootstrap_deferred_spool_bytes
                 .fetch_add(checkpoint.spool.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -373,7 +415,7 @@ async fn walk_and_ship(
             (
                 bootstrap::BootstrapDrainOutcome::default(),
                 PendingSpool::new(ctx.scratch_dir.join("gate_pending.bin"), filter.clone()),
-                Some(spool),
+                spool,
             )
         } else {
             let (drain_outcome, pending) = run_walk(
@@ -584,7 +626,7 @@ async fn run_walk(
 
     // Built after the reopen so a failed reopen retires the skip set with
     // the spools it could no longer prove
-    let barrier = resumable.then(|| Arc::new(WalkBarrier::default()));
+    let barrier = resumable.then(|| Arc::new(WalkBarrier::new(ctx.checkpoint_period)));
     let mut walk_sink = PageWalkSink::new(filter.clone(), walk_tx, resolver.stores_chunks())
         .with_stats(ctx.stats.backfill_backup_walk.clone())
         .with_gate(accums.clone())
@@ -714,7 +756,10 @@ async fn gate_task(
     .await?;
     let Ok(accums) = walk_ok.await else {
         stats.gated += stats.deferred;
-        deferred.discard().await;
+        // Resumable pass: the walk checkpoint still names this spool
+        if barrier.is_none() {
+            deferred.discard().await;
+        }
         // Resolution never ran; shipping reclaims the empty pending row spool
         return Ok((stats, 0, pending));
     };
@@ -760,16 +805,17 @@ async fn record_walked(
         return std::future::pending().await;
     };
     loop {
-        tokio::time::sleep(WALK_CHECKPOINT_PERIOD).await;
-        let Some(proof) = barrier.collect().await else {
-            continue;
+        tokio::time::sleep(barrier.period()).await;
+        let walk = match barrier.collect().await {
+            Some(proof) => match proof.prove(tail).await {
+                Ok(walk) => Some(walk),
+                Err(e) => return anyhow::Error::msg(e),
+            },
+            None => None,
         };
-        let walk = match proof.prove(tail).await {
-            Ok(walk) => walk,
-            Err(e) => return anyhow::Error::msg(e),
-        };
-        state.walk.record(walk, barrier).await;
-        if let Err(e) = state.save(dir).await {
+        if state.walk.record(walk, barrier).await
+            && let Err(e) = state.save(dir).await
+        {
             return e;
         }
     }
@@ -862,7 +908,7 @@ async fn replay_gap(
             drain_batch_bytes: ctx.dest.current().drain_batch_bytes,
             ..XactBufferConfig::new(spill)
         })
-        .map_err(|e| anyhow::anyhow!("backup_backfill: replay xact buffer: {e}"))?,
+        .context("backup_backfill: replay xact buffer")?,
     ));
     buffer.lock().await.clear_scratch_dir().ok();
 
@@ -875,7 +921,7 @@ async fn replay_gap(
             .await
             .toast_descriptor_for(desc.oid)
             .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: toast descriptor: {e}"))?
+            .context("backup_backfill: toast descriptor")?
         {
             filter_rfns.insert(rfn_key(&td));
         }
@@ -908,10 +954,10 @@ async fn replay_gap(
         return sink
             .finish()
             .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"));
+            .context("backup_backfill: finish gap replay");
     };
     let mut pump = SegmentPump::start(first, ctx.log.db_oid())?;
-    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
+    let mut ticker = Ticker::new(ctx.checkpoint_period);
     for (seg, path) in segments {
         pump.push(seg, path, &mut sink).await?;
         // Boundary flush costs an insert round trip, so pace it like the walk
@@ -922,7 +968,7 @@ async fn replay_gap(
         let seq = sink
             .segment_boundary()
             .await
-            .map_err(|e| anyhow::anyhow!("backup_backfill: gap replay boundary: {e}"))?;
+            .context("backup_backfill: gap replay boundary")?;
         tail.checkpoint(seq).await.map_err(anyhow::Error::msg)?;
         // Resume cannot start above a transaction whose prefix is buffered
         let end = seg.start_lsn(WAL_SEG_SIZE) + WAL_SEG_SIZE;
@@ -931,7 +977,7 @@ async fn replay_gap(
     }
     sink.finish()
         .await
-        .map_err(|e| anyhow::anyhow!("backup_backfill: finish gap replay: {e}"))
+        .context("backup_backfill: finish gap replay")
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1169,9 @@ mod tests {
         HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
         PgMultiXactAccum, PgXactAccum, PgXactView,
     };
-    use crate::decode::wal_xact::{XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_HAS_INFO};
+    use crate::decode::wal_xact::{
+        XACT_XINFO_HAS_TWOPHASE, XLOG_XACT_ASSIGNMENT, XLOG_XACT_HAS_INFO,
+    };
     use crate::record::Route;
     use walrus::pg::walparser::{
         BlockLocation, RelFileNode, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
@@ -1315,6 +1363,23 @@ mod tests {
         ));
         assert!(s.skew.is_some(), "malformed commit payload fails closed");
         assert!(s.patch.is_empty());
+        let mut s = prescan(16400, 16400);
+        let abort = XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO;
+        s.observe(&record(RmId::Xact, abort, 700, vec![0u8; 10], None));
+        assert!(
+            s.skew
+                .as_deref()
+                .is_some_and(|r| r.starts_with("malformed abort"))
+        );
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(
+            RmId::Xact,
+            XLOG_XACT_ASSIGNMENT,
+            700,
+            Vec::new(),
+            None,
+        ));
+        assert!(s.skew.is_none() && s.patch.is_empty());
     }
 
     #[test]
@@ -1399,6 +1464,31 @@ mod tests {
         let mut s = prescan(16401, 16401);
         s.observe(&record(RmId::Heap, XLOG_HEAP_TRUNCATE, 12, md, None));
         assert!(s.skew.is_none(), "TRUNCATE of other rels ignored");
+    }
+
+    /// Blockless heap records and pg_class deletes carry no catalog row
+    #[test]
+    fn prescan_ignores_heap_records_without_a_new_catalog_tuple() {
+        let mut s = prescan(16400, 16400);
+        s.observe(&record(RmId::Heap, 0x00, 12, Vec::new(), None));
+        let delete = crate::decode::heap_decoder::XLOG_HEAP_DELETE;
+        let block = Some((db_rfn(TARGET_DB, PG_CLASS_RELNODE), Vec::new()));
+        s.observe(&record(RmId::Heap, delete, 12, Vec::new(), block));
+        assert!(s.skew.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_segments_reports_an_uncreatable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let storage: walrus::storage::DynStorage =
+            Arc::new(walrus::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let settings = walrus::config::Settings::default();
+        let err = fetch_segments(&settings, &storage, &file.join("gap"), &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("create "), "{err}");
     }
 
     /// Relation OIDs, mapped-catalog filenodes and pg_class rows all repeat
@@ -1524,6 +1614,20 @@ mod tests {
             None,
         ));
         assert_eq!(s.patch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prescan_gap_seals_an_empty_gap_and_reports_unreadable_segments() {
+        let (oids, rfns) = (HashSet::new(), HashMap::default());
+        let patch = prescan_gap(&[], TARGET_DB, &oids, &rfns, 0).await.unwrap();
+        assert_eq!(patch.len(), 0);
+        let seg = SegmentName::parse("000000010000000000000001").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let segments = [(seg, dir.path().join("absent"))];
+        let err = prescan_gap(&segments, TARGET_DB, &oids, &rfns, 0)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").starts_with("read "), "{err:#}");
     }
 
     #[test]
@@ -1850,5 +1954,31 @@ mod tests {
             let (start, end) = backup_range(1, from..to);
             assert!(validate_backup_lineage(&TimelineHistory::root(1), &start, &end).is_err());
         }
+    }
+
+    /// Walk proof the tail cannot back stops checkpoint recording
+    #[tokio::test]
+    async fn record_walked_fails_once_tail_cannot_prove_walk() {
+        let tail = OwnedTail::null();
+        // Second registration of seq 0 wedges the ack collector
+        for _ in 0..2 {
+            tail.ack.seqs(0).mark(0);
+        }
+        let barrier = WalkBarrier::new(std::time::Duration::from_millis(1));
+        barrier
+            .publish_gate(vec![("base/5/16400".into(), 0)], SpoolMark::default())
+            .await;
+        barrier.publish_drain(0, 1, SpoolMark::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = BackupCheckpoint::new(
+            InitialLoadMode::ObjectStore,
+            &[],
+            &Arc::default(),
+            &crate::emit::ch_emitter::EmitterConfig::default(),
+            None,
+        );
+        let err = record_walked(Some(&barrier), &tail, &mut state, dir.path()).await;
+        assert!(err.to_string().contains("seq registered twice"), "{err}");
+        assert!(BackupCheckpoint::load(dir.path()).await.unwrap().is_none());
     }
 }

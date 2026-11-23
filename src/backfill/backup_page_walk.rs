@@ -34,7 +34,7 @@ use crate::decode::heap_decoder::{
 };
 use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum, PgXactView, SealedPatch};
 use crate::schema::RelDescriptor;
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// Heap page size, PG compile-time, identical to wal-rus `BLOCK_SIZE`
 pub const PAGE_BYTES: usize = 8192;
@@ -725,7 +725,7 @@ impl BackupSink for PageWalkSink {
         }
         Ok(FileAction::Tap(Box::new(PageWalkEntry {
             block_no: f.segno.saturating_mul(RELSEG_BLOCKS),
-            slab: Vec::with_capacity(SLAB_BYTES + PAGE_BYTES),
+            slab: Vec::new(),
             spare: None,
             walk: (!is_toast || self.store_toast).then_some(WalkTarget { desc, lsn }),
             out: match &self.out_tx {
@@ -760,10 +760,10 @@ pub struct PageWalkEntry {
     /// `(blkno, offnum)`, and all walk rows share one LSN, so per-file
     /// numbering would collide segment TIDs at equal version
     block_no: u32,
-    /// Accumulates body bytes; complete pages walk in place out of it and
-    /// only a sub-page remainder carries into the next slab
+    /// Body bytes awaiting the walk. A slab-sized chunk becomes the slab
+    /// as is; only a sub-page remainder carries into the next one
     slab: Vec<u8>,
-    /// The slab last handed to the walk, back for reuse. Two buffers
+    /// The slab last walked, back for the source to refill. Two buffers
     /// ping-pong, so a segment allocates twice however long it is
     spare: Option<Vec<u8>>,
     walk: Option<WalkTarget>,
@@ -797,30 +797,22 @@ impl PageWalkEntry {
         if full == 0 {
             return Ok(());
         }
-        let take = full * PAGE_BYTES;
         let first_block = self.block_no;
         self.block_no = self.block_no.saturating_add(full as u32);
 
+        // At most one walk in flight, so a segment holds two slabs, never more
+        self.join_pending().await?;
+        let rest = self.slab.split_off(full * PAGE_BYTES);
+        let walked = std::mem::replace(&mut self.slab, rest);
         let Some(target) = self.walk.as_ref() else {
             self.stats
                 .pages_walked
                 .fetch_add(full as u64, Ordering::Relaxed);
-            self.slab.drain(..take);
+            self.spare = Some(walked);
             return Ok(());
         };
         let desc = target.desc.clone();
         let lsn = target.lsn;
-
-        // At most one walk in flight, so a segment holds two slabs, never more
-        self.join_pending().await?;
-        let mut next = self
-            .spare
-            .take()
-            .unwrap_or_else(|| Vec::with_capacity(SLAB_BYTES + PAGE_BYTES));
-        next.clear();
-        next.extend_from_slice(&self.slab[take..]);
-        let mut walked = std::mem::replace(&mut self.slab, next);
-        walked.truncate(take);
 
         let stats = self.stats.clone();
         // Pure CPU over a byte slice; off the async runtime so the drain
@@ -878,12 +870,20 @@ impl PageWalkEntry {
 
 #[async_trait]
 impl EntrySink for PageWalkEntry {
-    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.slab.extend_from_slice(bytes);
+    fn chunk_len(&self) -> usize {
+        SLAB_BYTES
+    }
+
+    async fn chunk(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        if self.slab.is_empty() {
+            std::mem::swap(&mut self.slab, &mut bytes);
+        } else {
+            self.slab.extend_from_slice(&bytes);
+        }
         if self.slab.len() >= SLAB_BYTES {
             self.drain_slab().await?;
         }
-        Ok(())
+        Ok(self.spare.take().unwrap_or(bytes))
     }
 
     async fn end(mut self: Box<Self>) -> io::Result<()> {
@@ -972,9 +972,13 @@ impl CompleteAccums {
 
 #[async_trait]
 impl EntrySink for SlruEntry {
-    async fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.buf.extend_from_slice(bytes);
-        Ok(())
+    async fn chunk(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        if self.buf.is_empty() {
+            std::mem::swap(&mut self.buf, &mut bytes);
+        } else {
+            self.buf.extend_from_slice(&bytes);
+        }
+        Ok(bytes)
     }
 
     async fn end(self: Box<Self>) -> io::Result<()> {
@@ -1313,6 +1317,65 @@ mod tests {
         let mut tally = PageWalkTally::default();
         let err = walker.walk_page(&page, 0, &mut out, &mut tally);
         assert!(matches!(err, Err(PageWalkError::BadPageHeader { .. })));
+        let err = walker.walk_page(&page[..8], 0, &mut out, &mut tally);
+        assert!(matches!(
+            err,
+            Err(PageWalkError::BadPageHeader {
+                lower: 0,
+                upper: 0,
+                ..
+            })
+        ));
+    }
+
+    fn set_slot(page: &mut [u8], slot: usize, lp_off: usize, lp_len: usize) {
+        let raw = (lp_off as u32 & 0x7FFF) | ((LP_NORMAL as u32) << 15) | ((lp_len as u32) << 17);
+        let at = SIZE_OF_PAGE_HEADER + slot * SIZE_OF_ITEM_ID;
+        page[at..at + SIZE_OF_ITEM_ID].copy_from_slice(&raw.to_le_bytes());
+    }
+
+    #[test]
+    fn page_walker_counts_unreadable_slots_as_truncated() {
+        let rel = make_rel();
+        let walker = PageWalker::new(&rel, 0);
+        let mut page = synth_single_tuple_page(7);
+        let tuple_off = PAGE_BYTES - 32;
+        // Past page end, shorter than a tuple header, then zeroed t_hoff
+        set_slot(&mut page, 1, tuple_off, 64);
+        set_slot(&mut page, 2, tuple_off, 10);
+        set_slot(&mut page, 3, 512, 32);
+        page[12..14]
+            .copy_from_slice(&((SIZE_OF_PAGE_HEADER + 4 * SIZE_OF_ITEM_ID) as u16).to_le_bytes());
+        let mut out = Vec::new();
+        let mut tally = PageWalkTally::default();
+        walker.walk_page(&page, 0, &mut out, &mut tally).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(tally.tuples_skipped_truncated, 3);
+    }
+
+    #[test]
+    fn page_helpers_read_nothing_from_a_short_page() {
+        let short = [0u8; 8];
+        assert_eq!(page_tuple_bytes(&short, 1), None);
+        assert_eq!(page_max_offnum(&short), 0);
+        assert_eq!(page_pd_lsn(&short), 0);
+    }
+
+    #[test]
+    fn toast_rows_from_page_skips_undecodable_and_non_chunk_tuples() {
+        let rel = toast_chunk_rel();
+        let mut page = synth_toast_chunk_page(&[(7, 0, b"first"), (8, 0, b"second")], 0x9000);
+        // t_hoff below the tuple header
+        let raw = u32::from_le_bytes(
+            page[SIZE_OF_PAGE_HEADER..SIZE_OF_PAGE_HEADER + 4]
+                .try_into()
+                .unwrap(),
+        );
+        page[(raw & 0x7FFF) as usize + 22] = 0;
+        let rows = toast_rows_from_page(&page, &rel, 0, 0x9000);
+        assert_eq!(rows.iter().map(|r| r.chunk_id).collect::<Vec<_>>(), [8]);
+        let heap = synth_single_tuple_page(7);
+        assert!(toast_rows_from_page(&heap, &make_rel(), 0, 0x9000).is_empty());
     }
 
     #[test]
@@ -1348,8 +1411,8 @@ mod tests {
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
         let page = synth_single_tuple_page(99);
         // Two chunks exercise the buffer-across-chunk path
-        entry.chunk(&page[..4096]).await.unwrap();
-        entry.chunk(&page[4096..]).await.unwrap();
+        entry.chunk(page[..4096].to_vec()).await.unwrap();
+        entry.chunk(page[4096..].to_vec()).await.unwrap();
         entry.end().await.unwrap();
         sink.finish(&EndInfo {
             end_lsn: 0,
@@ -1372,6 +1435,53 @@ mod tests {
         assert_eq!(ld(&sink.stats.tuples_emitted), 1);
     }
 
+    #[tokio::test]
+    async fn pagewalk_sink_fails_once_the_walk_channel_closes() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let barrier = Arc::new(WalkBarrier::default());
+        let sink = PageWalkSink::new(catalog, tx, false).with_resume(
+            barrier,
+            HashSet::default(),
+            HashSet::default(),
+        );
+        // Empty page ships nothing, so only the end-of-file marker fails
+        let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
+        entry.chunk(vec![0u8; PAGE_BYTES]).await.unwrap();
+        assert!(entry.end().await.is_err());
+        let mut entry = tap(&sink, &heap_meta("base/5/16400.1")).await;
+        entry
+            .chunk(synth_single_tuple_page(1).to_vec())
+            .await
+            .unwrap();
+        let err = entry.end().await.unwrap_err();
+        assert!(err.to_string().contains("emitter channel closed"), "{err}");
+    }
+
+    /// A TOAST heap the store does not consume is counted, never decoded;
+    /// a misframed heap page is skipped, not fatal
+    #[tokio::test]
+    async fn pagewalk_sink_counts_unstored_toast_and_skips_misframed_pages() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(Arc::new(make_rel()));
+        catalog.insert(Arc::new(toast_chunk_rel()));
+        let sink = PageWalkSink::new_capturing(catalog);
+        let mut entry = tap(&sink, &heap_meta("base/5/16401")).await;
+        let page = synth_toast_chunk_page(&[(7, 0, b"first")], 0x9000);
+        entry.chunk(page.to_vec()).await.unwrap();
+        entry.end().await.unwrap();
+        let mut misframed = [0u8; PAGE_BYTES];
+        misframed[12..14].copy_from_slice(&(PAGE_BYTES as u16).to_le_bytes());
+        let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
+        entry.chunk(misframed.to_vec()).await.unwrap();
+        entry.end().await.unwrap();
+        assert!(sink.captured().is_empty());
+        assert_eq!(ld(&sink.stats.toast_files_observed), 1);
+        assert_eq!(ld(&sink.stats.pages_walked), 1);
+    }
+
     /// `.N` segment tuples get global block numbers: same local page +
     /// offnum in the base file and `.1` must yield distinct TIDs, else
     /// toast rows collide at equal walk LSN and merge keeps either.
@@ -1389,7 +1499,10 @@ mod tests {
         .unwrap();
         for path in ["base/5/16400", "base/5/16400.1"] {
             let mut entry = tap(&sink, &heap_meta(path)).await;
-            entry.chunk(&synth_single_tuple_page(7)).await.unwrap();
+            entry
+                .chunk(synth_single_tuple_page(7).to_vec())
+                .await
+                .unwrap();
             entry.end().await.unwrap();
         }
         let captured = sink.captured();
@@ -1528,7 +1641,10 @@ mod tests {
         .unwrap();
 
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
-        entry.chunk(&synth_single_tuple_page(1)).await.unwrap();
+        entry
+            .chunk(synth_single_tuple_page(1).to_vec())
+            .await
+            .unwrap();
         entry.end().await.unwrap();
         assert!(matches!(
             sink.begin(&heap_meta("base/5/16401")).await.unwrap(),
@@ -1566,7 +1682,7 @@ mod tests {
         }
         let mut entry = tap(&sink, &heap_meta("base/5/16400")).await;
         for chunk in body.chunks(6000) {
-            entry.chunk(chunk).await.unwrap();
+            entry.chunk(chunk.to_vec()).await.unwrap();
         }
         entry.end().await.unwrap();
 
@@ -1694,22 +1810,40 @@ mod tests {
         // interleave: worst case for a shared slot
         let mut a = tap(&sink, &heap_meta("base/5/16400")).await;
         let mut b = tap(&sink, &heap_meta("base/5/16401")).await;
-        b.chunk(&synth_single_tuple_page(200)).await.unwrap();
-        a.chunk(&synth_single_tuple_page(100)).await.unwrap();
+        b.chunk(synth_single_tuple_page(200).to_vec())
+            .await
+            .unwrap();
+        a.chunk(synth_single_tuple_page(100).to_vec())
+            .await
+            .unwrap();
         a.end().await.unwrap();
         b.end().await.unwrap();
 
         // Each tuple carries its own file's rfn + value; a shared slot
         // would attribute both to rel B
-        let captured = sink.captured();
-        let mut by_rel: HashMap<Oid, i32> = HashMap::new();
-        for t in &captured {
-            if let Some(Some(ColumnValue::Int4(v))) = t.columns.first() {
-                by_rel.insert(t.rfn.rel_node, *v);
-            }
-        }
-        assert_eq!(captured.len(), 2);
-        assert_eq!(by_rel.get(&16400), Some(&100), "entry A decoded vs rel A");
-        assert_eq!(by_rel.get(&16401), Some(&200), "entry B decoded vs rel B");
+        let mut by_rel: Vec<_> = sink
+            .captured()
+            .into_iter()
+            .map(|t| (t.rfn.rel_node, t.columns))
+            .collect();
+        by_rel.sort_by_key(|(rel_node, _)| *rel_node);
+        assert_eq!(
+            by_rel,
+            [
+                (16400, vec![Some(ColumnValue::Int4(100))]),
+                (16401, vec![Some(ColumnValue::Int4(200))]),
+            ]
+        );
+    }
+
+    /// Null bitmap claiming more attributes than the tuple holds
+    #[test]
+    fn on_page_tuple_with_overlong_null_bitmap_decodes_nothing() {
+        use crate::decode::heap_decoder::HEAP_HASNULL;
+        let mut tuple = [0u8; 24];
+        tuple[18..20].copy_from_slice(&0x07FFu16.to_le_bytes());
+        tuple[20..22].copy_from_slice(&HEAP_HASNULL.to_le_bytes());
+        tuple[22] = 24;
+        assert!(decode_on_page_tuple(&tuple, &make_rel()).is_none());
     }
 }

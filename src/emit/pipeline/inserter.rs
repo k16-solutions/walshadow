@@ -12,10 +12,10 @@
 //! dedups by `_lsn`). Retry-exhaustion is fatal: the watermark can't advance
 //! without this batch.
 
-use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, TypeAst};
+use clickhouse_c::{Allocator, BlockBuilder, ColumnBuilder, QueryOpts, TypeAst};
 use tokio::task::JoinHandle;
 
-use crate::ch::{ChConn, EmitterError, EndOfStream, drain_to_end_of_stream, with_timeout};
+use crate::ch::{ChConn, EmitterError, EndOfStream, INSERT_GATE, drain_to_end_of_stream};
 use crate::config::DestEmitter;
 use crate::emit::ch_emitter::{EmitterStats, build_leaf, build_root};
 use crate::emit::pipeline::Fatal;
@@ -23,7 +23,7 @@ use crate::emit::pipeline::ack::AckHandle;
 use crate::emit::pipeline::batcher::BatchMeta;
 use crate::emit::pipeline::resolver::ResolvedBatch;
 use crate::schema::TableKey;
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -63,18 +63,18 @@ impl Inserter {
         sql: &str,
         bb: &BlockBuilder<'_>,
     ) -> Result<EndOfStream, EmitterError> {
-        let insert_timeout = self.client.config().insert_timeout;
         let started = std::time::Instant::now();
         let result = self
             .client
             .retry(
                 |mut client| async move {
-                    let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
-                        client.send_data(Some(bb)).await?;
+                    let _pass = INSERT_GATE.enter();
+                    let result = async {
+                        client.send_query(sql, &QueryOpts::new()).await?;
+                        client.send_data(bb).await?;
                         client.send_data_end().await?;
                         drain_to_end_of_stream(&mut client).await
-                    })
+                    }
                     .await;
                     (client, result)
                 },
@@ -230,7 +230,82 @@ pub(crate) async fn spawn_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::heap_decoder::ColumnValue;
+    use crate::emit::ch_emitter::ColumnBuf;
     use crate::emit::pipeline::ack;
+    use crate::emit::pipeline::batcher::InsertBatch;
+    use crate::emit::pipeline::resolver::tests::{GEOM_OID, seal, wkt_row};
+
+    async fn run_one(batch: InsertBatch) -> String {
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let dest = DestEmitter::new(Arc::default(), None);
+        let inserter = Inserter {
+            client: ChConn::deferred(dest),
+            alloc: Allocator::global(&mimalloc::MiMalloc),
+            asts: HashMap::new(),
+            ack,
+            stats: Arc::default(),
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        let resolved = None;
+        tx.send(ResolvedBatch { batch, resolved }).await.unwrap();
+        let fatal = Fatal::new();
+        inserter.run(rx, fatal.clone()).await;
+        collector.await.unwrap();
+        fatal.message().expect("inserter trips fatal")
+    }
+
+    /// Batch shape faults fail before any connection dials
+    #[tokio::test]
+    async fn unanswered_oracle_column_and_bad_type_trip_fatal() {
+        let mut raw = wkt_row(0, None);
+        raw.committed.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Unsupported {
+            type_oid: GEOM_OID,
+            raw: vec![1],
+        });
+        let msg = run_one(seal(vec![raw]).await).await;
+        assert!(msg.contains("oracle answered no column"), "{msg}");
+
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let mut columns = batch.meta.columns.clone();
+        columns[0].type_repr = "Nope(((".into();
+        batch.meta = Arc::new(BatchMeta {
+            table_key: batch.meta.table_key.clone(),
+            inserts: batch.meta.inserts.clone(),
+            columns,
+            schema_epoch: batch.meta.schema_epoch,
+            rows_inserted: Arc::default(),
+        });
+        let msg = run_one(batch).await;
+        assert!(msg.starts_with("inserter type parse: "), "{msg}");
+    }
+
+    /// Slab shorter than its row count fails leaf or root build, before any dial
+    #[tokio::test]
+    async fn short_slab_trips_fatal() {
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        batch.buffers[0] = ColumnBuf::NullableFixed {
+            width: 4,
+            null_map: vec![0],
+            inner: Vec::new(),
+        };
+        let leaf = run_one(batch).await;
+        let mut batch = seal(vec![wkt_row(0, Some("POINT(1 2)"))]).await;
+        let lsn = batch
+            .buffers
+            .iter()
+            .position(|b| matches!(b, ColumnBuf::Fixed { width: 8, .. }))
+            .unwrap();
+        batch.buffers[lsn] = ColumnBuf::Fixed {
+            width: 8,
+            bytes: Vec::new(),
+        };
+        let root = run_one(batch).await;
+        for msg in [leaf, root] {
+            assert!(msg.starts_with("inserter: "), "{msg}");
+            assert!(msg.contains("fixed data"), "{msg}");
+        }
+    }
 
     #[tokio::test]
     async fn insert_retry_preserves_payload_through_failed_reconnect() {

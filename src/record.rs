@@ -188,6 +188,13 @@ pub enum SinkError {
     Other(String),
 }
 
+impl SinkError {
+    /// `map_err` adapter prefixing failure with step that failed
+    pub fn ctx<E: std::fmt::Display>(step: impl std::fmt::Display) -> impl FnOnce(E) -> Self {
+        move |e| Self::Other(format!("{step}: {e}"))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Record<'a> {
     pub parsed: XLogRecord<'a>,
@@ -483,6 +490,12 @@ impl RecordBytesSink for NoopBytesSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctx_prefixes_failed_step() {
+        let r: Result<(), _> = Err("disk full").map_err(SinkError::ctx("toast store put"));
+        assert_eq!(r.unwrap_err().to_string(), "toast store put: disk full");
+    }
 
     /// Descendant's file serves entire fork segment, including ancestor prefix
     #[test]

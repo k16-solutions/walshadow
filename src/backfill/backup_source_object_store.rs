@@ -36,7 +36,7 @@ use futures::{StreamExt, TryStreamExt};
 use walrus::compression;
 use walrus::config::Settings;
 use walrus::pg::backup::fetch::{fetch_sentinel, list_tar_parts};
-use walrus::pg::backup::tar_partitions_prefix;
+use walrus::pg::backup::{tar_partitions_prefix, tarball};
 use walrus::storage::DynStorage;
 
 use crate::backfill::backup_sentinel::build_lsn_pair;
@@ -185,7 +185,7 @@ impl BackupSource for ObjectStoreSource {
 }
 
 /// Fetch one tar part, throttle, decrypt, decompress, pump through
-/// `pump_tar_to_sink`. Decompressed reader is `AsyncRead`, tokio_tar
+/// `pump_tar_to_sink`. Decompressed reader is `AsyncRead`, tar reader
 /// drives it directly, no spawn_blocking.
 async fn unpack_one_part(
     settings: &Settings,
@@ -205,7 +205,7 @@ async fn unpack_one_part(
     let spooled = spool_backup_part(part_spool_dir, key, decrypted).await?;
     let decoded = compression::decode(method, Box::pin(spooled));
 
-    let mut archive = tokio_tar::Archive::new(decoded);
+    let mut archive = tarball::Reader::new(decoded);
     pump_tar_to_sink(&mut archive, target)
         .await
         .with_context(|| format!("ObjectStoreSource: tar unpack {key}"))?;
@@ -224,7 +224,7 @@ async fn unpack_one_part(
 /// drains. Decode against a live body ties request lifetime to the whole
 /// downstream pipeline, and walrus caps a request at 60s.
 ///
-/// The file is unlinked as soon as it is written: the fd pins the blocks,
+/// The file is unlinked as soon as it is opened: the fd pins the blocks,
 /// so no error or panic path can leak it. Same trick as
 /// [`crate::spill::BodySpoolFile`]. Bytes are still compressed here, so
 /// scratch tracks object size rather than the unpacked tar.
@@ -252,13 +252,11 @@ async fn spool_backup_part(
         .open(&path)
         .await
         .with_context(|| format!("ObjectStoreSource: open part spool {}", path.display()))?;
+    tokio::fs::remove_file(&path).await.ok();
     let bytes = tokio::io::copy(&mut body, &mut file)
         .await
         .with_context(|| format!("ObjectStoreSource: spool {key}"))?;
-    tokio::fs::remove_file(&path).await.ok();
-    file.rewind()
-        .await
-        .with_context(|| format!("ObjectStoreSource: rewind part spool {key}"))?;
+    file.rewind().await?;
     tracing::info!(
         target = "walshadow::backup_source_object_store",
         key,
@@ -284,6 +282,125 @@ fn num_cpus_or(fallback: usize) -> usize {
 mod tests {
     use super::*;
     use walrus::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, TablespaceSpec};
+
+    #[tokio::test]
+    async fn run_names_the_spool_dir_and_backup_it_could_not_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: DynStorage =
+            Arc::new(walrus::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"").await.unwrap();
+        let run = |spool: PathBuf| {
+            let source = ObjectStoreSource::new(
+                Settings::default(),
+                storage.clone(),
+                "LATEST".into(),
+                spool,
+            );
+            let sink = crate::backfill::backup_page_walk::PageWalkSink::new_capturing(
+                crate::backfill::backup_page_walk::CatalogMap::new(),
+            );
+            Box::new(source).run(tmp.path().join("void"), Arc::new(sink), Arc::default())
+        };
+        let err = run(file.join("spool")).await.unwrap_err();
+        assert!(err.to_string().starts_with("part spool dir "), "{err}");
+        let err = run(tmp.path().join("spool")).await.unwrap_err();
+        assert!(err.to_string().contains("resolve LATEST"), "{err}");
+    }
+
+    #[derive(Debug)]
+    struct RejectingCrypter;
+
+    struct Rejected;
+
+    impl tokio::io::AsyncRead for Rejected {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("ciphertext rejected")))
+        }
+    }
+
+    impl walrus::crypto::Crypter for RejectingCrypter {
+        fn name(&self) -> &'static str {
+            "rejecting"
+        }
+        fn encrypt_reader(&self, _plain: compression::AsyncReader) -> compression::AsyncReader {
+            Box::pin(Rejected)
+        }
+        fn decrypt_reader(&self, _cipher: compression::AsyncReader) -> compression::AsyncReader {
+            Box::pin(Rejected)
+        }
+    }
+
+    /// Full backup with one data part; each case breaks one step of its unpack
+    #[tokio::test]
+    async fn part_unpack_names_the_step_that_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("bucket");
+        let name = walrus::pg::backup::format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+        let sentinel = BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: std::num::NonZeroU64::new(0x0300_0000),
+                backup_finish_lsn: std::num::NonZeroU64::new(0x0300_1000),
+                pg_version: 160000,
+                files_metadata_disabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sentinel_path = root.join(walrus::pg::backup::sentinel_key(&name));
+        std::fs::create_dir_all(sentinel_path.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel_path, serde_json::to_vec(&sentinel).unwrap()).unwrap();
+        let part_key = format!("{}/part_001.tar", tar_partitions_prefix(&name));
+        let part = root.join(&part_key);
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"").unwrap();
+        let storage: DynStorage = Arc::new(walrus::storage::fs::FsStorage::new(&root).unwrap());
+        let spool = tmp.path().join("spool");
+        let run = |settings: Settings| {
+            let source =
+                ObjectStoreSource::new(settings, storage.clone(), name.clone(), spool.clone());
+            let sink = crate::backfill::backup_page_walk::PageWalkSink::new_capturing(
+                crate::backfill::backup_page_walk::CatalogMap::new(),
+            );
+            Box::new(source).run(tmp.path().join("data"), Arc::new(sink), Arc::default())
+        };
+
+        let crypter = Arc::new(RejectingCrypter);
+        let mut sealed = walrus::crypto::Crypter::encrypt_reader(&*crypter, Box::pin(&b""[..]));
+        let sealing = tokio::io::AsyncReadExt::read(&mut sealed, &mut [0; 1]).await;
+        assert_eq!(sealing.unwrap_err().to_string(), "ciphertext rejected");
+        assert_eq!(walrus::crypto::Crypter::name(&*crypter), "rejecting");
+        let rejecting = Settings {
+            crypter: Some(crypter),
+            ..Settings::default()
+        };
+        let err = run(rejecting).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("ObjectStoreSource: spool {part_key}")
+        );
+
+        let spool_file = spool.join("backup_part_part_001.tar");
+        std::fs::create_dir_all(&spool_file).unwrap();
+        let err = run(Settings::default()).await.unwrap_err();
+        let want = format!(
+            "ObjectStoreSource: open part spool {}",
+            spool_file.display()
+        );
+        assert_eq!(err.to_string(), want);
+
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = run(Settings::default()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("ObjectStoreSource: get {part_key}")
+        );
+    }
 
     #[test]
     fn timeline_parses_from_backup_name() {
@@ -316,6 +433,8 @@ mod tests {
         assert_eq!(end.end_lsn, 0x0300_1000);
         assert_eq!(start.timeline, 1);
 
+        s.sentinel.backup_finish_lsn = None;
+        assert!(build_lsn_pair(&resolved, &s).is_err());
         s.sentinel.backup_start_lsn = None;
         assert!(build_lsn_pair(&resolved, &s).is_err());
     }

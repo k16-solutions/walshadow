@@ -126,6 +126,15 @@ impl Reloader {
         unfollowed.retain(|db| !resolvers.iter().any(|r| r.dbname() == db));
         Ok(unfollowed)
     }
+
+    pub async fn live_configs(&self) -> BTreeMap<String, Arc<crate::config::ResolvedConfig>> {
+        self.resolvers
+            .lock()
+            .await
+            .iter()
+            .map(|r| (r.dbname().to_owned(), r.subscribe().borrow().clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +146,8 @@ impl Reloader {
 #[derive(Clone)]
 pub struct SharedCtx {
     pub ch_config: PathBuf,
-    /// Fragment control mutations write, see [`fragment_path`]
-    pub fragment: PathBuf,
+    /// Fragment control mutations write
+    pub fragment: Fragment,
     /// CLI-arg `[source]` / `[ch]` defaults; the config file overrides them,
     /// matching the daemon's connection resolution
     /// (see `ch_emitter::load_effective`).
@@ -216,11 +225,9 @@ pub(crate) fn ok_toml(t: &Table) -> String {
 /// Bind the control socket (unlinking any stale one, 0600) and serve one
 /// request per connection until the runtime tears down.
 pub fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()>> {
-    if let Some(dir) = path.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
+    // Bare file name: parent is "", which create_dir_all accepts
+    let dir = path.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -240,7 +247,10 @@ pub fn serve(path: PathBuf, ctx: SharedCtx) -> Result<tokio::task::JoinHandle<()
                         }
                     });
                 }
-                Err(e) => tracing::warn!(target: "walshadow::control", error = %e, "accept failed"),
+                Err(e) => {
+                    tracing::warn!(target: "walshadow::control", error = %e, "accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     }))
@@ -289,7 +299,7 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
         bail!("empty apply (send a TOML fragment as the body)");
     }
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
+    let mut root = load(&ctx.fragment.path()).await?;
     crate::ch_emitter::merge_tables(&mut root, req.config.clone());
     commit(ctx, &ctx.fragment, &root).await
 }
@@ -297,7 +307,7 @@ async fn apply(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
 /// Removes named keys without touching operator-owned base config
 async fn unset(ctx: &SharedCtx, req: &Request<'_>) -> Result<String> {
     let _guard = ctx.frag_lock.lock().await;
-    let mut root = load(&ctx.fragment).await?;
+    let mut root = load(&ctx.fragment.path()).await?;
     apply_mask(&mut root, &req.config);
     commit(ctx, &ctx.fragment, &root).await
 }
@@ -316,8 +326,8 @@ fn apply_mask(root: &mut Table, mask: &Table) {
 
 /// Persist `root` as fragment `frag` only once merged config accepts it, so
 /// file never holds a rejected fragment, not even briefly
-async fn commit(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<String> {
-    validate(ctx, frag, root)
+async fn commit(ctx: &SharedCtx, frag: &Fragment, root: &Table) -> Result<String> {
+    validate(ctx, &frag.path(), root)
         .await
         .context("rejected: merged config invalid")?;
     save(frag, root).await?;
@@ -354,12 +364,27 @@ pub const DEFAULT_FRAGMENT: &str = "50-api.toml";
 
 /// Plain `.toml` name, so reload picks the fragment up in its lexical slot of
 /// the `ch-config.d` directory
-pub fn fragment_path(ch_config: &Path, name: &str) -> Result<PathBuf> {
+#[derive(Clone, Debug)]
+pub struct Fragment {
+    dir: PathBuf,
+    name: String,
+}
+
+impl Fragment {
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(&self.name)
+    }
+}
+
+pub fn fragment_path(ch_config: &Path, name: &str) -> Result<Fragment> {
     let plain = Path::new(name).file_name().is_some_and(|n| n == name);
     if !plain || Path::new(name).extension().is_none_or(|e| e != "toml") {
         bail!("control fragment {name:?} must be a .toml file name without directories");
     }
-    Ok(ch_config.with_extension("d").join(name))
+    Ok(Fragment {
+        dir: ch_config.with_extension("d"),
+        name: name.to_owned(),
+    })
 }
 
 async fn get_config(ctx: &SharedCtx) -> Result<Table> {
@@ -378,8 +403,15 @@ async fn tables_list<'a>(ctx: &SharedCtx, req: &Request<'a>) -> Result<String> {
     let listed = introspect::tables(&client, ns)
         .await
         .context("list tables")?;
-    let selected: ahash::HashSet<(String, String)> =
+    let mut selected: foldhash::HashSet<(String, String)> =
         selected_tables(&root, db).into_iter().collect();
+    if let Some(live) = ctx.reloader.live_configs().await.get(db) {
+        selected.extend(
+            live.tables
+                .keys()
+                .map(|rel| (rel.namespace.to_string(), rel.name.to_string())),
+        );
+    }
     let arr = listed
         .into_iter()
         .map(|t| {
@@ -504,7 +536,62 @@ fn status_tables(
     db: &str,
     ch_database: &str,
     instances: &BTreeMap<String, InstanceConfig>,
+    live: Option<&crate::config::ResolvedConfig>,
 ) -> Vec<Value> {
+    let mut rows: BTreeMap<String, Table> =
+        configured_status_tables(root, db, ch_database, instances)
+            .into_iter()
+            .filter_map(|row| {
+                let source = row.get("source_table")?.as_str()?.to_owned();
+                Some((source, row))
+            })
+            .collect();
+    if let Some(live) = live {
+        for (rel, mapping) in &live.tables {
+            let source = format!("{db}.{}.{}", rel.namespace, rel.name);
+            let initial_load = rows
+                .get(&source)
+                .and_then(|row| row.get("initial_load"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    live.table_opt_ins
+                        .get(rel)
+                        .and_then(|row| row.initial_load.clone())
+                })
+                .or_else(|| {
+                    live.namespaces
+                        .get(&*rel.namespace)
+                        .and_then(|ns| ns.initial_load)
+                        .map(|mode| mode.as_str().to_owned())
+                })
+                .unwrap_or_else(|| "none".into());
+            let target = &mapping.target;
+            let mut entry = Table::new();
+            entry.insert("source_table".into(), source.clone().into());
+            entry.insert("destination_table".into(), target.to_string().into());
+            entry.insert(
+                "destination_instance".into(),
+                target
+                    .instance
+                    .clone()
+                    .unwrap_or_else(|| "default".into())
+                    .into(),
+            );
+            entry.insert("initial_load".into(), initial_load.into());
+            entry.insert("cdc".into(), true.into());
+            rows.insert(source, entry);
+        }
+    }
+    rows.into_values().map(Value::Table).collect()
+}
+
+fn configured_status_tables(
+    root: &Table,
+    db: &str,
+    ch_database: &str,
+    instances: &BTreeMap<String, InstanceConfig>,
+) -> Vec<Table> {
     replicated_entries(root, db)
         .into_iter()
         .map(|(ns, rel, block)| {
@@ -542,7 +629,7 @@ fn status_tables(
             entry.insert("destination_instance".into(), instance.into());
             entry.insert("initial_load".into(), initial_load.into());
             entry.insert("cdc".into(), true.into());
-            Value::Table(entry)
+            entry
         })
         .collect()
 }
@@ -575,6 +662,7 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
         .cloned()
         .and_then(|v| v.try_into().ok())
         .unwrap_or_default();
+    let live = ctx.reloader.live_configs().await;
     // One entry per database, each holding that database's selected tables
     let per_db: Vec<Value> = databases(&root)
         .iter()
@@ -583,14 +671,26 @@ async fn stream_status(ctx: &SharedCtx) -> Result<String> {
             row.insert("dbname".into(), db.clone().into());
             row.insert(
                 "tables".into(),
-                Value::Array(status_tables(&root, db, &ch_database, &instances)),
+                Value::Array(status_tables(
+                    &root,
+                    db,
+                    &ch_database,
+                    &instances,
+                    live.get(db).map(Arc::as_ref),
+                )),
             );
             Value::Table(row)
         })
         .collect();
     // Flat list stays the primary database's, which is what a single-database
     // deployment reports
-    let tables = status_tables(&root, dbname(&root), &ch_database, &instances);
+    let tables = status_tables(
+        &root,
+        dbname(&root),
+        &ch_database,
+        &instances,
+        live.get(dbname(&root)).map(Arc::as_ref),
+    );
     let snap = ctx.metrics.snapshot().await;
     let mut out = Table::new();
     out.insert("paused".into(), paused.into());
@@ -734,18 +834,15 @@ async fn load(path: &Path) -> Result<Table> {
     }
 }
 
-async fn save(path: &Path, root: &Table) -> Result<()> {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
-        bail!("bad fragment path {}", path.display());
-    };
-    tokio::fs::create_dir_all(dir).await.ok();
+async fn save(frag: &Fragment, root: &Table) -> Result<()> {
+    tokio::fs::create_dir_all(&frag.dir).await.ok();
     crate::fs::write_atomic(
-        dir,
-        name,
+        &frag.dir,
+        &frag.name,
         toml::to_string(root).context("serialize toml")?.as_bytes(),
     )
     .await
-    .with_context(|| format!("write {}", path.display()))
+    .with_context(|| format!("write {}", frag.path().display()))
 }
 
 // TODO: use daemon catalog rather than a second connection per request
@@ -768,7 +865,7 @@ pub(crate) async fn pg_connect(root: &Table, dbname: Option<&str>) -> Result<Cli
 fn set_mode_600(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
+        .context(format!("chmod 600 {}", path.display()))
 }
 
 #[cfg(test)]
@@ -858,6 +955,284 @@ mod tests {
         assert!(demo.get("a").is_none() && demo.get("b").is_some());
         apply_mask(&mut root, &cfg("table = \"\""));
         assert!(root.get("table").is_none());
+        apply_mask(&mut root, &cfg("[stream]\npaused = \"\""));
+        assert!(root.get("stream").is_none(), "absent section stays absent");
+    }
+
+    #[test]
+    fn ok_with_frames_body_on_its_own_lines() {
+        assert_eq!(ok_with(""), ok());
+        assert_eq!(ok_with("a\n"), "OK\na\n");
+        assert_eq!(ok_with("a"), "OK\na\n");
+    }
+
+    /// Resolver wiring sweeps config once; a broken file only warns
+    #[tokio::test]
+    async fn wiring_sweep_survives_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-config.toml");
+        let doc: Table = "[ch]\nhost = \"ch\"\n".parse().unwrap();
+        let base = crate::ch_emitter::EmitterConfig::from_table(&doc).unwrap();
+        let (resolver, _rx) = crate::config::ConfigResolver::new(
+            &base,
+            crate::config::CliOverrides::default(),
+            Some(path.clone()),
+            Table::new(),
+            crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
+        );
+        tokio::fs::write(&path, "[ch\n").await.unwrap();
+        let reloader = Reloader::default();
+        reloader.set_resolvers(vec![resolver]).await;
+        assert!(reloader.reload().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_directory_in_socket_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = serve(dir.path().to_path_buf(), ctx_at(dir.path())).unwrap_err();
+        assert!(format!("{err:#}").contains("unlink stale"), "{err:#}");
+    }
+
+    struct Warns(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+        fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let warn = *e.metadata().level() == tracing::Level::WARN;
+            self.0
+                .fetch_add(usize::from(warn), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Accept failing on fd exhaustion is retried after a backoff, peer gone
+    /// before reply drops only its own connection
+    #[tokio::test]
+    async fn serve_outlives_fd_exhaustion_and_vanished_peers() {
+        use std::os::fd::AsRawFd;
+        use tracing_subscriber::layer::SubscriberExt;
+        let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Current-thread runtime, so spawned accept loop logs on this thread
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Warns(warns.clone())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let _h = serve(sock.clone(), ctx_at(dir.path())).unwrap();
+
+        let mut gone = UnixStream::connect(&sock).await.unwrap();
+        gone.write_all(b"\xff").await.unwrap();
+        drop(gone);
+
+        let pending = tokio::net::UnixSocket::new_stream().unwrap();
+        let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let exhausted = |limit: libc::rlimit| libc::rlimit {
+            rlim_cur: libc::rlim_t::try_from(lowest_free).unwrap(),
+            ..limit
+        };
+        // SAFETY: rlimit structs outlive each call
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted(limit)), 0);
+        }
+        let mut s = pending.connect(&sock).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // SAFETY: as above
+        unsafe { assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0) };
+        s.write_all(b"\xff").await.unwrap();
+        s.shutdown().await.unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("ERR"), "{resp}");
+        let warned = warns.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=3).contains(&warned),
+            "{warned} accept warnings in 50ms"
+        );
+    }
+
+    /// Fragment I/O and source connect failures answer ERR naming the cause
+    #[tokio::test]
+    async fn requests_surface_fragment_and_source_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let frag = ctx.fragment.path();
+        let _h = serve(sock.clone(), ctx).unwrap();
+
+        let mut raw = UnixStream::connect(&sock).await.unwrap();
+        raw.write_all(b"\xff").await.unwrap();
+        raw.shutdown().await.unwrap();
+        let mut resp = String::new();
+        raw.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("ERR"), "{resp}");
+
+        let confd = frag.parent().unwrap();
+        std::fs::create_dir_all(&frag).unwrap();
+        let resp = call(&sock, "unset", "[ch]\nport = \"\"").await;
+        assert!(resp.starts_with("ERR read"), "{resp}");
+        std::fs::remove_dir(&frag).unwrap();
+        std::fs::write(&frag, "[ch\n").unwrap();
+        let resp = call(&sock, "unset", "[ch]\nport = \"\"").await;
+        assert!(resp.starts_with("ERR parse"), "{resp}");
+        std::fs::remove_file(&frag).unwrap();
+        std::fs::set_permissions(confd, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let resp = call(&sock, "apply", "[ch]\nhost = \"ch\"").await;
+        std::fs::set_permissions(confd, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(resp.starts_with("ERR write"), "{resp}");
+
+        let resp = call(&sock, "columns", "").await;
+        assert!(resp.starts_with("ERR usage: columns list"), "{resp}");
+        let resp = call(&sock, "apply", "[source]\nhost = \"\"").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let resp = call(&sock, "schemas", "").await;
+        assert!(resp.starts_with("ERR source host not set"), "{resp}");
+        let resp = call(&sock, "apply", "[source]\nhost = \"127.0.0.1\"\nport = 1").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let resp = call(&sock, "schemas", "").await;
+        assert!(resp.starts_with("ERR connect source 127.0.0.1:1"), "{resp}");
+    }
+
+    /// `status` resolves instance-routed tables and lists decoder skips
+    #[tokio::test]
+    async fn status_lists_instances_and_skipped_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        ctx.metrics
+            .update(|snap| {
+                snap.skipped_records_by_rel = vec![crate::metrics::SkippedRel {
+                    database: "app".into(),
+                    rel_node: "16400".into(),
+                    op: "update",
+                    reason: "not_covered",
+                    records: 3,
+                }];
+            })
+            .await;
+        let _h = serve(sock.clone(), ctx).unwrap();
+        let resp = call(&sock, "apply", "[ch.instances.west]\nhost = \"w\"").await;
+        assert!(resp.starts_with("OK"), "{resp}");
+        let status = call(&sock, "status", "").await;
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        let skipped = parsed["skipped_relations"].as_array().unwrap();
+        let [skip] = &skipped[..] else { panic!() };
+        assert_eq!(skip["rel_node"].as_str(), Some("16400"));
+        assert_eq!(skip["records"].as_integer(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn status_tables_include_auto_created_mappings() {
+        use crate::mapping::{TableMapping, TableTarget};
+        use crate::schema::{RelAttr, RelDescriptor, ReplIdent};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let ctx = ctx_at(dir.path());
+        let doc = "[source]\ndbname = \"app\"\n\
+                   [ch]\ndatabase = \"cdc\"\n\
+                   [namespace.public]\nauto_create = true\ninitial_load = \"object_store\"\n\
+                   [table.public.orders]\nreplicate = true\ninitial_load = \"copy\"\n";
+        std::fs::write(&ctx.ch_config, doc).unwrap();
+        // Live config still opts in a table the file since dropped
+        let live_doc =
+            format!("{doc}[table.public.items]\nreplicate = true\ninitial_load = \"copy\"\n");
+        let base =
+            crate::ch_emitter::EmitterConfig::from_table(&live_doc.parse().unwrap()).unwrap();
+        let (resolver, _rx) = crate::config::ConfigResolver::new(
+            &base,
+            crate::config::CliOverrides::default(),
+            None,
+            Table::new(),
+            crate::mapping::mapping_handle(Default::default()),
+            crate::config::ResolverBoot::default(),
+        );
+        let desc = RelDescriptor {
+            rfn: walrus::pg::walparser::RelFileNode {
+                spc_node: 1663,
+                db_node: 5,
+                rel_node: 30000,
+            },
+            oid: 30000,
+            toast_oid: 0,
+            namespace_oid: 2200,
+            rel_name: RelName::new("public", "events"),
+            kind: 'r',
+            persistence: 'p',
+            ancestors: Vec::new(),
+            replident: ReplIdent::Default { pk_attnums: None },
+            attributes: vec![RelAttr {
+                attnum: 1,
+                name: "id".into(),
+                type_oid: 23,
+                typmod: -1,
+                not_null: true,
+                dropped: false,
+                type_name: "int4".into(),
+                type_byval: true,
+                type_len: 4,
+                type_align: 'i',
+                type_storage: 'p',
+                missing_default: None,
+            }],
+        };
+        for (namespace, name) in [
+            ("public", "events"),
+            ("public", "items"),
+            ("audit", "trail"),
+        ] {
+            let desc = RelDescriptor {
+                rel_name: RelName::new(namespace, name),
+                ..desc.clone()
+            };
+            let target = TableTarget::new("cdc", &format!("{namespace}_{name}"));
+            resolver
+                .register_derived_mapping(
+                    &desc,
+                    TableMapping {
+                        target,
+                        columns: Vec::new(),
+                        tees: Vec::new(),
+                    },
+                )
+                .await;
+        }
+        ctx.reloader.set_resolvers(vec![resolver]).await;
+        let _h = serve(sock.clone(), ctx).unwrap();
+
+        let status = call(&sock, "status", "").await;
+        let parsed: Table = status.strip_prefix("OK\n").unwrap().parse().unwrap();
+        let tables = parsed["tables"].as_array().unwrap();
+        let entry = |source: &str| -> Table {
+            tables
+                .iter()
+                .filter_map(Value::as_table)
+                .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
+                .cloned()
+                .unwrap()
+        };
+        let events = entry("app.public.events");
+        assert_eq!(
+            events["destination_table"].as_str(),
+            Some("cdc.public_events")
+        );
+        assert_eq!(events["initial_load"].as_str(), Some("object_store"));
+        assert_eq!(
+            entry("app.public.orders")["initial_load"].as_str(),
+            Some("copy")
+        );
+        assert_eq!(
+            entry("app.public.items")["initial_load"].as_str(),
+            Some("copy")
+        );
+        assert_eq!(
+            entry("app.audit.trail")["initial_load"].as_str(),
+            Some("none")
+        );
+        assert_eq!(tables.len(), 4, "{status}");
     }
 
     fn ctx_at(dir: &Path) -> SharedCtx {
@@ -988,7 +1363,7 @@ mod tests {
                 .filter_map(Value::as_table)
                 .find(|t| t.get("source_table").and_then(Value::as_str) == Some(source))
                 .cloned()
-                .unwrap_or_else(|| panic!("{source} missing from {status}"))
+                .expect(source)
         };
         assert_eq!(tables.len(), 4, "{status}");
 
@@ -1085,7 +1460,7 @@ mod tests {
     fn fragment_path_takes_plain_toml_names_only() {
         let base = Path::new("/etc/walshadow/ch-config.toml");
         assert_eq!(
-            fragment_path(base, "90-ctl.toml").unwrap(),
+            fragment_path(base, "90-ctl.toml").unwrap().path(),
             Path::new("/etc/walshadow/ch-config.d/90-ctl.toml")
         );
         for bad in [

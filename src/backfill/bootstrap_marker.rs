@@ -19,6 +19,18 @@ pub struct BootstrapMarker {
     pub backup_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_lsn: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// Keep bootstrap position until streaming saves its manifest and descriptor log
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Handoff {
+    pub end_lsn: u64,
+    pub timeline: u32,
+    /// Earliest record among transactions open at window seal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_floor: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -111,10 +123,21 @@ impl BootstrapMarker {
             .context("persist bootstrap marker")
     }
 
-    /// End the attempt. Pending rows already in ClickHouse must be recorded
-    /// first, so a restart can still publish them
-    pub async fn complete(dir: &Path, _: PendingRecorded) -> Result<()> {
-        ExtractedCheckpoint::clear(dir).await?;
+    /// Record pending rows first so restart can publish them.
+    /// Keep marker until streaming saves its resume state
+    pub async fn hand_off(dir: &Path, handoff: Handoff, _: PendingRecorded) -> Result<()> {
+        let marker = Self::read(dir)?.context("bootstrap marker vanished before handoff")?;
+        Self {
+            handoff: Some(handoff),
+            ..marker
+        }
+        .write(dir)
+        .await?;
+        ExtractedCheckpoint::clear(dir).await
+    }
+
+    /// Clear marker after streaming saves its manifest and descriptor log
+    pub async fn complete(dir: &Path) -> Result<()> {
         Self::clear(dir).await
     }
 
@@ -132,6 +155,7 @@ impl BootstrapMarker {
             attempts: self.attempts + 1,
             backup_name: self.backup_name.clone(),
             snapshot_lsn: self.snapshot_lsn,
+            handoff: None,
         }
     }
 
@@ -155,8 +179,12 @@ impl BootstrapMarker {
     }
 }
 
+pub fn handed_off(dir: &Path) -> Result<Option<Handoff>> {
+    Ok(BootstrapMarker::read(dir)?.and_then(|m| m.handoff))
+}
+
 pub fn pending_attempt(dir: &Path, mode: BootstrapMode) -> Result<Option<BootstrapMarker>> {
-    let Some(marker) = BootstrapMarker::read(dir)? else {
+    let Some(marker) = BootstrapMarker::read(dir)?.filter(|m| m.handoff.is_none()) else {
         return Ok(None);
     };
     anyhow::ensure!(
@@ -275,6 +303,7 @@ async fn first_attempt(data_dir: &Path, pin: Option<String>) -> Result<Bootstrap
         attempts: 1,
         backup_name: pin,
         snapshot_lsn: None,
+        handoff: None,
     };
     marker.write(data_dir).await?;
     Ok(marker)
@@ -314,6 +343,7 @@ mod tests {
             attempts,
             backup_name: Some("base_original".into()),
             snapshot_lsn: None,
+            handoff: None,
         }
     }
 
@@ -328,6 +358,44 @@ mod tests {
         assert_eq!(BootstrapMarker::read(dir).unwrap(), Some(pinned(2)));
         BootstrapMarker::clear(dir).await.unwrap();
         assert_eq!(BootstrapMarker::read(dir).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn handoff_outlives_the_attempt_until_streaming_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        pinned(2).write(dir).await.unwrap();
+        ExtractedCheckpoint {
+            backup_name: "base_original".into(),
+            start_lsn: 0x100,
+            end_lsn: 0x200,
+            timeline: 1,
+            deferred_spools: Vec::new(),
+            handback_spools: Vec::new(),
+        }
+        .write(dir)
+        .await
+        .unwrap();
+        let handoff = Handoff {
+            end_lsn: 0x200,
+            timeline: 1,
+            open_floor: Some(0x180),
+        };
+        BootstrapMarker::hand_off(dir, handoff, PendingRecorded::nothing_pending())
+            .await
+            .unwrap();
+        assert_eq!(ExtractedCheckpoint::read(dir).unwrap(), None);
+        assert_eq!(handed_off(dir).unwrap(), Some(handoff));
+        assert_eq!(BootstrapMarker::read(dir).unwrap().unwrap().attempts, 2);
+        for mode in [
+            BootstrapMode::Off,
+            BootstrapMode::Direct,
+            BootstrapMode::ObjectStore,
+        ] {
+            assert_eq!(pending_attempt(dir, mode).unwrap(), None);
+        }
+        BootstrapMarker::complete(dir).await.unwrap();
+        assert_eq!(handed_off(dir).unwrap(), None);
     }
 
     #[test]
@@ -384,6 +452,7 @@ mod tests {
                 attempts: 1,
                 backup_name,
                 snapshot_lsn: None,
+                handoff: None,
             }
             .write(tmp.path())
             .await
@@ -524,6 +593,7 @@ mod tests {
                 attempts: 1,
                 backup_name: None,
                 snapshot_lsn: None,
+                handoff: None,
             };
             assert!(
                 resolve_backup(&storage, configured, Some(&unpinned))
@@ -533,10 +603,123 @@ mod tests {
         }
     }
 
+    fn extracted(spools: Vec<SpooledRecords>) -> ExtractedCheckpoint {
+        ExtractedCheckpoint {
+            backup_name: "base_original".into(),
+            start_lsn: 0x100,
+            end_lsn: 0x200,
+            timeline: 1,
+            deferred_spools: Vec::new(),
+            handback_spools: spools,
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_resumes_only_for_its_pin_with_every_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(
+            resumable_extraction(dir, Some("base_original")).unwrap(),
+            None
+        );
+        let spool = dir.join("handback.bin");
+        let done = extracted(vec![SpooledRecords {
+            path: spool.clone(),
+            records: 4,
+        }]);
+        done.write(dir).await.unwrap();
+        assert_eq!(ExtractedCheckpoint::read(dir).unwrap(), Some(done.clone()));
+        assert_eq!(resumable_extraction(dir, None).unwrap(), None);
+        assert_eq!(resumable_extraction(dir, Some("base_other")).unwrap(), None);
+        assert_eq!(
+            resumable_extraction(dir, Some("base_original")).unwrap(),
+            None
+        );
+        std::fs::write(&spool, b"").unwrap();
+        assert_eq!(
+            resumable_extraction(dir, Some("base_original")).unwrap(),
+            Some(done)
+        );
+
+        std::fs::write(dir.join(EXTRACTED_FILENAME), b"end_lsn =").unwrap();
+        let err = format!("{:#}", ExtractedCheckpoint::read(dir).unwrap_err());
+        assert!(err.starts_with("parse "), "{err}");
+        std::fs::remove_file(dir.join(EXTRACTED_FILENAME)).unwrap();
+        std::fs::create_dir(dir.join(EXTRACTED_FILENAME)).unwrap();
+        let err = format!("{:#}", ExtractedCheckpoint::read(dir).unwrap_err());
+        assert!(err.starts_with("read "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn retry_past_extraction_keeps_extracted_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("shadow");
+        let first = begin_attempt(&data_dir, None, pinned(1).backup_name)
+            .await
+            .unwrap();
+        let version = data_dir.join("PG_VERSION");
+        tokio::fs::write(&version, b"17\n").await.unwrap();
+        extracted(Vec::new()).write(&data_dir).await.unwrap();
+
+        let second = begin_attempt(&data_dir, Some(first), pinned(1).backup_name)
+            .await
+            .unwrap();
+        assert_eq!(second, pinned(2));
+        assert!(version.exists());
+        assert!(data_dir.join(EXTRACTED_FILENAME).exists());
+
+        let handoff = Handoff {
+            end_lsn: 0x200,
+            timeline: 1,
+            open_floor: None,
+        };
+        BootstrapMarker::hand_off(&data_dir, handoff, PendingRecorded::nothing_pending())
+            .await
+            .unwrap();
+        assert!(!data_dir.join(EXTRACTED_FILENAME).exists());
+        assert_eq!(handed_off(&data_dir).unwrap(), Some(handoff));
+
+        second.write(&data_dir).await.unwrap();
+        std::fs::create_dir(data_dir.join(EXTRACTED_FILENAME)).unwrap();
+        let err = BootstrapMarker::hand_off(&data_dir, handoff, PendingRecorded::nothing_pending())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "clear extracted checkpoint");
+        assert!(data_dir.join(MARKER_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn configured_backup_must_be_latest_or_resolvable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: walrus::storage::DynStorage =
+            std::sync::Arc::new(walrus::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let err = resolve_backup(&storage, "nightly", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("\"nightly\" must be `LATEST`"),
+            "{err}"
+        );
+        let err = resolve_backup(&storage, "LATEST", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("bootstrap: resolve LATEST"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn discard_is_idempotent_when_nothing_landed() {
         let tmp = tempfile::tempdir().unwrap();
         discard_partial(&tmp.path().join("absent")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_dir_below_a_file_fails_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"").await.unwrap();
+        let err = first_attempt(&file.join("shadow"), None).await.unwrap_err();
+        assert!(err.to_string().starts_with("create "), "{err}");
+        let err = discard_partial(&file).await.unwrap_err();
+        assert!(err.to_string().starts_with("read "), "{err}");
     }
 }
 

@@ -12,7 +12,6 @@
 //! cadence, HTTP server reads a snapshot per request. Endpoint is read-only by
 //! design (no `/quit`, no admin verbs); operator actions stay on the CLI.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -74,32 +73,26 @@ macro_rules! encode_metric {
 /// [`encode_metric`] for a family every database carries: the `database=`
 /// label comes first, a declared label array second
 macro_rules! encode_db_metric {
-    ($enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident) => {
         counter_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|db| (db.database.as_str(), db.$field)),
         )?
     };
-    ($enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident) => {
+    ($enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident) => {
         gauge_series(
             $enc,
             $name,
             $help,
             "database",
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), s.$field)),
+            $dbs.iter().map(|db| (db.database.as_str(), db.$field)),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, counter, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, counter, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         counter_grid(
@@ -107,14 +100,12 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|db| (db.database.as_str(), $labels.into_iter().zip(db.$field))),
         )?
     };
     (
-        $enc:expr, $dbs:expr, $names:expr, gauge, $name:expr, $help:expr, $field:ident,
+        $enc:expr, $dbs:expr, gauge, $name:expr, $help:expr, $field:ident,
         $key:literal, $labels:expr
     ) => {
         gauge_grid(
@@ -122,10 +113,8 @@ macro_rules! encode_db_metric {
             $name,
             $help,
             $key,
-            $names
-                .iter()
-                .zip($dbs)
-                .map(|(db, s)| (db.as_ref(), $labels.into_iter().zip(s.$field))),
+            $dbs.iter()
+                .map(|db| (db.database.as_str(), $labels.into_iter().zip(db.$field))),
         )?
     };
 }
@@ -515,7 +504,9 @@ snapshot! {
     counter catalog_boundary_holds_total: u64 =
         "Publication holds released at catalog-mutating commit boundaries.",
     counter catalog_boundary_hold_failures_total: u64 =
-        "Catalog-boundary holds woken with an error (worker death, walreceiver loss, timeout).",
+        "Catalog-boundary holds interrupted by decoder worker failure.",
+    gauge catalog_boundary_stalled_lsn: u64 =
+        "Target replay LSN of a stalled catalog boundary, or zero when none is stalled.",
     counter catalog_boundary_hold_seconds_total: f64 =
         "Cumulative seconds the pump parked in released catalog-boundary holds.",
 }
@@ -557,12 +548,9 @@ macro_rules! db_snapshot {
         }
 
         fn encode_db_fields(dbs: &[DbSeries], enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
-            let names: Vec<Cow<'_, str>> =
-                dbs.iter().map(|db| escape_label(&db.database)).collect();
             $(encode_db_metric!(
                 enc,
                 dbs,
-                names,
                 $kind,
                 concat!("walshadow_", stringify!($field)),
                 $help,
@@ -634,8 +622,6 @@ db_snapshot! {
         "Pending slots folded into a commit's descriptor-log batch.",
     counter pending_entries_dropped_abort_total: u64 =
         "Pending slots dropped with an aborted transaction tree.",
-    counter pending_ambiguities_suppressed_total: u64 =
-        "Ambiguity intervals the pending timeline covered end to end.",
     counter pending_degraded_by_reason: [u64; 5]
         ["reason" = DegradeReason::ALL.map(|reason| reason.label())] =
         "Transactions degraded to commit-time capture, by reason.",
@@ -923,24 +909,6 @@ where
     Ok(())
 }
 
-/// The encoder writes label values through, and a database name is whatever
-/// `CREATE DATABASE` took, so escape what OpenMetrics reserves inside quotes
-fn escape_label(value: &str) -> Cow<'_, str> {
-    if !value.contains(['\\', '"', '\n']) {
-        return Cow::Borrowed(value);
-    }
-    let mut out = String::with_capacity(value.len() + 8);
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    Cow::Owned(out)
-}
-
 /// LSN gauges carry their raw `u64`
 impl<K> EncodeGaugeValue for Pos<K> {
     fn encode(&self, encoder: &mut GaugeValueEncoder) -> fmt::Result {
@@ -1004,8 +972,6 @@ fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> f
         u64::from(!snap.crossing_blocked_on.is_empty()),
     )?;
 
-    // rmgr names come out of the fixed resource-manager table, so label values
-    // need no escaping the encoder does not do
     let mut records = declare(
         enc,
         "walshadow_filter_records_total",
@@ -1070,7 +1036,12 @@ pub async fn serve(
             source: e,
         })?;
     let local = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
+    Ok((local, accept_loop(listener, registry)))
+}
+
+/// Serve every accepted client until `accept` errors
+fn accept_loop(listener: TcpListener, registry: MetricsRegistry) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             let (mut socket, _peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -1095,8 +1066,7 @@ pub async fn serve(
                 let _ = socket.shutdown().await;
             });
         }
-    });
-    Ok((local, handle))
+    })
 }
 
 async fn handle_client(
@@ -1146,13 +1116,23 @@ mod tests {
             }
         }
 
+        // Encoder buffers small writes; a label past its buffer reaches the
+        // writer inside its own family
+        let huge = "x".repeat(1 << 16);
         let mut snap = MetricsSnapshot {
             crossing_blocked_on: "slot_missing",
             source_endpoint_swap_blocked_on: "slot_missing",
             promotion_blocked_on: "not_paused",
             unmapped_rows_by_table: vec![("app".into(), "public.noise".into(), 5)],
-            rows_inserted_by_table: vec![("app".into(), "public.orders".into(), 9)],
-            cells_inserted_by_type: vec![("String".into(), "local", 9)],
+            rows_inserted_by_table: vec![("app".into(), huge.clone(), 9)],
+            cells_inserted_by_type: vec![(huge.clone(), "local", 9)],
+            skipped_records_by_rel: vec![SkippedRel {
+                database: "app".into(),
+                rel_node: huge,
+                op: "update",
+                reason: "not_covered",
+                records: 3,
+            }],
             by_database: vec![DbSeries {
                 database: "app".into(),
                 ..DbSeries::default()
@@ -1162,19 +1142,68 @@ mod tests {
         snap.records_by_rm_route
             .insert(("Heap".into(), "to_decoder"), 3);
 
-        let full = render(snap.clone()).len();
-        for writes in 0..64 {
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(SnapshotCollector(snap)));
+        registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+        registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+        let mut whole = FailAfter {
+            writes: usize::MAX,
+            out: String::new(),
+        };
+        text::encode(&mut whole, &registry).unwrap();
+        let total = usize::MAX - whole.writes;
+        for writes in 0..total {
             let mut w = FailAfter {
                 writes,
                 out: String::new(),
             };
-            let mut registry = Registry::default();
-            registry.register_collector(Box::new(SnapshotCollector(snap.clone())));
-            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
             let failed = text::encode(&mut w, &registry).is_err();
             assert!(failed, "prefix length {writes} must surface the failure");
-            assert!(w.out.len() < full, "a failed encode cannot be complete");
+            assert!(
+                w.out.len() < whole.out.len(),
+                "a failed encode cannot be complete"
+            );
         }
+    }
+
+    /// Stage and log families fit in one encoder buffer, so a leading pad of
+    /// swept length lands the first flush, refused, in each of them
+    #[test]
+    fn stage_and_log_families_propagate_a_refused_flush() {
+        #[derive(Debug)]
+        struct Pad(String);
+        impl Collector for Pad {
+            fn encode(&self, mut enc: DescriptorEncoder) -> fmt::Result {
+                gauge(&mut enc, "walshadow_pad", &self.0, 0u64)
+            }
+        }
+        /// Refuses every write, keeping the refused chunk's length
+        struct Refuse(usize);
+        impl fmt::Write for Refuse {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0 = s.len();
+                Err(fmt::Error)
+            }
+        }
+        let name_at = |text: &str| text.split(' ').next().unwrap().to_owned();
+        let mut families = std::collections::BTreeSet::new();
+        let mut refused_in = std::collections::BTreeSet::new();
+        for pad in (0..4096).step_by(8) {
+            let mut registry = Registry::default();
+            registry.register_collector(Box::new(Pad("p".repeat(pad))));
+            registry.register_collector(Box::new(crate::ops::stages::StageCollector));
+            registry.register_collector(Box::new(crate::ops::log_events::LogEventCollector));
+            let mut whole = String::new();
+            text::encode(&mut whole, &registry).unwrap();
+            let mut refuse = Refuse(0);
+            text::encode(&mut refuse, &registry).unwrap_err();
+            let (head, _) = whole[..refuse.0].rsplit_once("# HELP ").unwrap();
+            refused_in.insert(name_at(&whole[head.len() + "# HELP ".len()..]));
+            families.extend(whole.split("# HELP ").skip(1).map(name_at));
+        }
+        refused_in.remove("walshadow_pad");
+        families.remove("walshadow_pad");
+        assert_eq!(refused_in, families);
     }
 
     #[test]
@@ -1333,7 +1362,7 @@ mod tests {
     #[test]
     fn render_declares_each_family_once() {
         let body = render(MetricsSnapshot::default());
-        let mut seen: ahash::HashMap<&str, usize> = ahash::HashMap::default();
+        let mut seen: foldhash::HashMap<&str, usize> = foldhash::HashMap::default();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("# TYPE ")
                 && let Some(name) = rest.split_whitespace().next()
@@ -1444,22 +1473,30 @@ mod tests {
         assert!(body.contains("walshadow_pump_queue_depth 0"), "{body}");
     }
 
-    /// A database name is a PG identifier, so a quote in it must not end the
-    /// label and truncate the scrape
     #[test]
     fn render_escapes_a_database_label() {
         let body = render(MetricsSnapshot {
             by_database: vec![DbSeries {
-                database: "we\"ird\\name".into(),
+                database: "we\"ird\\name\n".into(),
+                bridge_up: 1,
+                bridge_requests_by_op: [3, 0, 0, 0, 0, 0],
                 desc_log_entries: 4,
+                config_backfills_pending_by_mode: [2, 0, 0],
                 ..DbSeries::default()
             }],
             ..MetricsSnapshot::default()
         });
-        assert!(
-            body.contains(r#"walshadow_desc_log_entries{database="we\"ird\\name"} 4"#),
-            "{body}"
-        );
+        for want in [
+            r#"walshadow_bridge_up{database="we\"ird\\name\n"} 1"#,
+            r#"walshadow_desc_log_entries{database="we\"ird\\name\n"} 4"#,
+            &format!(
+                r#"walshadow_bridge_requests_total{{database="we\"ird\\name\n",op="{}"}} 3"#,
+                OP_LABELS[0]
+            ),
+            r#"walshadow_config_backfills_pending{database="we\"ird\\name\n",mode="copy"} 2"#,
+        ] {
+            assert!(body.contains(want), "missing {want}\n{body}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1649,6 +1686,37 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Content-Type: application/openmetrics-text"));
         assert!(resp.contains("walshadow_filter_lsn 57005"), "{resp}");
+        let taken = serve(addr, MetricsRegistry::new()).await.unwrap_err();
+        assert!(matches!(taken, MetricsError::Bind { .. }), "{taken}");
+    }
+
+    /// Reset client errors only its own connection, dead listener ends server
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_loop_outlives_reset_client_and_exits_on_dead_listener() {
+        use std::os::fd::AsFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fd = listener.as_fd().try_clone_to_owned().unwrap();
+        let handle = accept_loop(listener, MetricsRegistry::new());
+
+        let reset = tokio::net::TcpStream::connect(addr).await.unwrap();
+        reset.set_zero_linger().unwrap();
+        drop(reset);
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.starts_with(b"HTTP/1.0 200 OK\r\n"));
+
+        // Shutting down a listening socket fails its pending accept with EINVAL
+        std::net::TcpStream::from(fd)
+            .shutdown(std::net::Shutdown::Read)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 

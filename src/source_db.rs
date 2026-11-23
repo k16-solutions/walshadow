@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 
 use crate::catalog::desc_log::DescriptorLog;
-use crate::catalog::shadow_catalog::{ShadowCatalog, ShadowCatalogConfig, with_transient_retry};
+use crate::catalog::shadow_catalog::{ShadowCatalog, with_transient_retry};
 use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::ch_emitter::EmitterConfig;
 use crate::emit::route::RowPolicy;
@@ -81,21 +81,19 @@ impl DbLink {
             in_recovery = info.in_recovery,
             "bridge connected",
         );
-        let cat_cfg = ShadowCatalogConfig::default();
-        let mut catalog = with_transient_retry(
-            cfg.budget,
-            cat_cfg.reconnect_backoff_initial,
-            cat_cfg.reconnect_backoff_max,
-            async || {
-                ShadowCatalog::connect(cfg.shadow_conninfo, cat_cfg.clone(), bridge.clone()).await
-            },
-        )
+        let (catalog, oid) = async {
+            let mut catalog = with_transient_retry(
+                cfg.budget,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+                async || ShadowCatalog::connect(cfg.shadow_conninfo, bridge.clone()).await,
+            )
+            .await?;
+            let oid = catalog.current_database_oid().await?;
+            anyhow::Ok((catalog, oid))
+        }
         .await
         .with_context(|| format!("connect to shadow PG database {}", cfg.name))?;
-        let oid = catalog
-            .current_database_oid()
-            .await
-            .with_context(|| format!("shadow database oid for {}", cfg.name))?;
         anyhow::ensure!(
             info.datid == oid,
             "bridge socket {} serves database oid {}, but {} is oid {oid}; \
@@ -166,17 +164,7 @@ impl SourceDb {
     }
 }
 
-impl std::fmt::Debug for SourceDb {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceDb")
-            .field("name", &self.name)
-            .field("oid", &self.oid)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Databases this daemon follows
-#[derive(Debug)]
 pub struct SourceDbs {
     /// Config order, which is also bridge socket order
     order: Vec<Arc<SourceDb>>,
@@ -186,23 +174,16 @@ pub struct SourceDbs {
 }
 
 impl SourceDbs {
-    /// Use config order, fall back to first database if primary OID is missing
-    pub fn new(dbs: Vec<Arc<SourceDb>>, primary: Oid) -> Self {
-        let primary = dbs
-            .iter()
-            .find(|db| db.oid == primary)
-            .or_else(|| dbs.first())
-            .cloned()
-            .expect("a daemon follows at least one database");
+    /// Databases in config order, `primary` indexing `[source] dbname`
+    pub fn new(dbs: Vec<Arc<SourceDb>>, primary: usize) -> Self {
         Self {
+            primary: dbs[primary].clone(),
             order: dbs,
-            primary,
         }
     }
 
     pub fn single(db: Arc<SourceDb>) -> Self {
-        let primary = db.oid;
-        Self::new(vec![db], primary)
+        Self::new(vec![db], 0)
     }
 
     pub fn primary(&self) -> &Arc<SourceDb> {
@@ -215,5 +196,30 @@ impl SourceDbs {
 
     pub fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
         self.order.iter().map(|db| db.oid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_bridge_socket_names_the_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = DbLink::connect(DbLinkConfig {
+            name: "app",
+            index: 0,
+            workers: 1,
+            bridge_path: &tmp.path().join("absent"),
+            shadow_conninfo: "host=/nonexistent",
+            budget: Duration::ZERO,
+            emitter: None,
+        })
+        .await;
+        let e = link.err().expect("no bridge to dial");
+        assert!(
+            e.to_string().starts_with("connect bridge for database app"),
+            "{e:#}"
+        );
     }
 }

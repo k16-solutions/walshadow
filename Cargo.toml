@@ -3,12 +3,11 @@ members = ["bench"]
 
 [package]
 name = "walshadow"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2024"
 description = "Schema-only Postgres + WAL replay catalog mirror for CDC to ClickHouse"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ClickHouse/walshadow"
-homepage = "https://github.com/ClickHouse/walshadow"
 documentation = "https://github.com/ClickHouse/walshadow/tree/main/docs"
 
 [[bin]]
@@ -28,15 +27,20 @@ name = "walshadow"
 path = "src/lib.rs"
 
 [features]
-# Compression codecs walshadow's CH-Native emitter links. Forwarded to
+# Compression codecs for CH-Native emitter & wal-rus archives. Forwarded to
 # clickhouse-c-rs so its `chc_*_codec_init` symbols & C TU link only what the
-# top crate offers. Flip `default-features = false` for an uncompressed-only
-# build with neither codec lib linked — which then cannot decode a compressed
-# server response. Both by default: the wire flag only says what we send, and
-# a server answers in whatever method it is configured for.
+# top crate offers. Flip `default-features = false` for a build with no
+# CH-Native wire compression or lz4/zstd archive reads — which then cannot
+# decode a compressed server response. WAL FPI/TOAST decoding links lz4/zstd
+# regardless. Both by default: the wire flag only says what we send, and a
+# server answers in whatever method it is configured for.
 default = ["lz4", "zstd"]
-lz4 = ["clickhouse-c-rs/lz4"]
-zstd = ["clickhouse-c-rs/zstd"]
+lz4 = ["clickhouse-c-rs/lz4", "wal-rus/lz4"]
+zstd = ["clickhouse-c-rs/zstd", "wal-rus/zstd"]
+# Read backups & WAL archives other tools compressed with these
+brotli = ["wal-rus/brotli"]
+lzma = ["wal-rus/lzma"]
+gzip = ["wal-rus/gzip"]
 test-support = []
 
 [lints.rust]
@@ -47,20 +51,18 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 unused_async = "warn"
 
 [dependencies]
-wal-rus = "0.4.1"
-clickhouse-c-rs = { version = "0.2.2", default-features = false, features = ["tokio", "tls"] }
+wal-rus = { version = "0.4.2", default-features = false, features = ["s3", "gcs", "backup"] }
+clickhouse-c-rs = { version = "0.3.0", default-features = false, features = ["tokio", "tls"] }
 # hash keys are internal (relfilenodes, oids, xids, names), never network
 # input, so SipHash's HashDoS margin buys nothing at 2-4x per probe
-ahash = "0.8"
+foldhash = "0.2"
 anyhow = "1"
-astral-tokio-tar = { version = "0.7", default-features = false }
 async-channel = "2.5"
 async-trait = "0.1"
 backon = { version = "1", features = ["tokio-sleep"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
-fallible-iterator = "0.2"
 fearless_simd = "1.2"
 fearless_simd_macros = "0.1"
 futures = "0.3"
@@ -76,6 +78,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simdutf8 = "0.1"
 smallvec = "1"
+socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "fs", "sync", "signal", "io-util"] }
 tokio-postgres = "0.7"
@@ -91,7 +94,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 mimalloc = "0.1.52"
-prometheus-client = "0.25.1"
+prometheus-client = "0.26"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -30,6 +30,7 @@ use crate::source::manifest::ShadowFloor;
 pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
+const PARKED_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SQLSTATE for a WAL segment the source has already recycled
 /// (`undefined_file`). Locale-independent, unlike the message text.
@@ -241,6 +242,7 @@ pub struct SourceFeed {
     status_interval: Duration,
     last_status: Instant,
     receive_deadline: Option<Instant>,
+    parked_status_error: Option<anyhow::Error>,
     floors: StatusFloors,
     /// Most recent `server_wal_end` from a WAL frame or keepalive;
     /// surfaces "source ahead by N" without re-issuing IDENTIFY_SYSTEM.
@@ -257,6 +259,7 @@ impl SourceFeed {
             status_interval: DEFAULT_STATUS_INTERVAL,
             last_status: Instant::now(),
             receive_deadline: None,
+            parked_status_error: None,
             floors: StatusFloors::default(),
             last_server_wal_end: 0,
         })
@@ -323,6 +326,9 @@ impl SourceFeed {
         status: StandbyStatus,
         buf: &'b mut Vec<u8>,
     ) -> Result<SourceEvent<'b>> {
+        if let Some(err) = self.parked_status_error.take() {
+            return Err(err);
+        }
         buf.clear();
         loop {
             // tokio::select! drops losing futures.
@@ -333,12 +339,12 @@ impl SourceFeed {
                 Instant::now() < deadline,
                 "source replication receive timeout"
             );
-            let status_interval = self.status_interval.min(RECEIVE_TIMEOUT / 2);
-            if self.last_status.elapsed() >= status_interval {
-                self.send_status(status).await?;
+            if Instant::now() >= self.status_due() {
+                self.send_status(status, true).await?;
             }
-            let status_due = self.last_status + status_interval;
-            let wake = status_due.max(Instant::now() + Duration::from_millis(50));
+            let wake = self
+                .status_due()
+                .max(Instant::now() + Duration::from_millis(50));
             let Ok(msg) =
                 tokio::time::timeout_at(deadline.min(wake), self.conn.recv_message()).await
             else {
@@ -361,7 +367,7 @@ impl SourceFeed {
                         }
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                self.send_status(status).await?;
+                                self.send_status(status, true).await?;
                             }
                             self.last_server_wal_end = k.server_wal_end;
                         }
@@ -418,15 +424,41 @@ impl SourceFeed {
         Ok(row.map(|(_name, content)| content))
     }
 
-    async fn send_status(&mut self, status: StandbyStatus) -> Result<()> {
+    fn status_due(&self) -> Instant {
+        self.last_status
+            + self
+                .status_interval
+                .clamp(Duration::from_millis(50), RECEIVE_TIMEOUT / 2)
+    }
+
+    pub fn parked_status_due(&self) -> Option<Instant> {
+        self.parked_status_error
+            .is_none()
+            .then(|| self.status_due())
+    }
+
+    /// Keep COPY open while the pump holds WAL.
+    pub async fn send_parked_status(&mut self, status: StandbyStatus) {
+        let result = tokio::time::timeout(PARKED_STATUS_TIMEOUT, self.send_status(status, false))
+            .await
+            .context("source status write timed out while dispatching WAL")
+            .and_then(|result| result);
+        if let Err(err) = result {
+            tracing::warn!(target: "walshadow::source_feed", error = %err, "source feedback failed during WAL dispatch");
+            // Reconnect after dispatch. A failed write may have sent a partial frame.
+            self.parked_status_error = Some(err);
+        }
+    }
+
+    async fn send_status(&mut self, status: StandbyStatus, request_reply: bool) -> Result<()> {
         let held = prepare_status(status, &mut self.floors);
         let mut payload = build_status_update(
             held.write_lsn.get(),
             held.flush_lsn.get(),
             held.apply_lsn.get(),
         );
-        // PostgreSQL replies even when wal_sender_timeout is disabled.
-        *payload.last_mut().expect("standby status reply flag") = 1;
+        // Avoid soliciting replies while the pump isn't reading from COPY.
+        *payload.last_mut().expect("standby status reply flag") = u8::from(request_reply);
         self.conn.send_copy_data(&payload).await?;
         self.last_status = Instant::now();
         Ok(())
@@ -641,23 +673,23 @@ mod tests {
         socket.write_all(&frame).await.unwrap();
     }
 
-    async fn mock_feed() -> (SourceFeed, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let cfg = PgConfig {
+    fn mock_cfg(port: u16) -> PgConfig {
+        PgConfig {
             host: "127.0.0.1".into(),
-            port: listener.local_addr().unwrap().port(),
+            port,
             user: "test".into(),
             password: None,
             database: "test".into(),
             application_name: "source-timeout-test".into(),
             sslmode: SslMode::Disable,
             tls: Default::default(),
-        };
-        let client = async {
-            let mut feed = SourceFeed::connect(&cfg).await.unwrap();
-            feed.start_physical_replication(None, 0, 1).await.unwrap();
-            feed
-        };
+        }
+    }
+
+    /// Feed past startup, and the backend socket it talks to
+    async fn mock_session() -> (SourceFeed, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = mock_cfg(listener.local_addr().unwrap().port());
         let server = async {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.set_nodelay(true).unwrap();
@@ -666,13 +698,78 @@ mod tests {
             backend(&mut socket, b'R', &0u32.to_be_bytes()).await;
             backend(&mut socket, b'S', b"server_version\x0016.3\0").await;
             backend(&mut socket, b'Z', b"I").await;
-            assert_eq!(socket.read_u8().await.unwrap(), b'Q');
-            let len = socket.read_u32().await.unwrap() as usize;
-            socket.read_exact(&mut vec![0; len - 4]).await.unwrap();
-            backend(&mut socket, b'W', &[0, 0, 0]).await;
             socket
         };
-        tokio::join!(client, server)
+        let (feed, socket) = tokio::join!(SourceFeed::connect(&cfg), server);
+        (feed.unwrap(), socket)
+    }
+
+    /// Read one simple query off the backend socket
+    async fn query(socket: &mut TcpStream) -> String {
+        assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+        let len = socket.read_u32().await.unwrap() as usize;
+        let mut body = vec![0; len - 4];
+        socket.read_exact(&mut body).await.unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    fn error_response(code: &str) -> Vec<u8> {
+        format!("SERROR\0C{code}\0Mrefused\0\0").into_bytes()
+    }
+
+    async fn mock_feed() -> (SourceFeed, TcpStream) {
+        let (mut feed, mut socket) = mock_session().await;
+        let server = async {
+            query(&mut socket).await;
+            backend(&mut socket, b'W', &[0, 0, 0]).await;
+        };
+        let (started, ()) = tokio::join!(feed.start_physical_replication(None, 0, 1), server);
+        started.unwrap();
+        (feed, socket)
+    }
+
+    #[tokio::test]
+    async fn parked_status_keeps_copy_alive_without_advancing_flush() {
+        let (mut feed, mut server) = mock_feed().await;
+        let status = StandbyStatus {
+            write_lsn: Pos::new(0x4000),
+            flush_lsn: Pos::new(0x2000),
+            apply_lsn: Pos::new(0x3000),
+        };
+
+        for flush in [0x2000, 0] {
+            feed.send_parked_status(status).await;
+            assert!(feed.parked_status_due().is_some());
+            assert_eq!(server.read_u8().await.unwrap(), b'd');
+            assert_eq!(server.read_u32().await.unwrap(), 38);
+            assert_eq!(server.read_u8().await.unwrap(), b'r');
+            assert_eq!(server.read_u64().await.unwrap(), 0x4000);
+            assert_eq!(server.read_u64().await.unwrap(), flush);
+            assert_eq!(server.read_u64().await.unwrap(), 0x3000);
+            let _timestamp = server.read_u64().await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 0, "no reply requested");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_parked_status_surfaces_on_next_event() {
+        let (mut feed, server) = mock_feed().await;
+        drop(server);
+        // Peer close can take a write or two to surface as EPIPE
+        for _ in 0..100 {
+            if feed.parked_status_due().is_none() {
+                break;
+            }
+            feed.send_parked_status(StandbyStatus::default()).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(feed.parked_status_due().is_none(), "write never failed");
+        let mut buf = Vec::new();
+        assert!(
+            feed.next_event(StandbyStatus::default(), &mut buf)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -805,6 +902,90 @@ mod tests {
         assert_eq!(
             no_slot, "START_REPLICATION B/4C000000 TIMELINE 1",
             "high word must be hex (B), not decimal (11)"
+        );
+    }
+
+    /// A refusal before COPY opens is typed as a removed segment only on PG's
+    /// `undefined_file` SQLSTATE
+    #[tokio::test]
+    async fn start_refusal_reads_its_sqlstate() {
+        for (code, removed) in [(SQLSTATE_UNDEFINED_FILE, true), ("XX000", false)] {
+            let (mut feed, mut socket) = mock_session().await;
+            let server = async {
+                query(&mut socket).await;
+                backend(&mut socket, b'E', &error_response(code)).await;
+            };
+            let (started, ()) = tokio::join!(feed.start_physical_replication(None, 0, 1), server);
+            let e = started.unwrap_err();
+            assert_eq!(is_wal_segment_removed(&e), removed, "{e:#}");
+            assert!(format!("{e:#}").contains(code), "{e:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_skips_unexpected_backend_messages() {
+        let (mut feed, mut socket) = mock_feed().await;
+        backend(&mut socket, b'A', b"\0\0\0\x01chan\0note\0").await;
+        let mut frame = vec![b'w'];
+        frame.extend_from_slice(&0x100u64.to_be_bytes());
+        frame.extend_from_slice(&0x104u64.to_be_bytes());
+        frame.extend_from_slice(&0u64.to_be_bytes());
+        frame.extend_from_slice(b"WAL!");
+        backend(&mut socket, b'd', &frame).await;
+        let mut buf = Vec::new();
+        let event = feed.next_event(StandbyStatus::default(), &mut buf).await;
+        assert!(
+            matches!(event, Ok(SourceEvent::Wal(c)) if c.start_lsn == 0x100 && c.data == b"WAL!")
+        );
+        assert_eq!(feed.last_server_wal_end(), 0x104);
+    }
+
+    #[tokio::test]
+    async fn timeline_history_failure_names_the_timeline() {
+        let (mut feed, mut socket) = mock_session().await;
+        let server = async {
+            assert!(query(&mut socket).await.starts_with("TIMELINE_HISTORY 2"));
+            backend(&mut socket, b'E', &error_response("XX000")).await;
+        };
+        let (history, ()) = tokio::join!(feed.timeline_history(2), server);
+        let e = history.unwrap_err();
+        assert_eq!(e.to_string(), "TIMELINE_HISTORY 2");
+    }
+
+    /// Sidecar SQL rides the replication connection's transport settings
+    #[tokio::test]
+    async fn sql_client_dial_failures_name_the_endpoint() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = mock_cfg(closed.local_addr().unwrap().port());
+        cfg.password = Some("pw".into());
+        drop(closed);
+        let e = open_sql_client(&cfg).await.err().unwrap();
+        assert!(e.to_string().starts_with("connect to 127.0.0.1:"), "{e:#}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.port = listener.local_addr().unwrap().port();
+        let refuse_tls = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_exact(&mut [0; 8]).await.unwrap();
+            socket.write_all(b"N").await.unwrap();
+            let (mut plain, _) = listener.accept().await.unwrap();
+            plain.read_u32().await.unwrap();
+        };
+        let dial = async {
+            cfg.sslmode = SslMode::Require;
+            let tls = open_sql_client(&cfg).await.err().unwrap();
+            cfg.sslmode = SslMode::Disable;
+            let plain = open_sql_client(&cfg).await.err().unwrap();
+            (tls, plain)
+        };
+        let ((tls, plain), ()) = tokio::join!(dial, refuse_tls);
+        assert!(
+            tls.to_string().starts_with("tls negotiation against"),
+            "{tls:#}"
+        );
+        assert!(
+            !plain.to_string().starts_with("tls negotiation"),
+            "{plain:#}"
         );
     }
 }

@@ -30,7 +30,6 @@ writes. A documented limitation does not imply code rejects it
 | [Bootstrap ordering](bootstrap_ordering.md) | Extend TOAST reads at page LSN and replacement evidence to per-table and pending loads |
 | [Verification](verification.md) | Prove value fidelity and restart without skipping WAL |
 | [Snowflake](snowflake.md) | Run live correctness, restart and matched throughput/cost qualification; see [implementation evidence](snowflake-progress.md) |
-| [100% line coverage](coverage100.md) | Close fixture, live-system, CLI, and fault-path gaps, then enforce 100% |
 
 ## Further work
 

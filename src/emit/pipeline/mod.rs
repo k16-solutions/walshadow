@@ -35,7 +35,7 @@ use crate::ops::trace::TxnSpanRegistry;
 use crate::pos::{EmitterAck, Floor, Monotone};
 use crate::source_db::SourceDbs;
 use crate::xact::xact_buffer::{SubxactTracker, XactBuffer};
-use ahash::HashMap;
+use foldhash::HashMap;
 use tokio_postgres::types::Oid;
 
 /// One-shot fatal-error signal shared across pipeline stages. Pump polls
@@ -76,10 +76,12 @@ impl Fatal {
         self.0.borrow().clone()
     }
 
-    /// Resolve once the flag is set (now or later). Holding the sender keeps
-    /// the channel open, so this never resolves unset.
-    pub async fn wait(&self) {
-        let _ = self.0.subscribe().wait_for(Option::is_some).await;
+    /// Root cause, once set (now or later). Holding the sender keeps the
+    /// channel open, so this never resolves unset.
+    pub async fn wait(&self) -> String {
+        let mut rx = self.0.subscribe();
+        let set = rx.wait_for(Option::is_some).await;
+        set.ok().and_then(|m| m.clone()).unwrap_or_default()
     }
 }
 
@@ -109,7 +111,7 @@ pub struct PipelineConfig {
     /// One per database that applies CH DDL. A database with no entry has
     /// its schema events and truncates observed only (pairs with
     /// [`TailKind::Null`])
-    pub applicators: HashMap<Oid, DdlApplicator>,
+    pub ddl: HashMap<Oid, DbDdl>,
     pub tail: TailKind,
     pub buffer: Arc<Mutex<XactBuffer>>,
     pub subxact_tracker: Arc<Mutex<SubxactTracker>>,
@@ -120,9 +122,6 @@ pub struct PipelineConfig {
     /// Per-txn span map shared with the pump + buffer; `Some` only when OTLP
     /// tracing is on. Reorder parents `commit.drain`/`dispatch` under `txn`.
     pub span_registry: Option<TxnSpanRegistry>,
-    /// COPY backfillers for `initial_load='copy'` opt-ins, one per database.
-    /// A database with no entry streams from the opt-in LSN only
-    pub backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
     /// Durable queue of deferred toast-mirror retires, loaded from the
     /// spill dir; entries due at resume retire in
     /// [`reorder::BootingReorder::boot`]
@@ -136,6 +135,15 @@ pub struct PipelineConfig {
     /// concurrently with the pipeline and must draw from the same pool.
     /// `None` builds one at spawn
     pub budget: Option<crate::budget::MemoryBudget>,
+}
+
+/// CH-side wiring of one database applying DDL
+pub struct DbDdl {
+    pub applicator: DdlApplicator,
+    /// COPY or backup-sourced backfill of `initial_load` opt-ins
+    pub backfiller: Arc<dyn crate::backfill::opt_in::Backfiller>,
+    /// Live config the opt-in diff and route freeze read
+    pub resolver: Arc<crate::config::ConfigResolver>,
 }
 
 /// Spawned-stage join handles + shared signals. The daemon drives the
@@ -160,10 +168,7 @@ impl PipelineHandle {
     /// error.
     pub async fn join(self) -> Result<(), String> {
         self.tail.join().await;
-        match self.fatal.message() {
-            Some(msg) => Err(msg),
-            None => Ok(()),
-        }
+        self.fatal.message().map_or(Ok(()), Err)
     }
 }
 
@@ -181,14 +186,13 @@ impl PipelineConfig {
             inserter_pool_size,
             dbs,
             oracle,
-            applicators,
+            ddl,
             tail,
             buffer,
             subxact_tracker,
             pending,
             stats,
             span_registry,
-            backfillers,
             retires,
             pending_rows,
             resume_floor,
@@ -274,12 +278,11 @@ impl PipelineConfig {
             dbs,
             pending,
             subxact_tracker,
-            applicators,
+            ddl,
             ack,
             msg_tx,
             stats,
             planning,
-            backfillers,
             fatal.clone(),
             span_registry,
             emitter.drain_batch_rows,
@@ -319,17 +322,16 @@ pub fn build_budget(
         decoders,
     )?;
     // Progress invariant: a drain admits slices while holding its sealed
-    // generations (bounded by the body-spool + index caps), so the
-    // compartment must fit both plus slice headroom or a mid-drain admit
-    // could wait on units the drain itself holds
+    // generations (bounded by the body-spool cap), so the compartment must
+    // fit it plus slice headroom or a mid-drain admit could wait on units
+    // the drain itself holds
     let admission_max = emitter.resident_payload_max - reserve;
-    let drain_floor = crate::xact::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX
-        + crate::xact::xact_buffer::TOAST_INDEX_MEM_MAX
-        + 2 * emitter.drain_batch_bytes;
+    let drain_floor =
+        crate::xact::xact_buffer::TOAST_BODY_SPOOL_MEM_MAX + 2 * emitter.drain_batch_bytes;
     if admission_max < drain_floor {
         return Err(format!(
             "admission compartment {admission_max} below drain floor {drain_floor} \
-             (body spool cap + index cap + 2x drain_batch_bytes); raise \
+             (body spool cap + 2x drain_batch_bytes); raise \
              resident_payload_max or lower drain_batch_bytes",
         ));
     }
@@ -363,6 +365,14 @@ pub fn leaf_reserve_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fatal_keeps_first_message() {
+        let fatal = Fatal::new();
+        fatal.set("root".into());
+        fatal.set("echo".into());
+        assert_eq!(fatal.message().as_deref(), Some("root"));
+    }
 
     /// Default byte values with a wide decode pool must fail startup, not
     /// zero out the admission compartment

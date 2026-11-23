@@ -12,7 +12,7 @@ use crate::emit::route::RouteSnapshot;
 use crate::mapping::MappingSnapshot;
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
-use ahash::HashSetExt;
+use foldhash::HashSetExt;
 use futures::{StreamExt, TryStreamExt};
 
 /// One backup-walk snapshot generation. `Replayed` means a prior successful

@@ -40,7 +40,7 @@ use crate::filter::pg_class_decoder::{
     info_carries_new_tuple_heap2, info_is_inplace, page_rows, tuple_slots,
 };
 use crate::schema::FIRST_NORMAL_OBJECT_ID;
-use ahash::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet};
 
 /// XLOG_RELMAP_UPDATE info byte (`xl_info & XLR_RMGR_INFO_MASK`).
 const XLOG_RELMAP_UPDATE: u8 = 0x00;
@@ -520,17 +520,12 @@ impl CatalogTracker {
             let db_node: Oid = row.get(0);
             let catalog_oid: Oid = row.get(1);
             let filenode: Oid = row.get(2);
-            if filenode == 0 {
-                continue;
-            }
             if db_node != 0
                 && let Some(slot) = parse_ctid(row.get(3))
             {
                 slots.push((db_node, slot, catalog_oid, filenode));
             }
-            if self.nodes.insert((db_node, filenode)) {
-                added += 1;
-            }
+            added += usize::from(self.nodes.insert((db_node, filenode)));
             if catalog_oid == PG_CLASS_OID {
                 self.pg_class_filenode.insert(db_node, filenode);
             }
@@ -751,6 +746,17 @@ mod tests {
             t.is_opaque_catalog(6, 2619),
             "filenode tracking is per database",
         );
+        let again = heap_block_record_with_main(
+            RmId::Heap,
+            0x20,
+            5,
+            1259,
+            pg_class_block_data(2619, 41000),
+            xl_heap_update_no_compression(),
+        );
+        t.observe(&again, MAGIC);
+        assert!(t.is_opaque_catalog(5, 41000));
+        assert!(!t.is_opaque_catalog(5, 40000), "second move retires first");
     }
 
     #[test]
@@ -1153,6 +1159,27 @@ mod tests {
     }
 
     #[test]
+    fn pg_class_rebuild_outside_an_xact_teaches_its_transient_pages() {
+        let mut t = CatalogTracker::new();
+        let insert = heap_block_record_with_main(
+            RmId::Heap,
+            0x00,
+            5,
+            1259,
+            named_block_data(50010, "pg_temp_1259", 11, 50010),
+            1u16.to_le_bytes().to_vec(),
+        );
+        t.observe(&insert, MAGIC);
+        assert!(t.is_catalog(5, 50010));
+        assert!(
+            t.reads_image(5, 50010),
+            "transient pg_class pages teach slots"
+        );
+        t.observe(&smgr_create(5, 50011, 0), MAGIC);
+        assert!(!t.is_catalog(5, 50011), "no xact claims later storage");
+    }
+
+    #[test]
     fn user_rebuild_claims_nothing() {
         let mut t = CatalogTracker::new();
         let insert = heap_block_record_with_main(
@@ -1204,6 +1231,27 @@ mod tests {
         );
         t.observe(&again, MAGIC);
         assert!(t.is_catalog(5, 40100));
+    }
+
+    /// Unrestorable pg_class image teaches nothing and forgets its page
+    #[test]
+    fn unrestorable_image_forgets_its_page_slots() {
+        use walrus::pg::walparser::{BKP_BLOCK_HAS_IMAGE, XLogRecordBlockImageHeader};
+        let mut t = CatalogTracker::new();
+        t.catalog_slots.insert((5, 1259, 0, 7), (2674, 2674));
+        t.catalog_slots.insert((5, 1259, 1, 7), (2675, 2675));
+        let mut lock = heap_block_record(RmId::Heap, 0x60, 5, 1259, Vec::new());
+        let block = &mut lock.blocks[0];
+        block.header.fork_flags = BKP_BLOCK_HAS_IMAGE;
+        block.header.image_header = XLogRecordBlockImageHeader {
+            image_length: 0,
+            hole_offset: 8192,
+            hole_length: 1,
+            info: 0,
+        };
+        t.observe(&lock, MAGIC);
+        let left: Vec<_> = t.catalog_slots.into_iter().collect();
+        assert_eq!(left, [((5, 1259, 1, 7), (2675, 2675))]);
     }
 
     #[test]

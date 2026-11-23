@@ -389,6 +389,9 @@ async fn forward_decl_materializes_on_create_table() {
         vec![
             "CREATE TABLE app.later (id bigint PRIMARY KEY, body text)".into(),
             "INSERT INTO app.later (id, body) VALUES (1, 'declared-first')".into(),
+            "DELETE FROM walshadow.config_table WHERE namespace = 'app' AND relname = 'later'"
+                .into(),
+            "INSERT INTO app.later (id, body) VALUES (2, 'opted-out')".into(),
             "SELECT pg_switch_wal()".into(),
         ],
     );
@@ -420,6 +423,10 @@ async fn forward_decl_materializes_on_create_table() {
         )
         .expect("ch body");
     assert_eq!(body, "declared-first");
+    let n = ch
+        .query("SELECT count() FROM walshadow_test.app_later FINAL WHERE _is_deleted = 0")
+        .expect("ch count");
+    assert_eq!(n, "1", "insert after config row removal must not land");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1430,4 +1437,113 @@ async fn copy_load_pins_output_settings() {
         got, "['1 day 02:03:04','1 day 02:03:04']",
         "COPY row renders like the WAL row"
     );
+}
+
+/// Boot opt-in for a table the source has not created waits in the reload
+/// queue across config republishes, then applies once the shadow catalog
+/// resolves its descriptor
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boot_opt_in_waits_for_its_table() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let slot = fx::Ports::alloc();
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_sql = format!(
+        "{INSTALL_SQL}\nCREATE SCHEMA app;\nCREATE TABLE app.tick (id bigint PRIMARY KEY);\n"
+    );
+    let (
+        fx::BootstrappedClusters {
+            source,
+            shadow,
+            shadow_filter_dir,
+        },
+        shadow_stream_state,
+    ) = fx::bootstrap_clusters(&tmp, &schema_sql, slot.source, slot.shadow, slot.walsender).await;
+    let _src_stop = fx::StopOnDrop { sh: &source };
+    let _shd_stop = fx::StopOnDrop { sh: &shadow };
+    let ch_tmp = tempfile::tempdir().unwrap();
+    let ch = fx::ChServer::spawn(ch_tmp, slot.ch_tcp, slot.ch_http).expect("spawn ch");
+    ch.query("CREATE DATABASE IF NOT EXISTS walshadow_test")
+        .expect("create db");
+    let mut pipeline = fx::build_pipeline_with(
+        fx::BuildPipelineArgs {
+            tmp: &tmp,
+            source: &source,
+            shadow: &shadow,
+            shadow_filter_dir: &shadow_filter_dir,
+            shadow_stream_state,
+            ch_database: "walshadow_test",
+            ch_tcp_port: slot.ch_tcp,
+            mappings: vec![],
+            app_name: "walshadow-boot-opt-in-wait",
+            ddl: Some(overlay_ddl_args()),
+        },
+        |cfg| {
+            cfg.table_opt_ins.insert(
+                RelName::new("app", "later"),
+                walshadow::runtime_config::TableRow {
+                    replicate: Some(true),
+                    ..Default::default()
+                },
+            );
+        },
+    )
+    .await;
+    let later_exists = || {
+        ch.query(
+            "SELECT count() FROM system.tables WHERE database = 'walshadow_test' \
+             AND name = 'app_later'",
+        )
+        .expect("ch system.tables")
+    };
+
+    // Commits retry the unresolvable opt-in; the config row republishes
+    // while it waits
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO app.tick VALUES (1)".into(),
+            "INSERT INTO walshadow.config_table (namespace, relname, replicate) \
+             VALUES ('app', 'tick', false)"
+                .into(),
+            "INSERT INTO app.tick VALUES (2)".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+    let shipped = fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    assert!(shipped >= 1, "phase A: no segments shipped in 45s");
+    assert_eq!(
+        later_exists(),
+        "0",
+        "opt-in applied before its table existed"
+    );
+
+    // Shadow replays CREATE behind the stream, so tick until opt-in lands
+    let mut stmts = vec!["CREATE TABLE app.later (id bigint PRIMARY KEY, body text)".to_string()];
+    let mut tick = 3;
+    while later_exists() == "0" {
+        assert!(tick < 40, "opt-in never applied after CREATE TABLE");
+        stmts.push(format!("INSERT INTO app.tick VALUES ({tick})"));
+        stmts.push("SELECT pg_switch_wal()".into());
+        let driver = fx::spawn_workload(&source, std::mem::take(&mut stmts));
+        fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+        let _ = driver.join();
+        tick += 1;
+    }
+    let driver = fx::spawn_workload(
+        &source,
+        vec![
+            "INSERT INTO app.later VALUES (1, 'waited')".into(),
+            "SELECT pg_switch_wal()".into(),
+        ],
+    );
+    fx::pump_segments(&mut pipeline, 1, Duration::from_secs(45)).await;
+    let _ = driver.join();
+    pipeline.shutdown().await.expect("pipeline drains clean");
+    let body = ch
+        .query("SELECT argMax(body, _lsn) FROM walshadow_test.app_later WHERE _is_deleted = 0")
+        .expect("ch body");
+    assert_eq!(body, "waited");
 }

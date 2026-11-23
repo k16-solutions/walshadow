@@ -66,8 +66,9 @@ The stream binary works the same way, through `src/fork/bin/stream/`.
   the whole Snowflake branch inline.
 - **Run the hook's condition inside the fork file.** A hook that checks
   `emitter.snowflake` from the fork file runs on every path, so the fork file
-  gets line coverage even in CI without Snowflake. CI fails any file with 0%
-  coverage.
+  gets line coverage even in CI without Snowflake. Upstream requires 100% line
+  coverage; this fork caps missed lines instead (`MAX_MISSED_LINES` in
+  `ci.yml`), and untested fork code spends that budget.
 - **Don't add positional parameters to upstream functions.** A new `bool`
   argument means editing every upstream call site and test, now and after every
   sync. For example, `neutral_values` in `emit::pipeline::bootstrap::drain`

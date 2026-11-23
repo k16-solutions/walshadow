@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ahash::HashSet;
 use anyhow::{Context, Result};
+use foldhash::HashSet;
 use std::fs;
 use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::base_backup::BaseBackupOpts;
-use walrus::pg::replication::conn::PgConfig;
+use walrus::pg::replication::conn::{PgConfig, SystemIdentity};
 use walrus::time::Timestamp;
 use walshadow::backfill::visibility_gate::{
     DeferredLane, GateStats, GreenfieldSink, PendingGate, resolve_greenfield, stream_phase,
@@ -60,6 +60,14 @@ impl BootstrapPlan {
     }
 }
 
+/// Quiesce every lane tail, then prefer the fatal a tail recorded over `e`
+async fn unwind(tails: Vec<OwnedTail>, fatal: &Fatal, e: anyhow::Error) -> anyhow::Error {
+    for tail in tails {
+        tail.quiesce().await;
+    }
+    fatal.message().map(anyhow::Error::msg).unwrap_or(e)
+}
+
 pub(crate) fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Result<BootstrapPlan> {
     let toml = ch.map(|c| &c.bootstrap);
     let mode = cli_over_toml(args.bootstrap_mode, toml.and_then(|b| b.mode))
@@ -100,9 +108,32 @@ pub(crate) fn resolve_bootstrap(args: &Args, ch: Option<&EmitterConfig>) -> Resu
     })
 }
 
+/// Window leg reconnects to the source the backup opened on, same branch
+fn same_source(opened: &SystemIdentity, now: &SystemIdentity) -> Result<()> {
+    let opened = (opened.system_id, opened.timeline);
+    let now = (now.system_id, now.timeline);
+    anyhow::ensure!(
+        now == opened,
+        "source identity moved during bootstrap: (system, timeline) {opened:?} when the \
+         backup opened, {now:?} now",
+    );
+    Ok(())
+}
+
 /// Check for initialized cluster via `PG_VERSION`
 pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
     dir.join("PG_VERSION").exists()
+}
+
+/// Preserve existing cluster data when no bootstrap attempt owns it
+fn refuse_unowned_cluster(previous: Option<&BootstrapMarker>, dir: &Path) -> Result<()> {
+    anyhow::ensure!(
+        previous.is_some() || !shadow_data_dir_initialized(dir),
+        "bootstrap: {} already holds a cluster (PG_VERSION present) but no bootstrap attempt \
+         marker; provide an empty data dir to bootstrap",
+        dir.display(),
+    );
+    Ok(())
 }
 
 /// Run BASE_BACKUP into new shadow data dir and return backup `end_lsn`
@@ -110,8 +141,8 @@ pub(crate) fn shadow_data_dir_initialized(dir: &std::path::Path) -> bool {
 /// shadow in [`crate::run`]
 /// Config, credential, and CH-endpoint failures are resolved before the data
 /// dir is created, so they leave nothing behind. Once extraction starts, the
-/// marker survives a failure; `previous` carries it back on the retry
-/// [`BootstrapMode::ObjectStore`] gets, and is `None` for a first attempt
+/// marker survives a failure; [`BootstrapAttempt::ObjectStore`] carries it
+/// back on the retry, and is `None` for a first attempt
 ///
 /// `ch_config` `Some`: bootstrap rows route through the shared insert tail
 /// (synthetic INSERT `_lsn = start_lsn`, `_commit_ts = 0`, `_is_deleted = 0`).
@@ -125,7 +156,7 @@ pub(crate) async fn run_bootstrap(
     feed: &mut SourceFeed,
     args: &Args,
     plan: &BootstrapPlan,
-    previous: Option<BootstrapMarker>,
+    attempt: BootstrapAttempt,
     ch_config: Option<EmitterConfig>,
     observers: BootstrapObservers<'_>,
 ) -> Result<(BootstrapHandoff, BootstrapMetrics)> {
@@ -138,14 +169,7 @@ pub(crate) async fn run_bootstrap(
     let bridge_workers = bridge_pool_size(ch_config.as_ref());
     let shadow_data_dir = args.bootstrap_shadow_data_dir.clone();
 
-    // Preserve existing cluster data when no bootstrap attempt owns it
-    if previous.is_none() && shadow_data_dir_initialized(&shadow_data_dir) {
-        anyhow::bail!(
-            "bootstrap: {} already holds a cluster (PG_VERSION present) but no bootstrap attempt \
-             marker; provide an empty data dir to bootstrap",
-            shadow_data_dir.display(),
-        );
-    }
+    refuse_unowned_cluster(attempt.previous(), &shadow_data_dir)?;
 
     // Seed catalog map inside a REPEATABLE READ snapshot. DDL between the
     // seed COMMIT and BASE_BACKUP's checkpoint window is operator-quiesced
@@ -178,8 +202,8 @@ pub(crate) async fn run_bootstrap(
     let mut pinned_backup: Option<String> = None;
     let snowflake_target = ch_config.as_ref().is_some_and(|c| c.snowflake.is_some());
     let mut object_store_start_lsn = None;
-    let (source, mut wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match plan.mode {
-        BootstrapMode::Direct => {
+    let (source, wal_hydrate): (Box<dyn BackupSource>, Option<WalHydrate>) = match &attempt {
+        BootstrapAttempt::Direct => {
             let hydrate = if args.bootstrap_wal_from_archive {
                 let settings = ch_config.as_ref().and_then(|c| c.backup.clone()).context(
                     "bootstrap: --bootstrap-wal-from-archive requires a [backup] \
@@ -236,7 +260,7 @@ pub(crate) async fn run_bootstrap(
             }
             (Box::new(direct), hydrate)
         }
-        BootstrapMode::ObjectStore => {
+        BootstrapAttempt::ObjectStore(previous) => {
             let settings = ch_config
                     .as_ref()
                     .and_then(|c| c.backup.clone())
@@ -271,7 +295,6 @@ pub(crate) async fn run_bootstrap(
             }
             (Box::new(src), Some((settings, storage)))
         }
-        BootstrapMode::Off => unreachable!("dispatch happened in run()"),
     };
 
     // Tail drain gets a second CatalogMap clone for rfn → descriptor
@@ -326,8 +349,29 @@ pub(crate) async fn run_bootstrap(
             // but don't page-walk its existing rows.
             let skip_initial: HashSet<_> = drain_catalog
                 .descriptors()
-                .filter(|d| fork::bootstrap_skips_initial(&emitter_cfg, &resolved, d))
-                .map(|d| d.rel_name.clone())
+                .filter_map(|d| {
+                    // A partition loads as its root's `initial_load` says
+                    let rn = &routing(d, Some(&resolved.rules))
+                        .owner(d)
+                        .unwrap_or(d)
+                        .rel_name;
+                    let table_mode = emitter_cfg
+                        .table_opt_ins
+                        .get(rn)
+                        .and_then(|r| r.initial_load.as_deref())
+                        .or_else(|| emitter_cfg.table_initial_loads.get(rn).map(|m| m.as_str()));
+                    let none = match table_mode {
+                        Some(s) => s.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
+                        None => {
+                            resolved
+                                .namespaces
+                                .get(rn.namespace.as_ref())
+                                .and_then(|n| n.initial_load)
+                                == Some(InitialLoadMode::None)
+                        }
+                    };
+                    none.then(|| d.rel_name.clone())
+                })
                 .collect();
             Some((emitter_cfg, mapping, resolved, skip_initial))
         }
@@ -336,7 +380,7 @@ pub(crate) async fn run_bootstrap(
 
     // Decline unmapped relations at `begin` so their pages never decode.
     // Metrics-only (no CH) has no mapping to filter against, so it walks all
-    let (tap_filenodes, needs_oracle, mut routes) = match &ch_target {
+    let (tap_filenodes, needs_oracle, mut routes, loaded_rels) = match &ch_target {
         Some((emitter_cfg, mapping, resolved, skip_initial)) => {
             let routed = mapping.snapshot();
             let is_routed = |d: &RelDescriptor| {
@@ -345,6 +389,11 @@ pub(crate) async fn run_bootstrap(
                     .is_some_and(|o| routed.contains_key(&o.rel_name))
             };
             let walked = |d: &RelDescriptor| is_routed(d) && !skip_initial.contains(&d.rel_name);
+            let loaded: Vec<_> = drain_catalog
+                .descriptors()
+                .filter(|d| walked(d))
+                .map(|d| d.rel_name.clone())
+                .collect();
             (
                 walshadow::backfill_bootstrap::tap_filenode_set(&drain_catalog, is_routed, walked)
                     .map(Arc::new),
@@ -361,12 +410,13 @@ pub(crate) async fn run_bootstrap(
                     )
                 },
                 routed,
+                loaded,
             )
         }
-        None => (None, false, Default::default()),
+        None => (None, false, Default::default(), Vec::new()),
     };
 
-    let shadow_toast_rels: ahash::HashSet<(u32, u32)> = if shadow_toast {
+    let shadow_toast_rels: foldhash::HashSet<(u32, u32)> = if shadow_toast {
         walshadow::toast::shadow_landing::toast_relations(
             sql_client,
             drain_catalog.descriptors().map(Arc::as_ref),
@@ -374,7 +424,7 @@ pub(crate) async fn run_bootstrap(
         )
         .await?
     } else {
-        ahash::HashSet::default()
+        foldhash::HashSet::default()
     };
 
     // Set up oracle before opening BASE_BACKUP to avoid holding backup open
@@ -400,9 +450,13 @@ pub(crate) async fn run_bootstrap(
     };
     let oracle = bootstrap_oracle.as_ref().map(|o| o.oracle());
 
-    let mut marker = bootstrap_marker::begin_attempt(&shadow_data_dir, previous, pinned_backup)
-        .await
-        .context("prepare shadow data dir for bootstrap")?;
+    let mut marker = bootstrap_marker::begin_attempt(
+        &shadow_data_dir,
+        attempt.previous().cloned(),
+        pinned_backup,
+    )
+    .await
+    .context("prepare shadow data dir for bootstrap")?;
     let mut resume =
         bootstrap_marker::resumable_extraction(&shadow_data_dir, marker.backup_name.as_deref())?;
 
@@ -684,7 +738,7 @@ pub(crate) async fn run_bootstrap(
             for h in gate_handles {
                 let (s, spool) = h
                     .await
-                    .map_err(|e| format!("bootstrap gate join: {e}"))?
+                    .expect("bootstrap gate task panicked")
                     .map_err(|e| format!("bootstrap gate: {e}"))?;
                 stats.emitted += s.emitted;
                 stats.gated += s.gated;
@@ -755,12 +809,7 @@ pub(crate) async fn run_bootstrap(
         })();
         let (gate_stats, mut gate_spool, mut drain_outcome, outcome, mut window) = match prepared {
             Ok(prepared) => prepared,
-            Err(e) => {
-                for tail in tails {
-                    tail.quiesce().await;
-                }
-                return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
-            }
+            Err(e) => return Err(unwind(tails, &fatal, e).await),
         };
 
         // Only an object-store attempt can re-read the identical backup, so
@@ -786,17 +835,16 @@ pub(crate) async fn run_bootstrap(
             }
             let mut handback_spools = Vec::with_capacity(drain_outcome.len());
             for drained in &mut drain_outcome {
+                // Drain hands back only a spool holding records
                 if let Some(spool) = drained.deferred.as_mut() {
                     spool
                         .checkpoint()
                         .await
                         .context("bootstrap: persist deferred referrer spool")?;
-                    if spool.records() > 0 {
-                        handback_spools.push(bootstrap_marker::SpooledRecords {
-                            path: spool.path().to_path_buf(),
-                            records: spool.records(),
-                        });
-                    }
+                    handback_spools.push(bootstrap_marker::SpooledRecords {
+                        path: spool.path().to_path_buf(),
+                        records: spool.records(),
+                    });
                 }
             }
             bootstrap_marker::ExtractedCheckpoint {
@@ -812,7 +860,7 @@ pub(crate) async fn run_bootstrap(
             .context("bootstrap: record extraction checkpoint")?;
         }
 
-        if let Some((settings, storage)) = wal_hydrate.take() {
+        if let Some((settings, storage)) = wal_hydrate {
             fetch_wal_into_pg_wal(
                 &settings,
                 storage,
@@ -879,11 +927,10 @@ pub(crate) async fn run_bootstrap(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let dir = shadow_data_dir.display();
                 tokio::fs::set_permissions(&shadow_data_dir, fs::Permissions::from_mode(0o700))
                     .await
-                    .with_context(|| {
-                        format!("bootstrap: chmod 0700 {}", shadow_data_dir.display())
-                    })?;
+                    .context(format!("bootstrap: chmod 0700 {dir}"))?;
             }
             // Guard before start, so a failed bootstrap stops what it started
             let started = running_shadow.insert(OwnedShadow::new(
@@ -905,7 +952,6 @@ pub(crate) async fn run_bootstrap(
                 .measure(start_owned_shadow(
                     &started.shadow,
                     Some(outcome.end.end_lsn),
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
                     false,
                 ))
                 .await
@@ -947,16 +993,13 @@ pub(crate) async fn run_bootstrap(
             match replayed {
                 Ok(w) => window = Some(w),
                 Err(e) => {
-                    for tail in tails {
-                        tail.quiesce().await;
-                    }
                     let e = match &window_leg_error {
                         Some(live) => {
                             e.context(format!("after the live window leg failed: {live:#}"))
                         }
                         None => e.context("bootstrap: backup-window WAL leg"),
                     };
-                    return Err(fatal.message().map(anyhow::Error::msg).unwrap_or(e));
+                    return Err(unwind(tails, &fatal, e).await);
                 }
             }
         }
@@ -993,15 +1036,7 @@ pub(crate) async fn run_bootstrap(
                         deferred_rows += lane.rows_routed;
                     }
                 }
-                Err(e) => {
-                    for tail in tails {
-                        tail.quiesce().await;
-                    }
-                    return Err(fatal
-                        .message()
-                        .map(anyhow::Error::msg)
-                        .unwrap_or_else(|| anyhow::anyhow!(e)));
-                }
+                Err(e) => return Err(unwind(tails, &fatal, anyhow::anyhow!(e)).await),
             }
         }
         // Seqs are per-lane, so each tail is proven through its own count
@@ -1043,28 +1078,17 @@ pub(crate) async fn run_bootstrap(
 
     // Replace live-leg COPY connection and recheck source identity
     if live_leg_ran || window_leg_error.is_some() {
+        let (host, port) = (&src_cfg.host, src_cfg.port);
+        let reconnect = format!("bootstrap: reconnect source {host}:{port} after the window leg");
         *feed = SourceFeed::connect(src_cfg)
             .await
-            .with_context(|| {
-                format!(
-                    "bootstrap: reconnect source {}:{} after the window leg",
-                    src_cfg.host, src_cfg.port
-                )
-            })?
+            .context(reconnect)?
             .with_status_interval(Duration::from_secs(args.status_interval));
         let now = feed
             .identify_system()
             .await
             .context("bootstrap: IDENTIFY_SYSTEM after the window leg")?;
-        anyhow::ensure!(
-            now.system_id == source_ident.system_id && now.timeline == source_ident.timeline,
-            "source identity moved during bootstrap: system {} timeline {} when the backup \
-             opened, system {} timeline {} now",
-            source_ident.system_id,
-            source_ident.timeline,
-            now.system_id,
-            now.timeline,
-        );
+        same_source(&source_ident, &now)?;
     }
 
     tracing::info!(
@@ -1093,19 +1117,6 @@ pub(crate) async fn run_bootstrap(
         "bootstrap stage timings",
     );
     ticker.abort();
-
-    if let Some((settings, storage)) = wal_hydrate {
-        fetch_wal_into_pg_wal(
-            &settings,
-            storage,
-            &shadow_data_dir,
-            outcome.start.start_lsn,
-            outcome.end.end_lsn,
-            outcome.start.timeline,
-        )
-        .await
-        .context("bootstrap: hydrate shadow pg_wal from object store")?;
-    }
 
     let open_floor = window.as_ref().and_then(|w| w.open_floor);
     if let Some(w) = &window {
@@ -1202,21 +1213,45 @@ pub(crate) async fn run_bootstrap(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o700);
+        let dir = shadow_data_dir.display();
         tokio::fs::set_permissions(&shadow_data_dir, perms)
             .await
-            .with_context(|| format!("bootstrap: chmod 0700 {}", shadow_data_dir.display()))?;
+            .context(format!("bootstrap: chmod 0700 {dir}"))?;
     }
 
-    BootstrapMarker::complete(&shadow_data_dir, recorded).await?;
+    let ledger_mode = if plan.mode == BootstrapMode::ObjectStore {
+        InitialLoadMode::ObjectStore
+    } else {
+        InitialLoadMode::BaseBackup
+    };
+    let recorded_loads = walshadow::copy_backfill::record_bootstrap_loads(
+        &args.spill_dir,
+        source_ident.system_id,
+        ledger_mode,
+        outcome.end.end_lsn,
+        loaded_rels,
+    )
+    .await
+    .context("bootstrap: record loaded tables in the backfill ledger")?;
+    tracing::info!(
+        target: "walshadow::bootstrap",
+        tables = recorded_loads,
+        end_lsn = format_pg_lsn(outcome.end.end_lsn).to_string(),
+        "bootstrap loads recorded in the backfill ledger",
+    );
+
+    let handoff = bootstrap_marker::Handoff {
+        end_lsn: outcome.end.end_lsn,
+        timeline: outcome.start.timeline,
+        open_floor,
+    };
+    BootstrapMarker::hand_off(&shadow_data_dir, handoff, recorded).await?;
+    #[cfg(feature = "test-support")]
+    walshadow::crash_test::hit_now(walshadow::crash_test::Point::BootstrapHandoff);
 
     timing.finish();
     Ok((
-        BootstrapHandoff {
-            end_lsn: outcome.end.end_lsn,
-            timeline: outcome.start.timeline,
-            open_floor,
-            shadow: running_shadow,
-        },
+        BootstrapHandoff::new(handoff, running_shadow),
         BootstrapMetrics {
             progress,
             oracle: oracle_stats,
@@ -1255,6 +1290,15 @@ pub(crate) struct BootstrapHandoff {
 }
 
 impl BootstrapHandoff {
+    pub(crate) fn new(handoff: bootstrap_marker::Handoff, shadow: Option<OwnedShadow>) -> Self {
+        Self {
+            end_lsn: handoff.end_lsn,
+            timeline: handoff.timeline,
+            open_floor: handoff.open_floor,
+            shadow,
+        }
+    }
+
     /// Source or archive must retain crossing transaction records
     pub(crate) fn resume_lsn(&self) -> u64 {
         self.open_floor.unwrap_or(self.end_lsn).min(self.end_lsn)
@@ -1326,28 +1370,43 @@ pub(crate) async fn bootstrap_build_mapping(
         applicator
             .add(desc)
             .await
-            .with_context(|| format!("bootstrap: ensure CH table {}", desc.rel_name))?;
+            .context(format!("bootstrap: ensure CH table {}", desc.rel_name))?;
     }
     Ok((mapping, resolved))
+}
+
+/// Source of one bootstrap attempt. Only object store re-reads the same
+/// backup, so only it retries, carrying the failed attempt's marker
+#[derive(Clone)]
+pub(crate) enum BootstrapAttempt {
+    Direct,
+    ObjectStore(Option<BootstrapMarker>),
+}
+
+impl BootstrapAttempt {
+    fn previous(&self) -> Option<&BootstrapMarker> {
+        if let Self::ObjectStore(previous) = self {
+            previous.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// Choose one-time bootstrap or resume from `--bootstrap-shadow-data-dir`
 /// and data dir state
 /// Mode only chooses bootstrap source
 pub(crate) enum ShadowStart {
-    Bootstrap(PathBuf),
-    Rebootstrap(PathBuf, BootstrapMarker),
+    Bootstrap(PathBuf, BootstrapAttempt),
+    /// Load finished, streaming never persisted its resume state
+    Handoff(PathBuf, bootstrap_marker::Handoff),
     Resume(PathBuf),
 }
 
 impl ShadowStart {
-    pub(crate) fn bootstraps(&self) -> bool {
-        matches!(self, Self::Bootstrap(_) | Self::Rebootstrap(..))
-    }
-
     pub(crate) fn data_dir(&self) -> &Path {
         match self {
-            Self::Bootstrap(d) | Self::Rebootstrap(d, _) | Self::Resume(d) => d,
+            Self::Bootstrap(d, _) | Self::Handoff(d, _) | Self::Resume(d) => d,
         }
     }
 }
@@ -1366,8 +1425,20 @@ pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<S
             other.display(),
         );
     }
+    if let Some(handoff) = bootstrap_marker::handed_off(dir)? {
+        tracing::info!(
+            target: "walshadow::bootstrap",
+            data_dir = %dir.display(),
+            end_lsn = %format_pg_lsn(handoff.end_lsn),
+            "resuming streaming after bootstrap",
+        );
+        return Ok(ShadowStart::Handoff(dir.clone(), handoff));
+    }
     if let Some(marker) = bootstrap_marker::pending_attempt(dir, mode)? {
-        return Ok(ShadowStart::Rebootstrap(dir.clone(), marker));
+        return Ok(ShadowStart::Bootstrap(
+            dir.clone(),
+            BootstrapAttempt::ObjectStore(Some(marker)),
+        ));
     }
     if dir.join("PG_VERSION").exists() {
         if !matches!(mode, BootstrapMode::Off) {
@@ -1379,13 +1450,17 @@ pub(crate) fn resolve_shadow_start(args: &Args, mode: BootstrapMode) -> Result<S
         }
         return Ok(ShadowStart::Resume(dir.clone()));
     }
-    anyhow::ensure!(
-        !matches!(mode, BootstrapMode::Off),
-        "shadow data dir {} does not contain an initialized cluster; bootstrap mode off cannot \
-         bootstrap it, pass direct or object_store via --bootstrap-mode or [bootstrap] mode",
-        dir.display(),
-    );
-    Ok(ShadowStart::Bootstrap(dir.clone()))
+    let attempt = match mode {
+        BootstrapMode::Direct => BootstrapAttempt::Direct,
+        BootstrapMode::ObjectStore => BootstrapAttempt::ObjectStore(None),
+        BootstrapMode::Off => anyhow::bail!(
+            "shadow data dir {} does not contain an initialized cluster; bootstrap mode off \
+             cannot bootstrap it, pass direct or object_store via --bootstrap-mode or \
+             [bootstrap] mode",
+            dir.display(),
+        ),
+    };
+    Ok(ShadowStart::Bootstrap(dir.clone(), attempt))
 }
 
 /// True if `a` and `b` are the same path, or one is an ancestor of the other
@@ -1447,6 +1522,50 @@ mod tests {
 
     fn shadow_start(args: &Args) -> Result<ShadowStart> {
         resolve_shadow_start(args, resolve_bootstrap(args, None)?.mode)
+    }
+
+    #[test]
+    fn window_leg_reconnect_must_find_same_source() {
+        let ident = |system_id, timeline| SystemIdentity {
+            system_id,
+            timeline,
+            xlogpos: 0,
+        };
+        same_source(&ident(7, 1), &ident(7, 1)).unwrap();
+        assert_eq!(
+            same_source(&ident(7, 1), &ident(7, 2))
+                .unwrap_err()
+                .to_string(),
+            "source identity moved during bootstrap: (system, timeline) (7, 1) when the \
+             backup opened, (7, 2) now"
+        );
+    }
+
+    #[test]
+    fn bootstrap_refuses_cluster_no_attempt_owns() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(refuse_unowned_cluster(None, tmp.path()).is_ok());
+        std::fs::write(tmp.path().join("PG_VERSION"), "17").unwrap();
+        let err = refuse_unowned_cluster(None, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("already holds a cluster"), "{err}");
+    }
+
+    #[test]
+    fn shadow_data_dir_refuses_overlap_with_daemon_dirs() {
+        let err = shadow_start(&args_from(&[
+            "--bootstrap-shadow-data-dir",
+            "/tmp/out/shadow",
+        ]))
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("overlaps --out-dir /tmp/out"),
+            "{err}"
+        );
+        assert!(
+            paths_overlap(Path::new(""), Path::new("/tmp")),
+            "unresolvable path overlaps"
+        );
     }
 
     #[test]
@@ -1606,7 +1725,7 @@ mod tests {
         // Direct bootstraps empty dir, off rejects it
         assert!(matches!(
             shadow_start(&direct(dir_str)).unwrap(),
-            ShadowStart::Bootstrap(_)
+            ShadowStart::Bootstrap(_, BootstrapAttempt::Direct)
         ));
         assert!(shadow_start(&off(dir_str)).is_err());
 
@@ -1640,7 +1759,7 @@ mod tests {
                 "127.0.0.1:5999",
             ]))
             .unwrap(),
-            ShadowStart::Rebootstrap(..)
+            ShadowStart::Bootstrap(_, BootstrapAttempt::ObjectStore(Some(_)))
         ));
         assert!(dir.join("PG_VERSION").exists());
     }

@@ -8,7 +8,7 @@
 //! [`point_at_walsender`](Shadow::point_at_walsender),
 //! [`clear_stale_pid`](Shadow::clear_stale_pid),
 //! [`start_with_floor_retry`](Shadow::start_with_floor_retry),
-//! [`wait_for_replay`](Shadow::wait_for_replay),
+//! [`wait_for_replay_reporting`](Shadow::wait_for_replay_reporting),
 //! [`is_running`](Shadow::is_running),
 //! [`try_pg_wal_replay_resume`](Shadow::try_pg_wal_replay_resume),
 //! [`health`](Shadow::health),
@@ -28,6 +28,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use walrus::pg::backup::format_pg_lsn;
 
 use crate::source::shadow_stream::WALRECEIVER_PROTOCOL_PIN;
 
@@ -53,6 +55,8 @@ pub enum ShadowError {
     NotInRecovery,
     #[error("missing required PG binary: {0}")]
     MissingBinary(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, ShadowError>;
@@ -299,6 +303,13 @@ impl SourceGucFloor {
     }
 }
 
+fn killed_by_shutdown(err: &ShadowError) -> bool {
+    matches!(
+        err,
+        ShadowError::Process { stderr, .. } if stderr.contains("crash of another server process")
+    )
+}
+
 /// Outcome of [`try_pg_wal_replay_resume`](Shadow::try_pg_wal_replay_resume)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeOutcome {
@@ -384,9 +395,11 @@ impl Shadow {
     // ----- lifecycle steps -------------------------------------------
 
     pub fn initdb(&self) -> Result<()> {
-        if let Some(parent) = self.config.data_dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        self.config
+            .data_dir
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
         fs::create_dir_all(&self.config.socket_dir)?;
         self.run(
             "initdb",
@@ -611,13 +624,7 @@ impl Shadow {
             // Keep labels stable for parser
             .env("LC_ALL", "C")
             .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ShadowError::MissingBinary("pg_controldata".into())
-                } else {
-                    ShadowError::Io(e)
-                }
-            })?;
+            .map_err(|e| spawn_failed("pg_controldata", e))?;
         let out = self.check("pg_controldata", out)?;
         parse_controldata_floor(&String::from_utf8_lossy(&out.stdout))
     }
@@ -789,7 +796,6 @@ impl Shadow {
             .map_err(|e| ShadowError::PsqlParse(e.to_string()))
     }
 
-    /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn has_database(&self) -> Result<bool> {
         // `standard_conforming_strings` is on by default, so doubling the
         // quote is the whole escape
@@ -800,7 +806,17 @@ impl Shadow {
         Ok(present == "t")
     }
 
+    /// Block until in recovery and replay LSN ≥ `target`, or `timeout`.
     pub fn wait_for_replay(&self, target: u64, timeout: Duration) -> Result<u64> {
+        self.wait_for_replay_until(target, timeout, &CancellationToken::new())
+    }
+
+    fn wait_for_replay_until(
+        &self,
+        target: u64,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<u64> {
         let start = Instant::now();
         loop {
             if !self.is_in_recovery()? {
@@ -818,7 +834,67 @@ impl Shadow {
                     elapsed,
                 });
             }
+            if cancel.is_cancelled() {
+                return Err(ShadowError::Cancelled);
+            }
             thread::sleep(self.config.wait_poll);
+        }
+    }
+
+    /// [`wait_for_replay`](Self::wait_for_replay) without deadline, since
+    /// a large backup WAL window replays for as long as it needs. Log
+    /// progress each `report`, restart after a GUC floor pause. Postmaster
+    /// exit or recovery end fails through probe errors, `cancel` through
+    /// [`ShadowError::Cancelled`]
+    pub fn wait_for_replay_reporting(
+        &self,
+        target: u64,
+        report: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<u64> {
+        let target_lsn = format_pg_lsn(target).to_string();
+        let mut prior = None;
+        loop {
+            match self.wait_for_replay_until(target, report, cancel) {
+                Err(ShadowError::Timeout { .. }) => {}
+                reached => return reached,
+            }
+            match self.try_pg_wal_replay_resume()? {
+                ResumeOutcome::ResumedForFloor => {
+                    tracing::warn!(
+                        target: "walshadow::shadow",
+                        target_lsn,
+                        "shadow replay paused because GUC value is below primary; \
+                         restarting with required value",
+                    );
+                    while self.is_running()? {
+                        if cancel.is_cancelled() {
+                            return Err(ShadowError::Cancelled);
+                        }
+                        thread::sleep(self.config.wait_poll);
+                    }
+                    self.clear_stale_pid()?;
+                    self.start_with_floor_retry(None)?;
+                    continue;
+                }
+                ResumeOutcome::PausedForeign => tracing::warn!(
+                    target: "walshadow::shadow",
+                    target_lsn,
+                    "shadow replay paused for a reason other than GUC floor \
+                     (eg operator pg_wal_replay_pause); waiting for resume",
+                ),
+                ResumeOutcome::NotPaused => {}
+            }
+            let lsn = self.last_replay_lsn()?;
+            tracing::info!(
+                target: "walshadow::shadow",
+                replay_lsn = lsn.map(|l| format_pg_lsn(l).to_string()),
+                target_lsn,
+                remaining_bytes = target.saturating_sub(lsn.unwrap_or(0)),
+                advanced = lsn > prior,
+                "shadow replaying toward bootstrap end_lsn",
+            );
+            prior = lsn;
         }
     }
 
@@ -840,7 +916,11 @@ impl Shadow {
         {
             return Ok(ResumeOutcome::PausedForeign);
         }
-        self.probe_one("SELECT pg_wal_replay_resume()")?;
+        if let Err(e) = self.probe_one("SELECT pg_wal_replay_resume()")
+            && !killed_by_shutdown(&e)
+        {
+            return Err(e);
+        }
         Ok(ResumeOutcome::ResumedForFloor)
     }
 
@@ -910,13 +990,7 @@ impl Shadow {
             .args(args)
             .envs(env.iter().copied())
             .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ShadowError::MissingBinary(cmd.into())
-                } else {
-                    ShadowError::Io(e)
-                }
-            })?;
+            .map_err(|e| spawn_failed(cmd, e))?;
         self.check(cmd, out)
     }
 
@@ -929,6 +1003,15 @@ impl Shadow {
             status: out.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+}
+
+/// Missing binary names the command, any other spawn failure stays io
+fn spawn_failed(cmd: &str, e: std::io::Error) -> ShadowError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        ShadowError::MissingBinary(cmd.into())
+    } else {
+        ShadowError::Io(e)
     }
 }
 
@@ -1022,6 +1105,18 @@ mod tests {
     fn parse_controldata_floor_rejects_missing_key() {
         let err = parse_controldata_floor("max_connections setting: 100\n").unwrap_err();
         assert!(matches!(err, ShadowError::ControlDataParse(_)), "{err}");
+        let err = parse_controldata_floor("max_connections setting: many\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("max_connections setting: \"many\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_data_dir_puts_socket_under_tmp() {
+        let cfg = ShadowConfig::new("/".into(), "/filtered".into());
+        assert_eq!(cfg.socket_dir, Path::new("/tmp/shadow_sock"));
     }
 
     #[test]
@@ -1232,6 +1327,8 @@ mod tests {
         assert!(!data_dir.join("postmaster.pid").exists());
         fs::write(data_dir.join("PG_VERSION"), b"17\n").unwrap();
         assert!(shadow.data_dir_initialized());
+        fs::create_dir(data_dir.join("postmaster.pid")).unwrap();
+        assert!(matches!(shadow.clear_stale_pid(), Err(ShadowError::Io(_))));
     }
 
     fn stub_bin(path: &Path, body: &str) {
@@ -1290,5 +1387,386 @@ mod tests {
         cfg.pg_bin_dir = Some(bin);
         let err = Shadow::new(cfg).try_pg_wal_replay_resume().unwrap_err();
         assert!(matches!(err, ShadowError::Process { .. }), "{err}");
+    }
+
+    /// Read probe responses from `answers/<key>`; reject databases with `no_db_<name>`
+    fn psql_stub(tmp: &Path) -> (ShadowConfig, PathBuf) {
+        let bin = tmp.join("bin");
+        let answers = bin.join("answers");
+        fs::create_dir_all(&answers).unwrap();
+        fs::create_dir_all(tmp.join("data")).unwrap();
+        stub_bin(
+            &bin.join("psql"),
+            r#"dir=$(dirname "$0")
+while [ $# -gt 0 ]; do
+  case "$1" in -d) db=$2; shift;; -c) sql=$2; shift;; esac
+  shift
+done
+[ -e "$dir/no_db_$db" ] && { echo "database \"$db\" does not exist" >&2; exit 2; }
+case "$sql" in
+  *pg_is_in_recovery*) key=recovery;;
+  *pg_last_wal_replay_lsn*) key=replay;;
+  *data_directory*) key=data_directory;;
+  *restore_command*) key=restore_command;;
+  *socket_path*) key=socket_path;;
+  *bridge_workers*) key=bridge_workers;;
+  *"count(*)"*) key=count;;
+  *current_setting*) key=settings;;
+  *pause_state*) key=pause;;
+  *) key=other;;
+esac
+printf '%s\n' "$db" >> "$dir/dbs"
+printf '%s\n' "$key" >> "$dir/keys"
+[ -e "$dir/fail_$key" ] && { cat "$dir/fail_$key" >&2; exit 2; }
+cat "$dir/answers/$key""#,
+        );
+        let mut cfg = ShadowConfig::new(tmp.join("data"), tmp.join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        cfg.dbname = "app".into();
+        cfg.wait_poll = Duration::from_millis(1);
+        (cfg, answers)
+    }
+
+    fn answer(answers: &Path, key: &str, value: &str) {
+        fs::write(answers.join(key), format!("{value}\n")).unwrap();
+    }
+
+    #[test]
+    fn validate_running_names_each_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut cfg, answers) = psql_stub(tmp.path());
+        let mut bridge = BridgeConf::in_dir(&cfg.socket_dir);
+        bridge.workers = 2;
+        cfg.bridge = Some(bridge.clone());
+        let shadow = Shadow::new(cfg.clone());
+        let incompatible = |want: &str| {
+            assert_eq!(
+                shadow.validate_running().unwrap_err().to_string(),
+                ShadowError::Incompatible(want.into()).to_string()
+            );
+        };
+
+        answer(&answers, "recovery", "f");
+        assert!(matches!(
+            shadow.validate_running(),
+            Err(ShadowError::NotInRecovery)
+        ));
+        answer(&answers, "recovery", "t");
+        answer(&answers, "data_directory", tmp.path().to_str().unwrap());
+        incompatible("data_directory differs");
+        answer(&answers, "data_directory", cfg.data_str());
+        answer(&answers, "restore_command", "cp /elsewhere/%f %p");
+        incompatible("restore_command differs");
+        let restore = format!("cp {}/%f %p", cfg.filter_out_dir.display());
+        answer(&answers, "restore_command", &restore);
+        answer(&answers, "socket_path", "/elsewhere.sock");
+        incompatible("bridge socket differs");
+        answer(
+            &answers,
+            "socket_path",
+            bridge.socket_path.to_str().unwrap(),
+        );
+        answer(&answers, "bridge_workers", "1");
+        incompatible("bridge worker increase requires shadow restart");
+        answer(&answers, "bridge_workers", "2");
+        shadow.validate_running().unwrap();
+        // No bridge configured, so worker count goes unchecked
+        answer(&answers, "bridge_workers", "1");
+        cfg.bridge = None;
+        Shadow::new(cfg).validate_running().unwrap();
+    }
+
+    #[test]
+    fn probes_parse_and_fall_back_to_configured_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        fs::write(answers.parent().unwrap().join("no_db_postgres"), b"").unwrap();
+        let shadow = Shadow::new(cfg);
+
+        answer(&answers, "recovery", "maybe");
+        let err = shadow.is_in_recovery().unwrap_err();
+        assert!(err.to_string().contains("got \"maybe\""), "{err}");
+        let dbs = fs::read_to_string(answers.parent().unwrap().join("dbs")).unwrap();
+        assert_eq!(dbs, "app\n", "probe must use configured database");
+
+        answer(&answers, "replay", "not-an-lsn");
+        assert!(matches!(
+            shadow.last_replay_lsn(),
+            Err(ShadowError::PsqlParse(_))
+        ));
+
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "count", "many");
+        let err = shadow.health().unwrap_err();
+        assert!(err.to_string().contains("count(*) FROM pg_class"), "{err}");
+
+        answer(&answers, "pause", "paused");
+        let controldata = answers.parent().unwrap().join("pg_controldata");
+        stub_bin(
+            &controldata,
+            "echo 'max_connections setting: 500'\n\
+             echo 'max_worker_processes setting: 16'\n\
+             echo 'max_wal_senders setting: 12'\n\
+             echo 'max_prepared_xacts setting: 2'\n\
+             echo 'max_locks_per_xact setting: 128'",
+        );
+        for (row, want) in [
+            ("100|8", "missing max_wal_senders"),
+            ("100|8|x|0|64", "max_wal_senders \"x\""),
+        ] {
+            answer(&answers, "settings", row);
+            let err = shadow.try_pg_wal_replay_resume().unwrap_err();
+            assert!(err.to_string().contains(want), "{want}: {err}");
+        }
+
+        answer(&answers, "settings", "100|8|10|0|64");
+        let refused = answers.parent().unwrap().join("fail_other");
+        fs::write(
+            &refused,
+            "permission denied for function pg_wal_replay_resume",
+        )
+        .unwrap();
+        let err = shadow.try_pg_wal_replay_resume().unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "{err}");
+        fs::write(
+            &refused,
+            "WARNING:  terminating connection because of crash of another server process",
+        )
+        .unwrap();
+        assert_eq!(
+            shadow.try_pg_wal_replay_resume().unwrap(),
+            ResumeOutcome::ResumedForFloor
+        );
+    }
+
+    /// Stalled replay keeps waiting past each report, ends once it reaches target
+    #[test]
+    fn wait_for_replay_reporting_outlasts_stall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "pause", "not paused");
+        let keys = answers.with_file_name("keys");
+        let reports = move || {
+            fs::read_to_string(&keys).map_or(0, |s| s.lines().filter(|k| *k == "pause").count())
+        };
+        let catch_up = std::thread::spawn(move || {
+            while reports() < 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer(&answers, "replay", "0/11");
+        });
+        let reached = shadow.wait_for_replay_reporting(
+            0x11,
+            Duration::from_millis(5),
+            &CancellationToken::new(),
+        );
+        catch_up.join().unwrap();
+        assert_eq!(reached.unwrap(), 0x11);
+        // Cancel lands between polls, not at next report
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            shadow.wait_for_replay_reporting(0x12, Duration::from_secs(60), &cancel),
+            Err(ShadowError::Cancelled)
+        ));
+    }
+
+    /// Foreign pause holds, floor pause restarts shadow and replay resumes
+    #[test]
+    fn wait_for_replay_reporting_restarts_on_floor_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let bin = answers.parent().unwrap().to_path_buf();
+        // Floor matches running settings once, then replay raises it
+        stub_bin(
+            &bin.join("pg_controldata"),
+            "dir=$(dirname \"$0\")\n\
+             echo >> \"$dir/controldata_calls\"\n\
+             n=100; [ \"$(wc -l < \"$dir/controldata_calls\")\" -gt 1 ] && n=200\n\
+             echo \"max_connections setting: $n\"\n\
+             echo 'max_worker_processes setting: 8'\n\
+             echo 'max_wal_senders setting: 10'\n\
+             echo 'max_prepared_xacts setting: 0'\n\
+             echo 'max_locks_per_xact setting: 64'",
+        );
+        // Report running once per `running` marker, start lets replay reach 0/11
+        stub_bin(
+            &bin.join("pg_ctl"),
+            "dir=$(dirname \"$0\")\n\
+             case \"$*\" in\n\
+               *status) rm \"$dir/running\" 2>/dev/null || exit 3;;\n\
+               *start) echo 0/11 > \"$dir/answers/replay\";;\n\
+             esac",
+        );
+        fs::write(bin.join("running"), b"").unwrap();
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        answer(&answers, "pause", "paused");
+        answer(&answers, "settings", "100|8|10|0|64");
+        answer(&answers, "other", "");
+        let reached =
+            shadow.wait_for_replay_reporting(0x11, Duration::ZERO, &CancellationToken::new());
+        assert_eq!(reached.unwrap(), 0x11);
+        let keys = fs::read_to_string(bin.join("keys")).unwrap();
+        assert_eq!(keys.matches("pause").count(), 2, "{keys}");
+        assert!(!bin.join("running").exists());
+        // Cancel also ends wait for floor-paused postmaster to exit
+        fs::write(bin.join("running"), b"").unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            shadow.wait_for_replay_reporting(0x12, Duration::ZERO, &cancel),
+            Err(ShadowError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn wait_for_replay_stops_on_promotion_or_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, answers) = psql_stub(tmp.path());
+        let shadow = Shadow::new(cfg);
+        answer(&answers, "recovery", "t");
+        answer(&answers, "replay", "0/10");
+        assert_eq!(shadow.wait_for_replay(0x10, Duration::ZERO).unwrap(), 0x10);
+        let err = shadow
+            .wait_for_replay(0x11, Duration::from_millis(5))
+            .unwrap_err()
+            .to_string();
+        let want = "timeout waiting for pg_last_wal_replay_lsn >= 0x11 after";
+        assert!(err.starts_with(want), "{err}");
+        // Replay reaches target only once a poll has slept
+        let dbs = answers.with_file_name("dbs");
+        let probes = move || fs::read_to_string(&dbs).unwrap().lines().count();
+        let polled = probes() + 3;
+        let catch_up = std::thread::spawn(move || {
+            while probes() < polled {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer(&answers, "replay", "0/11");
+            answers
+        });
+        let reached = shadow.wait_for_replay(0x11, Duration::from_secs(10));
+        let answers = catch_up.join().unwrap();
+        assert_eq!(reached.unwrap(), 0x11);
+        answer(&answers, "recovery", "f");
+        assert!(matches!(
+            shadow.wait_for_replay(0x11, Duration::ZERO),
+            Err(ShadowError::NotInRecovery)
+        ));
+    }
+
+    /// WAL replay can raise recovery GUC minimums in `pg_control`
+    #[test]
+    fn floor_retry_restarts_until_floor_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(bin.join("max_connections"), "100\n").unwrap();
+        stub_bin(
+            &bin.join("pg_controldata"),
+            "dir=$(dirname \"$0\")\n\
+             echo \"max_connections setting: $(cat \"$dir/max_connections\")\"\n\
+             echo 'max_worker_processes setting: 8'\n\
+             echo 'max_wal_senders setting: 10'\n\
+             echo 'max_prepared_xacts setting: 0'\n\
+             echo 'max_locks_per_xact setting: 64'",
+        );
+        stub_bin(
+            &bin.join("pg_ctl"),
+            "dir=$(dirname \"$0\")\n\
+             echo >> \"$dir/starts\"\n\
+             n=$(wc -l < \"$dir/starts\")\n\
+             echo \"attempt $n\" >> \"$4\"\n\
+             echo 200 > \"$dir/max_connections\"\n\
+             echo 'pg_ctl: could not start server' >&2\n\
+             exit 1",
+        );
+        // Exclude old output from startup log tail
+        fs::write(data.join("startup.log"), format!("{}\n", "x".repeat(5000))).unwrap();
+        fs::write(data.join("postmaster.pid"), b"1\n").unwrap();
+        let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin.clone());
+        let shadow = Shadow::new(cfg);
+
+        let err = shadow.start_with_floor_retry(None).unwrap_err().to_string();
+        let stderr = err.strip_prefix("pg_ctl failed (exit 1): ").unwrap();
+        let (head, tail) = stderr.split_once("\nstartup.log tail:\n").unwrap();
+        assert_eq!(head, "pg_ctl: could not start server\n");
+        assert!(tail.ends_with("attempt 1\nattempt 2\n"), "{tail}");
+        assert_eq!(tail.len(), 4096);
+        assert_eq!(fs::read_to_string(bin.join("starts")).unwrap(), "\n\n");
+        assert!(!data.join("postmaster.pid").exists());
+        let conf = fs::read_to_string(data.join("postgresql.conf")).unwrap();
+        assert!(conf.contains("max_connections = 200"), "{conf}");
+    }
+
+    /// Running postmaster without a pidfile has exited, unreadable one fails
+    #[test]
+    fn wait_started_reads_pidfile_absence_and_faults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        stub_bin(&bin.join("pg_ctl"), "exit 0");
+        let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        assert!(!shadow.wait_started().unwrap());
+        fs::create_dir(data.join("postmaster.pid")).unwrap();
+        let err = shadow.wait_started().unwrap_err();
+        assert!(
+            matches!(&err, ShadowError::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+            "{err}"
+        );
+    }
+
+    /// Binary present but not executable is an io fault, not a missing one
+    #[test]
+    fn unexecutable_binaries_surface_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["pg_controldata", "pg_ctl"] {
+            fs::write(bin.join(name), "").unwrap();
+        }
+        let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        let denied = |r: Result<()>| {
+            let err = r.unwrap_err();
+            assert!(
+                matches!(&err, ShadowError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+                "{err}"
+            );
+        };
+        denied(shadow.control_guc_floor().map(drop));
+        denied(shadow.stop());
+    }
+
+    #[test]
+    fn missing_binaries_name_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
+        cfg.pg_bin_dir = Some(bin);
+        let shadow = Shadow::new(cfg);
+        let missing = |r: Result<()>, want: &str| {
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                ShadowError::MissingBinary(want.into()).to_string()
+            );
+        };
+        missing(shadow.control_guc_floor().map(drop), "pg_controldata");
+        missing(shadow.stop(), "pg_ctl");
+        assert_eq!(log_tail(&tmp.path().join("absent.log")), "<unreadable>");
     }
 }

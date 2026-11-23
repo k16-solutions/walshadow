@@ -4,6 +4,7 @@
 //! before resolving deferred values, which may read past `start_lsn`. Wait for
 //! synthetic sequences to become durable before advancing resume LSN to backup end
 
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,7 +30,7 @@ use crate::toast::{
     finish_value, pointer_extsize,
 };
 use crate::xact::xact_buffer::{MissPolicy, StoreMiss, fill_store_miss};
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// Window replay coverage for deferred TOAST reads. Row versions and sequence
 /// positions remain at `start_lsn`
@@ -206,7 +207,11 @@ pub async fn drain(
     let mut puts = resolver.chunk_puts();
     let mut row_buffer = RowBuffer::default();
     let mut consumed = 0u64;
-    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
+    let mut ticker = Ticker::new(
+        barrier
+            .as_ref()
+            .map_or(WALK_CHECKPOINT_PERIOD, |b| b.period()),
+    );
     while let Some(batch) = rx.recv().await {
         consumed += batch.len() as u64;
         for mut tuple in batch {
@@ -242,7 +247,6 @@ pub async fn drain(
                 }
             };
 
-            let mut permit = None;
             if tuple.has_mapped_external(&route.mapping) {
                 // Defer until page walk has populated or started backing store
                 if !resolver.fill_on_miss() {
@@ -256,16 +260,14 @@ pub async fn drain(
                     footprint.publish(spool);
                     continue;
                 }
-                permit = resolve_or_fill_toast(&mut tuple, rel, &route.mapping, &resolver)
-                    .await?
-                    .map(Arc::new);
+                fill_toast(&mut tuple, &route.mapping, &resolver)?;
             }
             if !neutral_values {
                 render_ext_columns(&rel.attributes, &mut tuple.columns);
             }
             let committed = tuple.into_committed_insert();
             row_buffer
-                .push(&msg_tx, run.seq.seq(), (rel, route), committed, permit)
+                .push(&msg_tx, run.seq.seq(), (rel, route), committed, None)
                 .await
                 .map_err(closed)?;
             run.rows += 1;
@@ -820,21 +822,26 @@ fn unreadable(fetched: &[Option<FetchedValue>]) -> bool {
 
 /// A batch's values, with how many referrers each one still owes
 struct FetchedValues {
-    /// `None` without store: nothing to consult, every referrer fills
-    values: Option<HashMap<ValueKey, FetchedValue>>,
-    uses: HashMap<ValueKey, u32>,
+    values: HashMap<ValueKey, FetchedEntry>,
+}
+
+#[derive(Default)]
+struct FetchedEntry {
+    remaining: u32,
+    value: Option<FetchedValue>,
 }
 
 impl FetchedValues {
     /// Last referrer of a value takes its bytes, earlier ones copy
     fn take(&mut self, key: ValueKey) -> Option<FetchedValue> {
-        let left = self.uses.get_mut(&key)?;
-        *left -= 1;
-        let values = self.values.as_mut()?;
-        if *left == 0 {
-            values.remove(&key)
+        let Entry::Occupied(mut entry) = self.values.entry(key) else {
+            return None;
+        };
+        entry.get_mut().remaining -= 1;
+        if entry.get().remaining == 0 {
+            entry.remove().value
         } else {
-            values.get(&key).cloned()
+            entry.get().value.clone()
         }
     }
 
@@ -860,14 +867,14 @@ async fn fetch_values_at<'a>(
     rows: impl Iterator<Item = (&'a ReplayRow, u64)>,
     resolver: &ToastResolver,
 ) -> Result<FetchedValues, String> {
-    let mut uses: HashMap<ValueKey, u32> = HashMap::new();
+    let mut values: HashMap<ValueKey, FetchedEntry> = HashMap::new();
     let mut wanted: HashMap<(u32, u32, u64), Vec<(u32, usize)>> = HashMap::new();
     for (row, bound) in rows {
         for site in &row.pointers {
             let key = value_key(row, site, bound);
-            let seen = uses.entry(key).or_default();
-            *seen += 1;
-            if *seen == 1 {
+            let entry = values.entry(key).or_default();
+            entry.remaining += 1;
+            if entry.remaining == 1 {
                 wanted
                     .entry((key.0, key.1, bound))
                     .or_default()
@@ -875,23 +882,24 @@ async fn fetch_values_at<'a>(
             }
         }
     }
-    let mut values = HashMap::with_capacity(uses.len());
     for ((db_oid, toast_relid, bound), batch) in wanted {
         let Some(got) = resolver
             .fetch_values(db_oid, toast_relid, &batch, bound)
             .await
             .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?
         else {
-            return Ok(FetchedValues { values: None, uses });
+            return Ok(FetchedValues {
+                values: HashMap::new(),
+            });
         };
         for ((value_id, _), value) in batch.iter().zip(got) {
-            values.insert((db_oid, toast_relid, *value_id, bound), value);
+            values
+                .get_mut(&(db_oid, toast_relid, *value_id, bound))
+                .expect("counted in fetch_values_at")
+                .value = Some(value);
         }
     }
-    Ok(FetchedValues {
-        values: Some(values),
-        uses,
-    })
+    Ok(FetchedValues { values })
 }
 
 /// Turn one fetch outcome into the column its row routes, counting fills.
@@ -922,49 +930,26 @@ fn apply_fetched(
     Ok((column, 0))
 }
 
-/// Resolve mapped TOAST pointers or fill in disabled mode. Value cap
-/// checked before any fetch; the returned leaf permit is shrunk to the
-/// retained decoded bytes and rides the routed row to insert ack
-pub(crate) async fn resolve_or_fill_toast(
+/// No store to consult: NULL-fill mapped TOAST pointers after the value
+/// cap check, counting each fill
+fn fill_toast(
     tuple: &mut BackfillTuple,
-    rel: &RelDescriptor,
     mapping: &TableMapping,
     resolver: &ToastResolver,
-) -> Result<Option<crate::budget::MemoryPermit>, String> {
+) -> Result<(), String> {
     let mut sites = mapped_pointers(tuple, mapping);
-    if sites.is_empty() {
-        return Ok(None);
-    }
-    let need = check_value_caps(
+    check_value_caps(
         sites.iter().map(|site| site.p),
         resolver.inline_value_max(),
         resolver.overflow(),
     )
     .map_err(|e| format!("bootstrap: {e}"))?;
     fill_oversize(tuple, &mut sites, resolver);
-    let mut leaf = crate::budget::acquire_opt(resolver.budget(), need).await;
-    let mut retained = 0usize;
     for site in &sites {
-        let type_oid = rel.attributes.get(site.idx).map_or(0, |a| a.type_oid);
-        let fetched = resolver
-            .fetch_value(
-                tuple.rfn.db_node,
-                site.p.va_toastrelid,
-                site.p.va_valueid,
-                tuple.source_lsn,
-                pointer_extsize(&site.p),
-            )
-            .await
-            .map_err(|e| format!("bootstrap: toast store fetch: {e}"))?;
-        let target = &mapping.columns[site.col].target_name;
-        let (column, bytes) = apply_fetched(fetched, &site.p, type_oid, rel, target, resolver)?;
-        retained += bytes;
-        tuple.columns[site.idx] = Some(column);
+        resolver.note_filled_default();
+        tuple.columns[site.idx] = Some(ColumnValue::Null);
     }
-    if let Some(p) = leaf.as_mut() {
-        p.shrink(retained as u64);
-    }
-    Ok(leaf)
+    Ok(())
 }
 
 fn put_err(e: ChunkStoreError) -> String {
@@ -1060,27 +1045,28 @@ mod tests {
     use super::*;
     use crate::emit::pipeline::batcher::RoutedRow;
 
+    /// End-of-backup store, refuses puts
+    struct ReadOnly;
+
+    #[async_trait::async_trait]
+    impl crate::toast::ChunkStore for ReadOnly {
+        async fn fetch_many(
+            &self,
+            _: u32,
+            _: u32,
+            values: &[(u32, usize)],
+            _: u64,
+        ) -> Result<Vec<FetchedValue>, crate::toast::ChunkStoreError> {
+            // Incomplete value is absent from end-of-backup state
+            Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
+        }
+    }
+
     /// Distinguish missing data in walk-seeded store from superseded value in
     /// read-only end-of-backup store
     #[tokio::test(flavor = "current_thread")]
     async fn a_miss_is_fatal_for_a_seeded_mirror_and_superseded_for_a_read_only_store() {
-        use crate::toast::{ChunkStore, ChunkStoreError, MemChunkStore};
-
-        struct ReadOnly;
-
-        #[async_trait::async_trait]
-        impl ChunkStore for ReadOnly {
-            async fn fetch_many(
-                &self,
-                _: u32,
-                _: u32,
-                values: &[(u32, usize)],
-                _: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                // Incomplete value is absent from end-of-backup state
-                Ok(vec![FetchedValue::Mismatch { got: 7984 }; values.len()])
-            }
-        }
+        use crate::toast::MemChunkStore;
 
         let ptr = crate::decode::heap_decoder::ToastPointer {
             va_rawsize: 9104,
@@ -1149,7 +1135,7 @@ mod tests {
     use crate::emit::pipeline::{Fatal, ack};
     use crate::schema::{RelAttr, RelDescriptor, RelName, ReplIdent};
     use crate::toast::{GatedStore, MemChunkStore};
-    use ahash::{HashMap, HashMapExt, HashSetExt};
+    use foldhash::{HashMap, HashMapExt, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     fn rel(rel_node: u32) -> Arc<RelDescriptor> {
@@ -1479,6 +1465,134 @@ mod tests {
         collector.await.unwrap();
     }
 
+    async fn drain_plain(
+        tuples: Vec<BackfillTuple>,
+        skip_initial: HashSet<RelName>,
+        batcher_open: bool,
+    ) -> (Result<BootstrapDrainOutcome, String>, Vec<RoutedRow>) {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(rel(16400));
+        catalog.insert(toast_rel(16500));
+        let tables = [(RelName::new("public", "t16400"), mapping_for(16400))];
+        let mapping = Arc::new(tables.into_iter().collect());
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx.send(tuples).await.unwrap();
+        drop(tup_tx);
+        if !batcher_open {
+            msg_rx.close();
+        }
+        let outcome = drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            Arc::default(),
+            ToastResolver::disabled(),
+            Deferral::Local(mem_spool()),
+            skip_initial,
+            false,
+            None,
+        )
+        .await;
+        let rows = collect_rows(&mut msg_rx).await;
+        drop(ack);
+        collector.await.unwrap();
+        (outcome, rows)
+    }
+
+    /// Caller-loaded relations and malformed chunk rows route nothing
+    #[tokio::test]
+    async fn skipped_relations_and_malformed_chunks_route_nothing() {
+        let skip = [RelName::new("public", "t16400")].into_iter().collect();
+        let tuples = vec![tuple(16400, 1), tuple(16500, 2)];
+        let (outcome, rows) = drain_plain(tuples, skip, true).await;
+        assert_eq!(outcome.unwrap().rows_routed, 0);
+        assert!(rows.is_empty());
+    }
+
+    /// Store-less fill still enforces the value cap
+    #[tokio::test]
+    async fn oversize_value_fails_storeless_drain() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let tables = [(RelName::new("public", "t16400"), bytea_mapping_for(16400))];
+        let mapping = Arc::new(tables.into_iter().collect());
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, _msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+        let outcome = drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            Arc::default(),
+            ToastResolver::disabled()
+                .with_inline_value_max(1)
+                .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Error),
+            Deferral::Rejected,
+            HashSet::new(),
+            false,
+            None,
+        )
+        .await;
+        let e = outcome.expect_err("oversize value fails drain");
+        assert!(e.starts_with("bootstrap: "), "{e}");
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// A chunk store refusing writes fails the walk at the put
+    #[tokio::test]
+    async fn refused_chunk_put_fails_the_drain() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(toast_rel(16500));
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, _msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx
+            .send(vec![toast_chunk_tuple(16500, 1, 0, b"a")])
+            .await
+            .unwrap();
+        drop(tup_tx);
+        let stats = Arc::new(EmitterStats::default());
+        let resolver =
+            ToastResolver::with_store(Arc::new(ReadOnly), stats.clone()).with_put_batch_rows(1);
+        let outcome = drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&Arc::new(HashMap::new()), None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            stats,
+            resolver,
+            Deferral::Local(mem_spool()),
+            HashSet::new(),
+            false,
+            None,
+        )
+        .await;
+        let e = outcome.expect_err("refused put fails drain");
+        assert!(e.starts_with("bootstrap: toast store put: "), "{e}");
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_batcher_fails_the_drain() {
+        let (outcome, _) = drain_plain(vec![tuple(16400, 1)], HashSet::new(), false).await;
+        let e = outcome.expect_err("closed batcher fails drain");
+        assert!(e.starts_with("bootstrap: "), "{e}");
+    }
+
     /// Disabled resolver: a mapped externally-TOASTed column has no store to
     /// consult, so it NULL-fills inline, routes the row, and counts the fill.
     #[tokio::test]
@@ -1707,10 +1821,7 @@ mod tests {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), msg_rx.recv())
             .await
             .expect("heap rows stuck behind gated put");
-        let Some(BatcherMsg::Rows(chunk)) = msg else {
-            panic!("expected heap rows");
-        };
-        assert_eq!(chunk.rows.len(), 2);
+        assert!(matches!(&msg, Some(BatcherMsg::Rows(c)) if c.rows.len() == 2));
         assert_eq!(store.permits.available_permits(), 0, "no put landed yet");
 
         store.permits.add_permits(2);
@@ -2199,6 +2310,59 @@ mod tests {
         collector.await.unwrap();
     }
 
+    async fn replay_one(
+        mapping: HashMap<RelName, Arc<TableMapping>>,
+        resolver: ToastResolver,
+    ) -> (Result<BootstrapDrainOutcome, String>, u64) {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let mut spool = mem_spool();
+        spool
+            .push(bytea_toast_tuple(16400, 16500, 1))
+            .await
+            .unwrap();
+        let stats = EmitterStats::default();
+        let routes = freeze_routes(&Arc::new(mapping), None, &RowPolicy::default());
+        let outcome = resolve_spooled(
+            spool.into(),
+            &routes,
+            &catalog,
+            &msg_tx,
+            &ack,
+            &stats,
+            &resolver,
+            0,
+            false,
+            None,
+            None,
+        )
+        .await;
+        drop(msg_tx);
+        assert!(collect_rows(&mut msg_rx).await.is_empty());
+        drop(ack);
+        collector.await.unwrap();
+        (outcome, stats.unsupported_relations.load(Ordering::Relaxed))
+    }
+
+    /// Replay drops referrers whose relation lost its route, and checks
+    /// value caps before any fetch
+    #[tokio::test]
+    async fn deferred_replay_skips_unrouted_and_rejects_oversize() {
+        let (outcome, unsupported) = replay_one(HashMap::new(), ToastResolver::disabled()).await;
+        assert_eq!(outcome.unwrap().rows_routed, 0);
+        assert_eq!(unsupported, 1);
+        let tables = [(RelName::new("public", "t16400"), bytea_mapping_for(16400))];
+        let store = Arc::new(MemChunkStore::new());
+        let resolver = ToastResolver::with_store(store, Arc::default())
+            .with_inline_value_max(1)
+            .with_overflow(crate::emit::ch_emitter::InlineValueOverflow::Error);
+        let (outcome, _) = replay_one(tables.into_iter().collect(), resolver).await;
+        let e = outcome.expect_err("oversize value fails replay");
+        assert!(e.starts_with("bootstrap: "), "{e}");
+    }
+
     /// Replay order survives the batch boundary: batch N+1 resolves while
     /// batch N routes, so a late batch must not overtake an early one
     #[tokio::test]
@@ -2301,13 +2465,14 @@ mod tests {
             .collect();
         tup_tx.send(chunks).await.unwrap();
         let referrers = (0..rows)
-            .map(|i| {
-                let mut t = bytea_toast_tuple(16400, 16500, i + 1);
-                if let Some(ColumnValue::ExternalToast(p)) = &mut t.columns[0] {
-                    p.va_rawsize = VALUE as i32 + 4;
-                    p.va_extinfo = VALUE as u32;
-                }
-                t
+            .map(|i| BackfillTuple {
+                columns: vec![Some(ColumnValue::ExternalToast(ToastPointer {
+                    va_rawsize: VALUE as i32 + 4,
+                    va_extinfo: VALUE as u32,
+                    va_valueid: i + 1,
+                    va_toastrelid: 16500,
+                }))],
+                ..bytea_toast_tuple(16400, 16500, i + 1)
             })
             .collect();
         tup_tx.send(referrers).await.unwrap();
@@ -2630,4 +2795,290 @@ mod tests {
         drop(ack);
         collector.await.unwrap();
     }
+
+    /// Spool whose file sits below a regular file, so creating it fails
+    fn unwritable_spool(dir: &tempfile::TempDir, mem_max: usize) -> DeferredSpool {
+        std::fs::write(dir.path().join("file"), b"").unwrap();
+        DeferredSpool::new(dir.path().join("file/spool.bin"), mem_max)
+    }
+
+    async fn drain_referrer(
+        deferral: Deferral,
+        barrier: Option<Arc<WalkBarrier>>,
+    ) -> Result<BootstrapDrainOutcome, String> {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let mapping = Arc::new(HashMap::from_iter([(
+            RelName::new("public", "t16400"),
+            bytea_mapping_for(16400),
+        )]));
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, _msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx
+            .send(vec![bytea_toast_tuple(16400, 16500, 1)])
+            .await
+            .unwrap();
+        drop(tup_tx);
+        let stats = Arc::new(EmitterStats::default());
+        let outcome = drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            stats.clone(),
+            ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats),
+            deferral,
+            HashSet::new(),
+            false,
+            barrier,
+        )
+        .await;
+        drop(ack);
+        collector.await.unwrap();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn unwritable_deferred_spool_fails_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = drain_referrer(Deferral::Local(unwritable_spool(&dir, 0)), None)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("bootstrap: deferred spool: "), "{err}");
+
+        let barrier = Arc::new(WalkBarrier::new(std::time::Duration::ZERO));
+        let spool = unwritable_spool(&dir, DEFERRED_SPOOL_MEM_MAX);
+        let err = drain_referrer(Deferral::Local(spool), Some(barrier))
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("bootstrap: deferred spool checkpoint: "),
+            "{err}"
+        );
+    }
+
+    /// Checkpoint behind an empty end-of-file slab has no open run to place
+    #[tokio::test]
+    async fn checkpoint_without_spool_or_open_run_keeps_seqs() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(rel(16400));
+        let mapping = Arc::new(HashMap::from_iter([(
+            RelName::new("public", "t16400"),
+            mapping_for(16400),
+        )]));
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let (tup_tx, tup_rx) = mpsc::channel::<Vec<BackfillTuple>>(64);
+        tup_tx.send(vec![tuple(16400, 1)]).await.unwrap();
+        tup_tx.send(Vec::new()).await.unwrap();
+        drop(tup_tx);
+        let outcome = drain(
+            tup_rx,
+            catalog,
+            freeze_routes(&mapping, None, &RowPolicy::default()),
+            msg_tx,
+            ack.clone(),
+            Arc::default(),
+            ToastResolver::disabled(),
+            Deferral::Rejected,
+            HashSet::new(),
+            false,
+            Some(Arc::new(WalkBarrier::new(std::time::Duration::ZERO))),
+        )
+        .await
+        .unwrap();
+        assert_eq!((outcome.next_seq, outcome.rows_routed), (1, 1));
+        assert_eq!(collect_rows(&mut msg_rx).await.len(), 1);
+        drop(ack);
+        collector.await.unwrap();
+    }
+
+    /// Checkpointed replay of a batch whose every row window replay covers
+    /// advances the saved offset without a seq to place
+    #[tokio::test]
+    async fn checkpointed_replay_of_covered_rows_places_no_seq() {
+        use crate::backfill::backup_checkpoint::BackupCheckpoint;
+        use crate::emit::ch_emitter::EmitterConfig;
+        use crate::emit::pipeline::tail::OwnedTail;
+        use crate::runtime_config::InitialLoadMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let referrer = bytea_toast_tuple(16400, 16500, 1);
+        let coverage = WindowCoverage {
+            page_bound: false,
+            replaced: [(referrer.rfn, referrer.blkno, referrer.offnum)]
+                .into_iter()
+                .collect(),
+        };
+        let mut spool = DeferredSpool::new(dir.path().join("spool.bin"), 0);
+        spool.push(referrer).await.unwrap();
+        spool.checkpoint().await.unwrap();
+        let total = spool.spooled_bytes();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        catalog.insert(toast_rel(16500));
+        let mapping = Arc::new(HashMap::from_iter([(
+            RelName::new("public", "t16400"),
+            bytea_mapping_for(16400),
+        )]));
+        let stats = Arc::new(EmitterStats::default());
+        stats
+            .bootstrap_deferred_spool_bytes
+            .store(total, Ordering::Relaxed);
+        // Mirror exists but lost value 1
+        let resolver = ToastResolver::with_store(Arc::new(MemChunkStore::new()), stats.clone());
+        let other = row_from_columns(toast_chunk_tuple(16500, 9, 0, b"x"), 5, 16500).unwrap();
+        resolver.put(&[other]).await.unwrap();
+        let mut state = BackupCheckpoint::new(
+            InitialLoadMode::ObjectStore,
+            &[],
+            &Arc::default(),
+            &EmitterConfig::default(),
+            None,
+        );
+        let tail = OwnedTail::null();
+        let outcome = drain_deferred(
+            spool.into(),
+            &catalog,
+            &mapping,
+            &tail.msg_tx,
+            &tail.ack,
+            &stats,
+            &resolver,
+            &RowPolicy::default(),
+            None,
+            0,
+            false,
+            Some(ReplayCheckpoint {
+                state: &mut state,
+                dir: dir.path(),
+                tail: &tail,
+            }),
+            Some(&coverage),
+        )
+        .await
+        .unwrap();
+        assert_eq!((outcome.next_seq, outcome.rows_routed), (0, 0));
+        assert_eq!((state.offset, state.rows), (total, 0));
+        assert_eq!(
+            stats.bootstrap_replay_covered_rows.load(Ordering::Relaxed),
+            1
+        );
+        tail.finish(0).await.unwrap();
+    }
+
+    /// File-backed spool of one unmapped referrer
+    async fn file_spool(dir: &tempfile::TempDir) -> DeferredSpool {
+        let mut spool = DeferredSpool::new(dir.path().join("spool.bin"), 0);
+        spool
+            .push(bytea_toast_tuple(16400, 16500, 1))
+            .await
+            .unwrap();
+        spool.checkpoint().await.unwrap();
+        spool
+    }
+
+    async fn replay_spool(
+        spool: DeferredSpool,
+        catalog: &CatalogMap,
+        resolver: &ToastResolver,
+    ) -> (Result<BootstrapDrainOutcome, String>, Vec<RoutedRow>) {
+        let mapping = Arc::new(HashMap::from_iter([(
+            RelName::new("public", "t16400"),
+            bytea_mapping_for(16400),
+        )]));
+        let (ack, collector) = ack::spawn(Arc::default(), Fatal::new());
+        let (msg_tx, mut msg_rx) = mpsc::channel::<BatcherMsg>(64);
+        let outcome = drain_deferred(
+            spool.into(),
+            catalog,
+            &mapping,
+            &msg_tx,
+            &ack,
+            &EmitterStats::default(),
+            resolver,
+            &RowPolicy::default(),
+            None,
+            0,
+            false,
+            None,
+            None,
+        )
+        .await;
+        drop(msg_tx);
+        let rows = collect_rows(&mut msg_rx).await;
+        drop(ack);
+        collector.await.unwrap();
+        (outcome, rows)
+    }
+
+    #[tokio::test]
+    async fn deferred_replay_reports_spool_faults() {
+        let catalog = CatalogMap::new();
+        let resolver = ToastResolver::disabled();
+
+        let dir = tempfile::tempdir().unwrap();
+        let spool = file_spool(&dir).await;
+        std::fs::remove_file(spool.path()).unwrap();
+        let err = replay_spool(spool, &catalog, &resolver)
+            .await
+            .0
+            .unwrap_err();
+        assert!(err.starts_with("bootstrap: deferred spool seal: "), "{err}");
+
+        let spool = file_spool(&dir).await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(spool.path())
+            .unwrap()
+            .set_len(6)
+            .unwrap();
+        let err = replay_spool(spool, &catalog, &resolver)
+            .await
+            .0
+            .unwrap_err();
+        assert!(
+            err.starts_with("bootstrap: deferred spool replay: "),
+            "{err}"
+        );
+
+        // Directory without write permission keeps replayed file in place
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::remove_file(dir.path().join("spool.bin")).unwrap();
+        let spool = file_spool(&dir).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (outcome, _) = replay_spool(spool, &catalog, &resolver).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = outcome.unwrap_err();
+        assert!(
+            err.starts_with("bootstrap: deferred spool cleanup: "),
+            "{err}"
+        );
+        assert!(dir.path().join("spool.bin").exists());
+    }
+
+    /// No store to consult: replayed referrer routes with its value filled
+    #[tokio::test]
+    async fn deferred_replay_without_store_fills_referrers() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(bytea_rel(16400));
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, rows) =
+            replay_spool(file_spool(&dir).await, &catalog, &ToastResolver::disabled()).await;
+        assert_eq!(outcome.unwrap().rows_routed, 1);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.committed.decoded.new.as_ref().unwrap().columns.clone())
+                .collect::<Vec<_>>(),
+            [vec![Some(ColumnValue::Null)]]
+        );
+        assert!(!dir.path().join("spool.bin").exists());
+    }
 }
+
+// k16 fork: per-tuple TOAST resolution lives in src/fork/ (see FORK.md)
+#[path = "../../fork/emit/pipeline/bootstrap.rs"]
+mod fork;
+pub(crate) use fork::resolve_or_fill_toast;

@@ -22,10 +22,7 @@ impl DeferredBackfills {
         self.starts.is_empty() && self.opt_outs.is_empty()
     }
 
-    pub async fn start(self, backfiller: Option<&Arc<dyn Backfiller>>) {
-        let Some(b) = backfiller else {
-            return;
-        };
+    pub async fn start(self, b: &Arc<dyn Backfiller>) {
         for rel in &self.opt_outs {
             b.note_opt_out(rel).await;
         }
