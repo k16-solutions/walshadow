@@ -21,6 +21,7 @@ Use remaining guides as needed:
 - [Planned source switchover](failover.md), controlled PostgreSQL primary moves
 - [Limitations](limitations.md), unsupported behavior and safeguards
 - [Development](development.md), builds, integration prerequisites, fixtures, and coverage
+- [Branching and releases](branching.md), merge rules, upstream syncs, release tags, and GitHub rules
 
 Read [architecture](../architecture/README.md) for system design and
 [plans](../plans/INDEX.md) for unfinished work
