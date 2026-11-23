@@ -1,0 +1,17 @@
+walshadow is running as {{ include "walshadow.fullname" . }}-0 in namespace {{ .Release.Namespace }}.
+
+Check progress:
+
+  kubectl -n {{ .Release.Namespace }} logs -f {{ include "walshadow.fullname" . }}-0
+  kubectl -n {{ .Release.Namespace }} exec {{ include "walshadow.fullname" . }}-0 -- walshadow-stream ctl status
+{{- if .Values.tenants }}
+  kubectl -n {{ .Release.Namespace }} exec {{ include "walshadow.fullname" . }}-0 -- walshadow-stream ctl tenant list
+{{- end }}
+
+Metrics: port {{ .Values.metrics.port }} on service {{ include "walshadow.fullname" . }}.
+
+All durable state is on the volume claim data-{{ include "walshadow.fullname" . }}-0. Deleting it
+forces a full BASE_BACKUP of the source and a full reload into every destination.
+
+Changes made with `ctl apply` or `ctl tenant` last only until the pod is
+recreated. Make lasting changes in the chart values.

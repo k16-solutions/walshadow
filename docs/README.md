@@ -18,6 +18,7 @@ Use remaining guides as needed:
   query patterns
 - [Schema changes](schema-changes.md), supported DDL behavior
 - [Operations](operations.md), monitoring, restarts, and WAL retention
+- [Helm chart](../charts/walshadow/README.md), running walshadow on Kubernetes
 - [Planned source switchover](failover.md), controlled PostgreSQL primary moves
 - [Limitations](limitations.md), unsupported behavior and safeguards
 - [Development](development.md), builds, integration prerequisites, fixtures, and coverage

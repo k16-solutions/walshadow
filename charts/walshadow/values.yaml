@@ -1,0 +1,215 @@
+# One release runs one walshadow daemon for one source PostgreSQL cluster:
+# one replication slot, one managed shadow, and every tenant of that cluster.
+# The StatefulSet always has exactly one replica. Two daemons must never share
+# a slot, a destination or a state directory.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Required. An image built from docker/Dockerfile.
+  repository: ""
+  # Required. The image's PostgreSQL major must equal the source's major: the
+  # shadow is a physical clone, and a base backup can't cross majors.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Required. The root config as TOML text, written to
+# /etc/walshadow/walshadow.toml and passed with --config. Same format as
+# config/snowflake.toml and docs/configuration.md. Keep credentials out of it:
+# reference files under /run/secrets/walshadow (see `secrets`), or pass the
+# source password through WALSHADOW_PG_URL (see `env`).
+#
+# This is TOML text rather than YAML because Helm turns every YAML number into
+# a float, and walshadow rejects `port = 5432.0`.
+config: ""
+
+# Tenant fragments, keyed by tenant id. Each value is TOML text holding that
+# tenant's [tenant.<id>] tables, written to
+# /etc/walshadow/walshadow.d/60-tenant-<id>.toml: the file `ctl tenant` manages.
+# The root config needs a [tenants] section for these to take effect.
+# See docs/tenants.md.
+tenants: {}
+  # acme: |
+  #   [tenant.acme]
+  #   dbname = "acme"
+  #   initial_load = "copy"
+  #   [tenant.acme.destination]
+  #   kind = "snowflake"
+  #   ...
+
+# Other config fragments, keyed by file name (must end in .toml), written to
+# /etc/walshadow/walshadow.d/. Fragments merge over the root config in lexical
+# order. `ctl` writes 50-api.toml; avoid that name and the 60-tenant- prefix.
+extraFragments: {}
+
+# Config fragments live on an emptyDir, so changes made at runtime with
+# `ctl apply` or `ctl tenant` last until the pod is recreated. Make lasting
+# changes here.
+
+daemon:
+  # off | direct | object_store. Empty defers to [bootstrap] mode in the
+  # config, then to direct. An initialized shadow resumes whatever this says.
+  bootstrapMode: ""
+  # Seconds between source status updates.
+  statusInterval: 5
+  # In-memory transaction buffer budget in bytes, shared across open
+  # transactions. Counts against the memory limit.
+  xactBufferMax: 1073741824
+  # Filtered-WAL retention in bytes. Empty keeps the binary's default; 0
+  # turns trimming off.
+  retentionBytes: ""
+  # Tokio worker threads. Empty uses one per CPU of the limit.
+  workerThreads: ""
+  # Extra walshadow-stream flags. A flag the chart already sets can't be
+  # repeated.
+  extraArgs: []
+
+# Extra environment variables, for example the source credentials:
+#   - name: WALSHADOW_PG_URL
+#     valueFrom:
+#       secretKeyRef: {name: walshadow-source, key: url}
+# A URL fills in what [source] in the config leaves unset, such as the
+# password.
+env: []
+envFrom: []
+
+secrets:
+  # Projected volume sources mounted read-only at /run/secrets/walshadow.
+  # Point Snowflake private_key_file / token_file here. Projected, never
+  # subPath, so rotated secret contents reach the pod. Example:
+  #   - secret:
+  #       name: walshadow-acme-snowflake
+  #       items:
+  #         - key: private-key
+  #           path: acme.p8
+  sources: []
+  # Group-readable by the postgres group (fsGroup), nobody else.
+  defaultMode: 0440
+
+persistence:
+  # One volume at /var/lib/walshadow holds the shadow data directory,
+  # filtered WAL, the spill directory and manifests, and the Snowflake state.
+  # They are only consistent as a set, so they share a volume and a snapshot.
+  # Put [snowflake.state] directory under /var/lib/walshadow/snowflake/.
+  #
+  # Fixed at install: Kubernetes won't change a StatefulSet's volume
+  # template, so changing anything here makes helm upgrade fail. To grow the
+  # volume, resize the claim itself (see the chart README, Storage).
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOncePod
+  size: 100Gi
+  annotations: {}
+  labels: {}
+  # Keep the volume when the StatefulSet is deleted or scaled down. Losing it
+  # forces a full BASE_BACKUP and reload, and in outbox mode loses rows already
+  # acknowledged to the source.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+# Scratch space at /tmp, including temporary Parquet files.
+tmp:
+  sizeLimit: 8Gi
+
+# Shared memory for the shadow PostgreSQL (dynamic_shared_memory_type posix).
+# Memory-backed, so it counts against the memory limit.
+shm:
+  sizeLimit: 1Gi
+
+# The shadow runs inside this container and shares its memory limit, so an
+# OOM kill takes both down. Keep requests equal to limits (Guaranteed QoS).
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    cpu: "2"
+    memory: 8Gi
+
+serviceAccount:
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+  # For IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+  annotations: {}
+
+# Nothing in the pod calls the Kubernetes API. IRSA and Pod Identity still
+# inject their own token.
+automountServiceAccountToken: false
+
+# Clean shutdown drains in-flight batches and stops the shadow. A second
+# signal exits without draining, so there's no preStop hook.
+terminationGracePeriodSeconds: 900
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# uid/gid 70 is the postgres user in the postgres:*-alpine image.
+podSecurityContext:
+  runAsUser: 70
+  runAsGroup: 70
+  fsGroup: 70
+  fsGroupChangePolicy: OnRootMismatch
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+initContainer:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# The metrics port binds before bootstrap starts and answers any path. There
+# is no health endpoint yet (DATA-452), so all probes are TCP. Liveness is
+# lenient so it never restarts a pod in the middle of a long bootstrap or
+# initial load.
+probes:
+  startup:
+    tcpSocket:
+      port: metrics
+    periodSeconds: 10
+    failureThreshold: 30
+  liveness:
+    tcpSocket:
+      port: metrics
+    periodSeconds: 60
+    timeoutSeconds: 10
+    failureThreshold: 10
+  # The pod serves no traffic; readiness is informational.
+  readiness:
+    tcpSocket:
+      port: metrics
+    periodSeconds: 30
+
+metrics:
+  port: 9484
+  service:
+    annotations: {}
+  podMonitor:
+    # Needs the Prometheus Operator CRDs.
+    enabled: false
+    # Add the labels your Prometheus selects PodMonitors by, eg release.
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
