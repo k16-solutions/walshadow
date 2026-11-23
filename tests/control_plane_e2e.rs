@@ -220,6 +220,7 @@ impl Harness {
             "1",
             "--metrics-bind",
             &metrics_addr.to_string(),
+            "--metrics-status",
             "--walsender-bind",
             &format!("127.0.0.1:{}", ports.walsender),
             "--retention-bytes",
@@ -496,6 +497,24 @@ impl Harness {
         }
     }
 
+    /// Poll a path on the metrics port until it answers `want`; returns the
+    /// body that did
+    async fn wait_http(&self, path: &str, want: u16, timeout: Duration) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = fx::http_request(self.metrics_addr, "GET", path);
+            if let Ok((status, body)) = &last
+                && *status == want
+            {
+                return Ok(body.clone());
+            }
+            if Instant::now() >= deadline {
+                bail!("timeout: GET {path} never answered {want}, last {last:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// SIGKILL, no drain: what a crash leaves behind, including a shadow
     /// postmaster the daemon never got to stop.
     fn kill_daemon(&mut self) -> Result<()> {
@@ -762,6 +781,110 @@ async fn pause_resume_via_ctl_and_sighup_no_restart() {
             .await
             .context("SIGHUP resume did not catch up")?;
 
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let stderr = h.teardown();
+    if let Err(e) = result {
+        panic!("{e:#}\n--- daemon stderr ---\n{stderr}");
+    }
+}
+
+/// The metrics port's probes against a live daemon. `/healthz` answers while
+/// the daemon does; `/readyz` once the pump runs, failing while the shadow
+/// postmaster is down and recovering after the supervisor restarts it;
+/// `/status` is `ctl status` as JSON; no other path is the scrape
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probes_follow_the_pump_and_the_shadow_postmaster() {
+    if !gated() {
+        return;
+    }
+    let mut h = Harness::up(&fx::Ports::alloc())
+        .await
+        .expect("bring up harness");
+
+    let result = async {
+        h.wait_ready(Duration::from_secs(60)).await?;
+        let addr = h.metrics_addr;
+        ensure!(
+            fx::http_request(addr, "GET", "/healthz")? == (200, "ok\n".into()),
+            "liveness"
+        );
+        h.wait_http("/readyz", 200, Duration::from_secs(30)).await?;
+        let (status, body) = fx::http_request(addr, "GET", "/")?;
+        ensure!(
+            status == 404 && !body.contains("walshadow_"),
+            "GET / answered {status}: {body}"
+        );
+        ensure!(fx::http_request(addr, "POST", "/metrics")?.0 == 405);
+
+        let (status, body) = fx::http_request(addr, "GET", "/status")?;
+        ensure!(status == 200, "/status answered {status}: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).context("parse /status")?;
+        for key in [
+            "dbname",
+            "ch_database",
+            "source_system_id",
+            "floor_timeline",
+        ] {
+            let ctl = h.status_field(key)?;
+            let http = match &json[key] {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            ensure!(http == ctl, "{key}: /status says {http}, ctl status {ctl}");
+        }
+
+        // Down and held down: restart needs the socket directory, and only
+        // initdb creates one, so every supervisor attempt fails until it is
+        // back. Hidden before the stop, so no attempt can slip in between
+        let held = h.tmp.path().join("shadow-sock.held");
+        fs::rename(&h.shadow_sock, &held).context("hide shadow socket dir")?;
+        h.shadow().stop().context("stop shadow")?;
+        let down = h.wait_http("/readyz", 503, Duration::from_secs(30)).await?;
+        ensure!(down.contains("shadow postmaster is down"), "{down}");
+        h.wait_log(
+            "shadow postmaster stopped, restarting",
+            Duration::from_secs(10),
+        )
+        .await?;
+        // A failed restart retries with backoff; the daemon stays up and live
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        ensure!(h.alive(), "daemon exited while its shadow was down");
+        ensure!(
+            fx::http_request(addr, "GET", "/healthz")?.0 == 200,
+            "liveness must not follow the shadow"
+        );
+        let (status, body) = fx::http_request(addr, "GET", "/readyz")?;
+        if status != 503 {
+            let log = h.shadow_log();
+            let tail: Vec<&str> = log.lines().rev().take(30).collect();
+            bail!(
+                "/readyz answered {status} {body:?} with the socket dir hidden; \
+                 socket dir exists: {}, held exists: {}, shadow log tail:\n{}",
+                h.shadow_sock.exists(),
+                held.exists(),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+            );
+        }
+
+        fs::rename(&held, &h.shadow_sock).context("restore shadow socket dir")?;
+        h.wait_http("/readyz", 200, Duration::from_secs(90))
+            .await
+            .context("the supervisor never brought the shadow back")?;
+        h.wait_log("shadow restarted", Duration::from_secs(5))
+            .await?;
+
+        // Replication resumes through the restarted shadow
+        h.psql("UPDATE demo.users SET email = 'after-shadow-restart@x' WHERE id = 1")?;
+        h.wait_ch(
+            USER_EMAIL,
+            "after-shadow-restart@x",
+            Duration::from_secs(60),
+        )
+        .await?;
+        ensure!(fx::http_request(addr, "GET", "/readyz")?.0 == 200);
         Ok::<(), anyhow::Error>(())
     }
     .await;

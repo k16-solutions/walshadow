@@ -572,6 +572,12 @@ impl Shadow {
         }
     }
 
+    /// `pg_ctl -w start`, and a postmaster running after it. `pg_ctl` alone
+    /// is not proof: when the postmaster dies during startup and `pg_control`
+    /// reads "shut down in recovery", it reports a recovery-target shutdown
+    /// and exits 0. A cleanly stopped standby always reads that, so on the
+    /// shadow any startup failure would pass as a start. Walshadow sets no
+    /// recovery target that shuts down, so no postmaster is a failure
     pub fn start(&self) -> Result<()> {
         let log = self.config.data_dir.join("startup.log");
         let log_str = log.to_str().expect("non-utf8 log path");
@@ -585,21 +591,33 @@ impl Shadow {
             "86400",
             "start",
         ];
-        let res = self.run_env("pg_ctl", args, &[WALRECEIVER_PROTOCOL_PIN]);
-        if let Err(ShadowError::Process {
+        let with_log = |cmd: String, status: i32, stderr: String| ShadowError::Process {
             cmd,
             status,
-            stderr,
-        }) = res
-        {
+            stderr: format!("{stderr}\nstartup.log tail:\n{}", log_tail(&log)),
+        };
+        let out = match self.run_env("pg_ctl", args, &[WALRECEIVER_PROTOCOL_PIN]) {
+            Ok(out) => out,
             Err(ShadowError::Process {
                 cmd,
                 status,
-                stderr: format!("{stderr}\nstartup.log tail:\n{}", log_tail(&log)),
-            })
-        } else {
-            res.map(|_| ())
+                stderr,
+            }) => return Err(with_log(cmd, status, stderr)),
+            Err(e) => return Err(e),
+        };
+        if !self.is_running()? {
+            return Err(with_log(
+                "pg_ctl".into(),
+                0,
+                format!(
+                    "postmaster exited during startup ({})",
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .replace('\n', " "),
+                ),
+            ));
         }
+        Ok(())
     }
 
     /// Read minimum standby GUC values from local `pg_control`
@@ -1265,6 +1283,49 @@ mod tests {
         fs::write(&pid, pidfile("ready")).unwrap();
         assert!(waiter.join().unwrap());
         assert!(probes() >= 2);
+    }
+
+    /// `pg_ctl -w start` exits 0 for a standby whose postmaster died during
+    /// startup, calling it a recovery-target shutdown. No postmaster after a
+    /// start is a failed start, or the supervisor reports a restart that never
+    /// happened and the daemon reads as ready with its shadow down
+    #[test]
+    fn start_fails_when_no_postmaster_survives_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let shadow = |status_rc: u8| {
+            stub_bin(
+                &bin.join("pg_ctl"),
+                &format!(
+                    "case \"$*\" in\n\
+                     *status*) exit {status_rc};;\n\
+                     *start*) echo 'waiting for server to start.... done'; \
+                     echo 'server shut down because of recovery target settings'; exit 0;;\n\
+                     esac"
+                ),
+            );
+            let mut cfg = ShadowConfig::new(data.clone(), tmp.path().join("filtered"));
+            cfg.pg_bin_dir = Some(bin.clone());
+            Shadow::new(cfg)
+        };
+        fs::write(
+            data.join("startup.log"),
+            "FATAL:  could not create lock file\n",
+        )
+        .unwrap();
+        let err = shadow(3).start().unwrap_err().to_string();
+        assert!(err.contains("postmaster exited during startup"), "{err}");
+        assert!(err.contains("recovery target settings"), "{err}");
+        assert!(
+            err.contains("could not create lock file"),
+            "the log tail: {err}"
+        );
+        shadow(0)
+            .start()
+            .expect("a postmaster that stays up is a start");
     }
 
     /// Unreadable running settings must not read as an unraised floor: a

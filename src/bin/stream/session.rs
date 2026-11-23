@@ -404,8 +404,11 @@ async fn session_body(
     } else {
         (owned, source_databases)
     };
-    let shadow_lifecycle =
-        ShadowLifecycle::spawn(owned, walsender_primary_conninfo(args.walsender_bind));
+    let shadow_lifecycle = ShadowLifecycle::spawn(
+        owned,
+        walsender_primary_conninfo(args.walsender_bind),
+        metrics.health().clone(),
+    );
     let archive = ch_config
         .as_ref()
         .or(cluster_cfg.as_ref())
@@ -1177,6 +1180,9 @@ async fn session_body(
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
+    // Bootstrap is behind and the walreceiver attached: `/readyz` answers
+    // ready while the pump runs, and stops the moment any path leaves it
+    let streaming = metrics.health().streaming();
     let shutdown_reason = 'pump: loop {
         // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
         // missing from `history`; use that connection to fetch updated history.
@@ -2250,6 +2256,7 @@ async fn session_body(
             inflight_stall_logged = false;
         }
     };
+    drop(streaming);
     drop(path);
     tracing::info!(
         target: "walshadow",

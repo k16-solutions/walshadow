@@ -175,32 +175,48 @@ async fn run(mut args: Args) -> Result<()> {
     let metrics = MetricsRegistry::new();
     let reloader = Arc::new(Reloader::default());
 
+    // Control context: the socket's, which `/status` reads through as well
+    if args.control_socket.is_some() && args.ch_config.is_none() {
+        anyhow::bail!("--control-socket requires --ch-config");
+    }
+    if args.metrics_status && (args.metrics_bind.is_none() || args.ch_config.is_none()) {
+        anyhow::bail!("--metrics-status requires --metrics-bind and --config");
+    }
+    let ctx = match &args.ch_config {
+        Some(ch_config) if args.control_socket.is_some() || args.metrics_status => {
+            Some(SharedCtx {
+                fragment: walshadow::control::fragment_path(ch_config, &args.control_fragment)?,
+                ch_config: ch_config.clone(),
+                cli_base: cli_base(&args),
+                metrics: metrics.clone(),
+                reloader: reloader.clone(),
+                frag_lock: Arc::new(Mutex::new(())),
+            })
+        }
+        _ => None,
+    };
+
     let _metrics_server = if let Some(addr) = args.metrics_bind {
-        let (bound, h) = walshadow::metrics::serve(addr, metrics.clone())
+        let status = ctx.clone().filter(|_| args.metrics_status);
+        let (bound, h) = walshadow::metrics::serve(addr, metrics.clone(), status)
             .await
             .context("bind metrics endpoint")?;
-        tracing::info!(target: "walshadow::metrics", addr = %bound, "metrics endpoint serving");
+        tracing::info!(
+            target: "walshadow::metrics",
+            addr = %bound,
+            status = args.metrics_status,
+            "metrics endpoint serving",
+        );
         Some(h)
     } else {
         None
     };
 
-    let _control_server = if let Some(sock) = args.control_socket.clone() {
-        let ch_config = args
-            .ch_config
-            .clone()
-            .context("--control-socket requires --ch-config")?;
-        let ctx = SharedCtx {
-            fragment: walshadow::control::fragment_path(&ch_config, &args.control_fragment)?,
-            ch_config,
-            cli_base: cli_base(&args),
-            metrics: metrics.clone(),
-            reloader: reloader.clone(),
-            frag_lock: Arc::new(Mutex::new(())),
-        };
-        Some(walshadow::control::serve(sock, ctx).context("bind control socket")?)
-    } else {
-        None
+    let _control_server = match (args.control_socket.clone(), ctx) {
+        (Some(sock), Some(ctx)) => {
+            Some(walshadow::control::serve(sock, ctx).context("bind control socket")?)
+        }
+        _ => None,
     };
 
     let mut sighup = sighup;

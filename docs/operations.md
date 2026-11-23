@@ -39,11 +39,16 @@ Each replicated relation is one `[[tables]]` entry:
 Healthy steady state has `drain`, `emitter_ack`, and `shadow_replay` moving
 toward `source_received`. Short differences are expected while batches flush
 
+With `--metrics-status`, the metrics port also serves the same document as
+JSON at `GET /status`, for tools that cannot reach the control socket. It is
+off by default: the metrics port has no authentication, and status names
+databases, tables and destinations. It needs `--metrics-bind` and `--config`
+
 ## Monitor with Prometheus and Grafana
 
-Set `--metrics-bind` to expose OpenMetrics text metrics, which Prometheus
-scrapes directly. Counter series carry `_total`. Docker deployment uses port
-9484 and includes optional provisioned dashboard
+Set `--metrics-bind` to expose OpenMetrics text metrics at `/metrics`, which
+Prometheus scrapes directly. Counter series carry `_total`. Docker deployment
+uses port 9484 and includes optional provisioned dashboard
 
 ```bash
 docker compose -f docker/docker-compose.yml \
@@ -77,6 +82,33 @@ Choose thresholds from workload's normal lag and retained-WAL budget
 
 Grafana reads walshadow metrics only. It does not connect to source or
 ClickHouse
+
+## Health probes
+
+The metrics port answers liveness and readiness probes, such as Kubernetes
+`httpGet` probes:
+
+| Path | 200 when | Otherwise |
+|---|---|---|
+| `/healthz` | the daemon's runtime answers requests | no answer |
+| `/readyz` | bootstrap is done, the pump is streaming, and the managed shadow postmaster is up | 503, with the first unmet condition in the body |
+
+Use `/healthz` for liveness. It stays 200 through a long bootstrap, an
+initial load, a paused pump, a source reconnect and a destination outage: a
+restart fixes none of those, and a restart during bootstrap starts it over. A
+TCP check is weaker: the kernel completes the handshake even when the process
+has stopped answering
+
+Use `/readyz` for readiness and for rollout status. It is 503 until bootstrap
+finishes, which can take hours on a large source, so don't make a deploy wait
+on it with a short timeout. While the pump streams it drops to 503 when the
+shadow supervisor finds the postmaster stopped, and returns once the
+supervisor restarts it. The supervisor probes every 2 seconds. A destination
+outage, a paused pump or an unreachable source leaves it 200; alert on those
+from metrics instead
+
+Every path other than `/metrics`, `/healthz`, `/readyz` and, when enabled,
+`/status` answers 404, and methods other than `GET` and `HEAD` answer 405
 
 ## Pause and resume
 

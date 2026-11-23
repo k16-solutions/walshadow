@@ -262,9 +262,16 @@ pub(crate) struct Args {
     /// the command line without editing TOML. Absent defers to TOML.
     #[arg(long)]
     pub(crate) drop_table_strategy: Option<DropTableStrategy>,
-    /// HTTP/Prometheus metrics bind address. Disabled when absent.
+    /// HTTP bind address for `/metrics` (Prometheus) and the `/healthz` and
+    /// `/readyz` probes. Disabled when absent.
     #[arg(long)]
     pub(crate) metrics_bind: Option<SocketAddr>,
+    /// Also serve `GET /status` on `--metrics-bind`: what `ctl status` prints,
+    /// as JSON. Off by default because it names databases, tables and
+    /// destinations, and the metrics port has no authentication. Needs
+    /// `--metrics-bind` and `--config`
+    #[arg(long)]
+    pub(crate) metrics_status: bool,
     /// Control socket path, omit to disable control API
     #[arg(long)]
     pub(crate) control_socket: Option<PathBuf>,
