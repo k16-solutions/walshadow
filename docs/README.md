@@ -23,6 +23,7 @@ Use remaining guides as needed:
 - [Limitations](limitations.md), unsupported behavior and safeguards
 - [Development](development.md), builds, integration prerequisites, fixtures, and coverage
 - [Branching and releases](branching.md), merge rules, upstream syncs, release tags, and GitHub rules
+- [Upstream sync plan](upstream-sync.md), the biweekly merge from ClickHouse/walshadow and its automation
 
 Read [architecture](../architecture/README.md) for system design and
 [plans](../plans/INDEX.md) for unfinished work

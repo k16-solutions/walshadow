@@ -1,0 +1,120 @@
+# k16 fork: biweekly upstream sync. See docs/upstream-sync.md.
+#
+# `trial` reports what merging upstream would conflict on (no secrets, no
+# writes). `sync` runs Claude with the upstream-sync skill
+# (.claude/skills/upstream-sync) to merge, build and open a
+# merge/upstream-YYYY-MM-DD PR. A person reviews and merges that PR.
+name: upstream sync
+
+on:
+  schedule:
+    # 13:00 UTC on the 1st and 15th, about every two weeks. Schedules run
+    # only from the default branch.
+    - cron: "0 13 1,15 * *"
+  workflow_dispatch:
+    inputs:
+      sync:
+        description: Run the Claude merge too, not just the trial merge
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  trial:
+    name: trial merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      behind: ${{ steps.trial.outputs.behind }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/ClickHouse/walshadow.git
+          git fetch --no-tags upstream main
+
+      - name: Trial merge
+        id: trial
+        run: |
+          echo "behind=$(git rev-list --count --no-merges origin/main..upstream/main)" >> "$GITHUB_OUTPUT"
+          scripts/fork/trial-merge.sh origin/main upstream/main >> "$GITHUB_STEP_SUMMARY" || true
+
+  sync:
+    name: merge upstream (Claude)
+    needs: trial
+    # Small batches aren't worth a run. `inputs` is empty on schedule, and
+    # null compares equal to false, so test the event first
+    if: fromJSON(needs.trial.outputs.behind) >= 5 && (github.event_name == 'schedule' || inputs.sync)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+      id-token: write
+    steps:
+      # Pushes and PRs made with the default GITHUB_TOKEN don't start other
+      # workflows, so CI would never run on the sync PR. Act as a GitHub App
+      # instead (setup in docs/upstream-sync.md).
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.UPSTREAM_SYNC_APP_ID }}
+          private-key: ${{ secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: upstream-sync
+
+      - name: Install C deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libclang-dev cmake liblz4-dev libzstd-dev
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Configure git
+        run: |
+          git config user.name "walshadow upstream sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream with Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: /upstream-sync
+          claude_args: |
+            --model opus
+            --max-turns 200
+            --allowedTools "Bash(git *),Bash(cargo *),Bash(scripts/fork/*),Bash(gh pr *),Bash(gh api *),Read,Edit,Write,Grep,Glob"
