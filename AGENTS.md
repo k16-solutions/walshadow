@@ -79,8 +79,8 @@ description and explain why.
   `cargo clippy --workspace --all-targets -- -D warnings` and
   `cargo test -p walshadow --lib --bins` pass. CI also runs rustdoc with
   warnings denied and the e2e suites.
-- If you change dependencies, run `cargo deny --locked check`. PR CI doesn't
-  run it; only the upstream sync does.
+- If you change dependencies, run `cargo deny --locked check`. From merge 1
+  on, CI's lint job runs it too and fails on any advisory.
 - `git diff --stat origin/main` touches upstream-owned files only with hook
   lines.
 - When the change is large, `scripts/fork/trial-merge.sh HEAD upstream/main`
