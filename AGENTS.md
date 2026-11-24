@@ -13,12 +13,10 @@ fork-owned files, and keep edits to upstream-owned files to one-line hooks.**
 
 Fork-owned. Upstream has no copy of these:
 
-- `src/fork/**`: fork code that extends an upstream module (see below)
-- `src/destination/**`: the Snowflake destination
-- `src/tenants.rs`, `src/source/tenant_router.rs`, `src/ops/tenant_ctl.rs`,
-  `src/bin/stream/tenant.rs`: tenants
-- `tests/fork_*.rs`, `tests/multi_tenant_e2e.rs`, `tests/snowflake_live.rs`,
-  `tests/destination_config.rs`
+- `src/snowflake/**`: the Snowflake destination
+- `src/tenant/**`: tenants
+- `src/standby/**`: bulk loads read from a standby
+- `tests/snowflake_*.rs`, `tests/tenant_*.rs`, `tests/standby_*.rs`
 - `bench/src/snowflake.rs`, `bench/src/qualification.rs`,
   `bench/src/bin/snowflake_qualify.rs`
 - `charts/**`, `.github/workflows/chart.yml`,
@@ -34,23 +32,28 @@ Everything else is upstream-owned: the rest of `src/`, `tests/`, `benches/`,
 
 ## Changing behavior in an upstream-owned file
 
-1. Write the code in a fork-owned file:
+1. Pick the feature the change belongs to (`snowflake`, `tenant` or
+   `standby`; FORK.md lists what each holds) and write the code in its
+   directory:
    - If it needs the upstream module's private items, put it in
-     `src/fork/<same path>.rs`. Upstream's `src/emit/ch_ddl.rs` is extended by
-     `src/fork/emit/ch_ddl.rs`. If the upstream file doesn't declare
-     `mod fork;` yet, add the declaration at the end of the file:
+     `src/<feature>/ext/<same path>.rs`. Upstream's `src/emit/ch_ddl.rs` is
+     extended by `src/snowflake/ext/emit/ch_ddl.rs` and
+     `src/tenant/ext/emit/ch_ddl.rs`. If the upstream file doesn't declare
+     that feature's child yet, add the declaration at the end of the file,
+     next to any other feature's:
      ```rust
      // k16 fork: <what lives there> (see FORK.md)
-     #[path = "../fork/emit/ch_ddl.rs"]
-     mod fork;
+     #[path = "../snowflake/ext/emit/ch_ddl.rs"]
+     mod snowflake;
      ```
      The fork file starts with `use super::*;`.
-   - Otherwise put it in a fork-owned module, such as `src/destination/...`.
-2. In the upstream file, add only the call: one `if let ... = fork::x(...)`,
-   one `pub use fork::Name;`, one struct field.
+   - Otherwise put it in the feature's own module, `src/<feature>/`.
+2. In the upstream file, add only the call: one
+   `if let ... = snowflake::x(...)`, one `pub use snowflake::Name;`, one
+   struct field.
 3. Put new tests in the fork file's `#[cfg(test)] mod tests` or in a new
-   `tests/fork_<topic>.rs`. Never append to an upstream test file. Shared
-   relation fixtures are in `crate::fork::test_support`.
+   `tests/<feature>_<topic>.rs`. Never append to an upstream test file. Shared
+   relation fixtures are in `crate::snowflake::test_support`.
 
 ## Never do these in upstream-owned files
 
