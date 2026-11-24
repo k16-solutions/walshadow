@@ -96,16 +96,16 @@ tracing-opentelemetry = { version = "0.34", default-features = false }
 mimalloc = "0.1.52"
 prometheus-client = "0.26"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
 rocksdb = { version = "0.24", default-features = false, features = ["lz4", "bindgen-runtime"] }
-arrow-array = "56"
-arrow-schema = "56"
-parquet = { version = "56", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 aws-config = "1"
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 
 # `harness = false` throughout: these take shape flags rather than libtest
 # filters. Bootstrap pump + drain needs no PG and no CH; oracle batch needs
