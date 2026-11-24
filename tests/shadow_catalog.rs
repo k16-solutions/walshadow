@@ -19,9 +19,7 @@ use walshadow::bridge::Bridge;
 use walshadow::pg::socket_conninfo;
 use walshadow::schema::{RelName, ReplIdent};
 use walshadow::shadow::{BridgeConf, Shadow, ShadowConfig};
-use walshadow::shadow_catalog::{
-    CatalogError, ShadowCatalog, ShadowCatalogConfig, with_transient_retry,
-};
+use walshadow::shadow_catalog::{ShadowCatalog, with_transient_retry};
 
 fn make_shadow(tmp: &tempfile::TempDir, port: u16) -> Shadow {
     let mut cfg = ShadowConfig::new(tmp.path().join("data"), tmp.path().join("filtered"));
@@ -55,7 +53,7 @@ fn stop_on_drop(shadow: &Shadow) -> StopOnDrop<'_> {
     StopOnDrop { shadow }
 }
 
-async fn open_catalog(shadow: &Shadow, replay_timeout: Duration) -> ShadowCatalog {
+async fn open_catalog(shadow: &Shadow) -> ShadowCatalog {
     let cfg = shadow.config();
     let conninfo = socket_conninfo(
         cfg.socket_dir.to_str().unwrap(),
@@ -63,12 +61,7 @@ async fn open_catalog(shadow: &Shadow, replay_timeout: Duration) -> ShadowCatalo
         "postgres",
         "postgres",
     );
-    let cat_cfg = ShadowCatalogConfig {
-        replay_timeout,
-        replay_poll: Duration::from_millis(20),
-        ..Default::default()
-    };
-    ShadowCatalog::connect(&conninfo, cat_cfg, open_bridge(shadow).await)
+    ShadowCatalog::connect(&conninfo, open_bridge(shadow).await)
         .await
         .expect("catalog connect")
 }
@@ -127,11 +120,13 @@ async fn user_relation_lookup_by_name() {
                 id   bigint PRIMARY KEY,\n\
                 name text NOT NULL,\n\
                 payload jsonb\n\
-             );\n",
+             );\n\
+             CREATE TABLE wc.narrow (id bigint);\n\
+             CREATE TABLE wc.bare ();\n",
         )
         .expect("apply schema dump");
 
-    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let mut cat = open_catalog(&shadow).await;
     let desc = cat
         .descriptor_by_name(&RelName::new("wc", "things"))
         .await
@@ -157,34 +152,31 @@ async fn user_relation_lookup_by_name() {
             .is_none(),
         "unknown rel resolves None (forward-declaration parking)",
     );
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_lsn_gate_times_out_when_not_in_recovery() {
-    if !pg_available() {
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let shadow = make_shadow(&tmp, ports::PG_SHADOW_PORT);
-    shadow.initdb().expect("initdb");
-    shadow.write_base_conf().expect("conf");
-    shadow.start().expect("start");
-    let _stop = stop_on_drop(&shadow);
-
-    let mut cat = open_catalog(&shadow, Duration::from_millis(300)).await;
-    // pg_last_wal_replay_lsn() is NULL on a non-standby cluster. The
-    // gate must time out cleanly rather than spin or crash.
-    let err = cat
-        .wait_for_replay(0x0100_0000)
+    let toast = cat
+        .toast_descriptor_for(desc.oid)
         .await
-        .expect_err("non-recovering cluster: expected ReplayTimeout");
-    match err {
-        CatalogError::ReplayTimeout { target, last, .. } => {
-            assert_eq!(target, 0x0100_0000);
-            assert!(last.is_none());
-        }
-        other => panic!("expected ReplayTimeout, got {other:?}"),
-    }
+        .expect("toast lookup")
+        .expect("jsonb column needs toast");
+    assert_eq!((toast.oid, toast.kind), (desc.toast_oid, 't'));
+    let narrow = relation_oid(&shadow, "wc.narrow");
+    assert!(
+        cat.toast_descriptor_for(narrow)
+            .await
+            .expect("toast lookup")
+            .is_none(),
+        "fixed-width table has no toast",
+    );
+    let (_, none) = cat.fetch_descriptors_batch(&[]).await.expect("empty batch");
+    assert!(none.is_empty(), "empty oid list reads no relation");
+    let (_, bare) = cat
+        .fetch_descriptors_batch(&[relation_oid(&shadow, "wc.bare")])
+        .await
+        .expect("zero-column fetch");
+    let [bare] = &bare[..] else {
+        panic!("{bare:?}")
+    };
+    assert!(bare.attributes.is_empty(), "{bare:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -199,7 +191,7 @@ async fn catalog_reconnects_after_pg_restart() {
     shadow.start().expect("start");
     let _stop = stop_on_drop(&shadow);
 
-    let mut cat = open_catalog(&shadow, Duration::from_secs(10)).await;
+    let mut cat = open_catalog(&shadow).await;
     let first = cat
         .descriptor_by_name(&RelName::new("pg_catalog", "pg_class"))
         .await
@@ -278,18 +270,7 @@ async fn with_transient_retry_outlasts_a_pg_restart() {
         Duration::from_secs(15),
         Duration::from_millis(50),
         Duration::from_millis(500),
-        async move || {
-            ShadowCatalog::connect(
-                &conninfo,
-                ShadowCatalogConfig {
-                    replay_timeout: Duration::from_secs(5),
-                    replay_poll: Duration::from_millis(20),
-                    ..Default::default()
-                },
-                bridge.clone(),
-            )
-            .await
-        },
+        async move || ShadowCatalog::connect(&conninfo, bridge.clone()).await,
     )
     .await
     .expect("eventually connects through with_transient_retry");
@@ -325,7 +306,7 @@ async fn dropped_column_keeps_physical_slot() {
     let db = current_db_oid(&shadow);
     let oid = relation_oid(&shadow, "wc.evolve");
     let filenode = user_relation_filenode(&shadow, "wc.evolve");
-    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let mut cat = open_catalog(&shadow).await;
 
     let desc = cat
         .descriptor_by_name(&RelName::new("wc", "evolve"))
@@ -413,7 +394,7 @@ async fn replident_matrix_default_nothing_full_index() {
         )
         .expect("schema dump");
 
-    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let mut cat = open_catalog(&shadow).await;
 
     let cases = [
         (
@@ -494,7 +475,7 @@ async fn fetch_all_descriptors_covers_eligible_kinds() {
         )
         .expect("schema dump");
 
-    let mut cat = open_catalog(&shadow, Duration::from_secs(5)).await;
+    let mut cat = open_catalog(&shadow).await;
     let (_, descs) = cat
         .fetch_all_descriptors()
         .await

@@ -26,7 +26,7 @@ use crate::ch::{ChConn, EmitterError, exec_drain, query_strings, quote_ident};
 use crate::config::DestEmitter;
 use crate::mapping::{MappingHandle, TableMapping, TableTarget};
 use crate::schema::RelName;
-use ahash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 /// `orders` loads into `orders__wsstg`; deterministic so a retry or boot
 /// recovery finds the prior attempt's table
@@ -144,7 +144,7 @@ impl StagingSession {
         }
         let client = ChConn::connect(dest.clone())
             .await
-            .map_err(|e| anyhow::anyhow!("backfill_staging: connect: {e}"))?;
+            .context("backfill_staging: connect")?;
         Ok(Self {
             client: Some(client),
             dest,
@@ -178,7 +178,6 @@ impl StagingSession {
     }
 
     async fn attempt_write(&mut self, sql: &str) -> Result<(), EmitterError> {
-        let timeout = self.dest.current().insert_timeout;
         let client = self
             .client
             .as_mut()
@@ -187,19 +186,18 @@ impl StagingSession {
             })?
             .ready()
             .await?;
-        exec_drain(client, sql, timeout).await
+        exec_drain(client, sql).await
     }
 
     /// Statement safe to re-apply (DROP/CREATE IF NOT EXISTS, dedup-absorbed
     /// INSERT..SELECT): reconnect + resend on retryable failure.
     pub(crate) async fn exec_retry(&mut self, sql: &str) -> Result<()> {
-        let timeout = self.dest.current().insert_timeout;
         self.client
             .as_mut()
             .context("ClickHouse staging SQL is unavailable for Snowflake")?
             .retry(
                 |mut client| async move {
-                    let result = exec_drain(&mut client, sql, timeout).await;
+                    let result = exec_drain(&mut client, sql).await;
                     (client, result)
                 },
                 |e, attempt| {
@@ -214,7 +212,7 @@ impl StagingSession {
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
-    /// Single attempt, no resend: an ambiguous timeout may have applied
+    /// Single attempt, no resend: a dropped connection may have applied
     /// server-side. Callers resolve through the ledger's staging uuid.
     async fn exec_once(&mut self, sql: &str) -> Result<()> {
         self.attempt_write(sql)
@@ -222,14 +220,13 @@ impl StagingSession {
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
 
-    /// Single-column String SELECT, one attempt under the timeout.
+    /// Single-column String SELECT, one attempt.
     pub(crate) async fn query_strings(&mut self, sql: &str) -> Result<Vec<String>> {
-        let timeout = self.dest.current().insert_timeout;
         let client = self
             .client
             .as_mut()
             .context("ClickHouse staging SQL is unavailable for Snowflake")?;
-        async { query_strings(client.ready().await?, sql, timeout).await }
+        async { query_strings(client.ready().await?, sql).await }
             .await
             .map_err(|e| anyhow::anyhow!("backfill_staging: {sql}: {e}"))
     }
@@ -382,6 +379,58 @@ mod tests {
         assert!(session.exec_once(sql).await.is_err());
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn prepare_names_the_rel_whose_staging_rebuild_failed() {
+        let sql = "DROP TABLE IF EXISTS `db`.`t__wsstg`";
+        let (config, server) = crate::ch::test_support::retry_server(0, sql, false, false).await;
+        let desc = crate::backfill::backup_page_walk::make_rel_named(
+            16400,
+            16400,
+            0,
+            RelName::new("public", "t"),
+        );
+        let table = TableMapping {
+            target: TableTarget::new("db", "t"),
+            columns: Vec::new(),
+            tees: Vec::new(),
+        };
+        let live =
+            crate::mapping::mapping_handle([(desc.rel_name.clone(), table)].into_iter().collect());
+        let reqs = [BackupRequest {
+            desc,
+            s_lsn: 0x5000,
+        }];
+        let err = prepare(
+            DestEmitter::new(Arc::new(config), None),
+            &live,
+            &reqs,
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "backfill_staging: rebuild staging for public.t"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_query_names_its_sql() {
+        let sql = "SELECT name FROM system.tables";
+        let (config, server) = crate::ch::test_support::retry_server(0, sql, false, false).await;
+        let mut session = StagingSession::connect(DestEmitter::new(Arc::new(config), None))
+            .await
+            .unwrap();
+        let err = session.query_strings(sql).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("backfill_staging: {sql}: "))
+        );
+        server.await.unwrap();
     }
 
     #[test]

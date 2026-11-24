@@ -28,7 +28,7 @@ use walshadow::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
 use walshadow::record::{MetricsRecordSink, WAL_SEG_SIZE};
-use walshadow::retention::max_segment_end;
+use walshadow::retention::{DEFAULT_TRIM_INTERVAL, max_segment_end, remove_stale_temps};
 use walshadow::segment_sink::{DirSegmentSink, SegFsync};
 use walshadow::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use walshadow::timeline::TimelineHistory;
@@ -56,10 +56,9 @@ use crate::shadow_proc::{
 use crate::sinks::DaemonSinks;
 use crate::source_db::{ATTACH_MARKER, list_databases};
 use crate::source_recovery::{
-    BARRIER_LOG_INTERVAL, FORK_FENCE_DRAIN, PROMOTION_POLL, PauseState, PromotionGate,
-    ReconnectBackoff, ResumePoint, SOURCE_SWAP_RETRY, SourcePath, SourceRecovery,
-    commit_fork_resume, connect_source_waiting, promotion_gate, resume_manifest,
-    resume_source_feed, stream_branch, swap_reason,
+    BARRIER_LOG_INTERVAL, PROMOTION_POLL, PauseState, PromotionGate, ReconnectBackoff, ResumePoint,
+    SOURCE_SWAP_RETRY, SourcePath, SourceRecovery, commit_fork_resume, connect_source_waiting,
+    promotion_gate, resume_manifest, resume_source_feed, stream_branch, swap_reason,
 };
 use crate::tenant;
 
@@ -91,6 +90,157 @@ async fn ensure_boot_database_waiting(cfg: &EmitterConfig) -> Result<()> {
     Ok(())
 }
 
+/// Poll until a walreceiver streams from the walsender, or `timeout` passes
+async fn await_walreceiver(
+    shadow_state: &Mutex<walshadow::shadow_stream::ShadowStreamState>,
+    walsender_addr: std::net::SocketAddr,
+    timeout: Duration,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let agg = shadow_state.lock().await.aggregate();
+        if agg.active_connections > 0 {
+            break;
+        }
+        // `accepted` separates "shadow never dialed" from "shadow dialed
+        // and stalled in the handshake" — the latter reads as the former
+        // without it, since only START_REPLICATION registers a connection
+        let (secs, accepted) = (timeout.as_secs(), agg.accepted_total);
+        anyhow::ensure!(
+            start.elapsed() < timeout,
+            "no walreceiver streaming from walsender {walsender_addr} within \
+             {secs}s (accepted {accepted}, none sent START_REPLICATION); catalog-boundary \
+             holds require a live wire — point shadow's primary_conninfo here \
+             or raise --walsender-connect-timeout",
+        );
+        or_signal(shutdown, async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        })
+        .await?;
+    }
+    tracing::info!(
+        target: "walshadow",
+        wait = ?start.elapsed(),
+        "walsender connected — starting pump",
+    );
+    Ok(())
+}
+
+/// Followed databases in bridge socket order: `[source] dbname` plus every
+/// database-prefixed config key
+fn followed_databases(ch_config: Option<&EmitterConfig>, dbname: &str) -> Result<Vec<String>> {
+    let databases = match ch_config {
+        Some(cfg) if !cfg.databases.is_empty() => cfg.databases.clone(),
+        _ => vec![dbname.to_owned()],
+    };
+    let seats = walshadow::bridge::MAX_BRIDGE_DATABASES;
+    let named = databases.len();
+    anyhow::ensure!(
+        named <= seats,
+        "config names {named} source databases, the shadow bridge seats {seats}"
+    );
+    Ok(databases)
+}
+
+/// Manifest boot resumes from. Unreadable is fatal unless an operator override
+/// discards it, another cluster's is fatal regardless
+fn boot_manifest(
+    loaded: Result<Option<manifest::Manifest>, manifest::ManifestError>,
+    overridden: bool,
+    spill_dir: &std::path::Path,
+) -> Result<Option<manifest::Manifest>> {
+    match loaded {
+        Ok(m) => Ok(m),
+        Err(e @ manifest::ManifestError::ForeignSource { .. }) => Err(e.into()),
+        Err(e) if overridden => {
+            tracing::warn!(
+                target: "walshadow::manifest",
+                error = %e,
+                spill_dir = %spill_dir.display(),
+                "manifest unreadable; operator override discards it",
+            );
+            Ok(None)
+        }
+        Err(e) => anyhow::bail!(
+            "manifest at {} unreadable: {e}; restore it, or authorize \
+             recovery with --ignore-cursor / --start-lsn",
+            manifest::manifest_path(spill_dir).display(),
+        ),
+    }
+}
+
+/// Branch serving `aligned` on the source's history. `--ignore-cursor`
+/// adopts the live timeline when the stored one has no lineage there
+fn start_branch(
+    history: &mut TimelineHistory,
+    stored_timeline: u32,
+    aligned: Pos<Floor>,
+    live_timeline: u32,
+    ignore_cursor: bool,
+) -> Result<u32> {
+    if let Some(tli) = history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
+        return Ok(tli);
+    }
+    let serves = history.tli_of_segment(aligned.get(), WAL_SEG_SIZE);
+    anyhow::ensure!(
+        ignore_cursor,
+        "timeline_not_descendant: stored timeline {stored_timeline} does not reach \
+         {aligned} on live timeline {live_timeline}'s history (it serves {serves:?}); \
+         --ignore-cursor re-baselines onto the live branch",
+    );
+    tracing::warn!(
+        target: "walshadow",
+        stored_timeline,
+        live_timeline,
+        serves_start = serves,
+        "--ignore-cursor adopts the live timeline without a lineage proof",
+    );
+    *history = TimelineHistory::root(live_timeline);
+    Ok(live_timeline)
+}
+
+/// Same number, different branch: only the switchpoint tells a sibling from
+/// the branch artifacts came off. `stored_begin` 0 is a manifest that never
+/// recorded one
+fn check_branch_begin(
+    stored_timeline: u32,
+    stored_begin: u64,
+    live_begin: u64,
+    ignore_cursor: bool,
+) -> Result<()> {
+    match stored_begin {
+        0 if stored_timeline > 1 => tracing::warn!(
+            target: "walshadow",
+            stored_timeline,
+            live_begin = %format_pg_lsn(live_begin),
+            "manifest records no switchpoint for its branch, so a sibling sharing \
+             that number cannot be refused until the next manifest write",
+        ),
+        0 => {}
+        begin if begin != live_begin => {
+            anyhow::ensure!(
+                ignore_cursor,
+                "sibling_branch: source places timeline {stored_timeline} at {}, \
+                 walshadow's artifacts came off it from {}; the branch behind them is \
+                 absent from this source's history",
+                format_pg_lsn(live_begin),
+                format_pg_lsn(begin),
+            );
+            tracing::warn!(
+                target: "walshadow",
+                stored_timeline,
+                stored_begin = %format_pg_lsn(begin),
+                live_begin = %format_pg_lsn(live_begin),
+                "--ignore-cursor adopts a branch that begins somewhere else",
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Wait out tracked I/O on every exit, attach restart reopens same files
 /// in-process
 pub(crate) async fn run_session(
@@ -112,7 +262,7 @@ async fn session_body(
     args: &Args,
     metrics: &MetricsRegistry,
     reloader: &Arc<walshadow::control::Reloader>,
-    sighup: tokio::signal::unix::Signal,
+    mut sighup: tokio::signal::unix::Signal,
     shutdown: &CancellationToken,
     attach: &AttachSlot,
     io: &TaskTracker,
@@ -120,12 +270,13 @@ async fn session_body(
     // Clone the Arc-backed registry so the body's `&metrics` uses are unchanged.
     let metrics = metrics.clone();
     let mut tasks = SessionTasks::default();
+    let sighup = futures::stream::poll_fn(move |cx| sighup.poll_recv(cx));
     tasks.spawn("sighup reload", sighup_reload(sighup, reloader.clone()));
 
     let mut merged: toml::Table = match args.ch_config.as_deref() {
         Some(p) => walshadow::ch_emitter::load_effective(p, cli_base(args))
             .await
-            .with_context(|| format!("load config {}", p.display()))?,
+            .context(format!("load config {}", p.display()))?,
         None => cli_base(args),
     };
     // Applied source endpoint. Boot resolves it file-over-CLI; a later reload
@@ -138,7 +289,7 @@ async fn session_body(
     let mut cfg = source_conn.to_pg_config();
     let mut feed = or_signal(
         shutdown,
-        connect_source_waiting(args, &mut source_conn, &mut cfg),
+        connect_source_waiting(args, &mut source_conn, &mut cfg, SOURCE_SWAP_RETRY),
     )
     .await?;
 
@@ -203,18 +354,7 @@ async fn session_body(
                 c.decoder_queue_capacity
             }),
     );
-    // Followed databases, in bridge socket order: `[source] dbname` plus
-    // every database-prefixed config key
-    let source_databases: Vec<String> = match ch_config.as_ref() {
-        Some(cfg) if !cfg.databases.is_empty() => cfg.databases.clone(),
-        _ => vec![source_conn.dbname.clone()],
-    };
-    anyhow::ensure!(
-        source_databases.len() <= walshadow::bridge::MAX_BRIDGE_DATABASES,
-        "config names {} source databases, the shadow bridge seats {}",
-        source_databases.len(),
-        walshadow::bridge::MAX_BRIDGE_DATABASES,
-    );
+    let source_databases = followed_databases(ch_config.as_ref(), &source_conn.dbname)?;
     // Assign older TOAST mirrors and retire entries to sole followed database
     // TODO(0.2.0): remove with adopt_legacy_mirrors and legacy ledger load
     let legacy_owner: Option<u32> = if source_databases.len() == 1 {
@@ -255,7 +395,7 @@ async fn session_body(
     let bootstrap_plan = resolve_bootstrap(args, ch_config.as_ref().or(cluster_cfg.as_ref()))?;
     let shadow_start = resolve_shadow_start(args, bootstrap_plan.mode)?;
     if ch_config.as_ref().is_some_and(|c| c.toast.mode.is_shadow())
-        && let ShadowStart::Resume(dir) = &shadow_start
+        && let ShadowStart::Resume(dir) | ShadowStart::Handoff(dir, _) = &shadow_start
     {
         walshadow::filter::shadow_relations::ShadowRelations::load(dir).await?;
     }
@@ -264,7 +404,7 @@ async fn session_body(
     if let Some(slot) = source_conn.slot.as_deref() {
         feed.ensure_physical_slot(slot)
             .await
-            .with_context(|| format!("ensure physical replication slot {slot}"))?;
+            .context(format!("ensure physical replication slot {slot}"))?;
         tracing::info!(target: "walshadow", slot, "physical replication slot ready");
     }
     // Uptime anchors here, ahead of bootstrap: an initial load is part of the
@@ -276,7 +416,7 @@ async fn session_body(
     // keeps inserter and TOAST totals from resetting at handoff
     let emitter_stats = Arc::new(EmitterStats::default());
     let mut bootstrap_metrics: Option<BootstrapMetrics> = None;
-    let mut bootstrap_handoff: Option<BootstrapHandoff> = if shadow_start.bootstraps() {
+    let mut bootstrap_handoff = if let ShadowStart::Bootstrap(_, attempt) = &shadow_start {
         if !args.skip_preflight {
             let source_sql = feed
                 .sql_client()
@@ -292,11 +432,6 @@ async fn session_body(
             .into_result()
             .context("pre-flight rejected bootstrap")?;
         }
-        let previous = if let ShadowStart::Rebootstrap(_, marker) = &shadow_start {
-            Some(marker.clone())
-        } else {
-            None
-        };
         let (handoff, stage) = or_signal(
             shutdown,
             run_bootstrap(
@@ -305,7 +440,7 @@ async fn session_body(
                 &mut feed,
                 args,
                 &bootstrap_plan,
-                previous,
+                attempt.clone(),
                 ch_config.clone(),
                 BootstrapObservers {
                     metrics: &metrics,
@@ -318,6 +453,8 @@ async fn session_body(
         .context("bootstrap")?;
         bootstrap_metrics = Some(stage);
         Some(handoff)
+    } else if let ShadowStart::Handoff(_, handoff) = &shadow_start {
+        Some(BootstrapHandoff::new(*handoff, None))
     } else {
         None
     };
@@ -345,29 +482,21 @@ async fn session_body(
                 .shadow
                 .write_standby_signal()
                 .context("write standby.signal")?;
-            walshadow::ops::stages::SHADOW_REPLAY
-                .measure(start_owned_shadow(
+            or_signal(
+                shutdown,
+                walshadow::ops::stages::SHADOW_REPLAY.measure(start_owned_shadow(
                     &owned.shadow,
                     bootstrap_end_lsn,
-                    Duration::from_secs(args.bootstrap_shadow_replay_timeout),
                     args.keep_shadow_running,
-                ))
-                .await?;
+                )),
+            )
+            .await?;
             owned
         }
     };
     let stand_in = stand_in_primary(&owned.shadow, &source_conn.dbname).await;
     let (owned, source_databases) = if let Some(name) = &stand_in {
-        let substituted: Vec<String> = source_databases
-            .iter()
-            .map(|db| {
-                if *db == source_conn.dbname {
-                    name.clone()
-                } else {
-                    db.clone()
-                }
-            })
-            .collect();
+        let substituted = substitute_database(&source_databases, &source_conn.dbname, name);
         tracing::warn!(
             target: "walshadow",
             absent = source_conn.dbname.as_str(),
@@ -393,11 +522,9 @@ async fn session_body(
             .shadow
             .write_standby_signal()
             .context("write standby.signal")?;
-        start_owned_shadow(
-            &owned.shadow,
-            None,
-            Duration::from_secs(args.bootstrap_shadow_replay_timeout),
-            args.keep_shadow_running,
+        or_signal(
+            shutdown,
+            start_owned_shadow(&owned.shadow, None, args.keep_shadow_running),
         )
         .await?;
         (owned, substituted)
@@ -411,13 +538,9 @@ async fn session_body(
         .or(cluster_cfg.as_ref())
         .and_then(|c| c.backup.clone())
         .map(Archive::open)
-        .transpose()?;
-    let start_lsn_override: Option<Pos<RawStart>> = args
-        .start_lsn
-        .as_deref()
-        .map(|s| walshadow::pg::parse_pg_lsn(s).context("--start-lsn"))
-        .transpose()?
-        .map(Pos::new);
+        .transpose()
+        .context("open backup archive")?;
+    let start_lsn_override: Option<Pos<RawStart>> = args.start_lsn.map(Pos::new);
 
     let live_identity = manifest::SourceIdentity {
         system_id: ident.system_id,
@@ -428,29 +551,9 @@ async fn session_body(
     // LSNs, not artifact ownership. Foreign system_id is fatal regardless
     // (retire/backfill ledgers would act on another cluster's state). A newer
     // live timeline is a promotion, proved against the source's history below.
-    let manifest_at_boot: Option<manifest::Manifest> =
-        match manifest::load(&args.spill_dir, &live_identity).await {
-            Ok(m) => m,
-            Err(e @ manifest::ManifestError::ForeignSource { .. }) => {
-                anyhow::bail!("{e}");
-            }
-            Err(e) if args.ignore_cursor || start_lsn_override.is_some() => {
-                tracing::warn!(
-                    target: "walshadow::manifest",
-                    error = %e,
-                    spill_dir = %args.spill_dir.display(),
-                    "manifest unreadable; operator override discards it",
-                );
-                None
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "manifest at {} unreadable: {e}; restore it, or authorize \
-                     recovery with --ignore-cursor / --start-lsn",
-                    manifest::manifest_path(&args.spill_dir).display(),
-                );
-            }
-        };
+    let loaded = manifest::load(&args.spill_dir, &live_identity).await;
+    let overridden = args.ignore_cursor || start_lsn_override.is_some();
+    let manifest_at_boot = boot_manifest(loaded, overridden, &args.spill_dir)?;
     // Precedence: explicit > bootstrap > manifest > greenfield head
     let manifest_at_boot = if args.ignore_cursor {
         None
@@ -515,29 +618,13 @@ async fn session_body(
         .or_else(|| manifest_at_boot.as_ref().map(|m| m.source.timeline))
         .unwrap_or(ident.timeline);
     let mut history = load_boot_history(&mut feed, ident.timeline, stored_timeline).await?;
-    let start_timeline = match history.resume_branch(stored_timeline, aligned.get(), WAL_SEG_SIZE) {
-        Some(tli) => tli,
-        None if args.ignore_cursor => {
-            let found = history.tli_of_segment(aligned.get(), WAL_SEG_SIZE);
-            tracing::warn!(
-                target: "walshadow",
-                stored_timeline,
-                live_timeline = ident.timeline,
-                serves_start = found,
-                "--ignore-cursor adopts the live timeline without a lineage proof",
-            );
-            history = TimelineHistory::root(ident.timeline);
-            ident.timeline
-        }
-        None => anyhow::bail!(
-            "timeline_not_descendant: stored timeline {stored_timeline} does not reach \
-             {} on live timeline {}'s history (it serves {:?}); \
-             --ignore-cursor re-baselines onto the live branch",
-            aligned,
-            ident.timeline,
-            history.tli_of_segment(aligned.get(), WAL_SEG_SIZE),
-        ),
-    };
+    let start_timeline = start_branch(
+        &mut history,
+        stored_timeline,
+        aligned,
+        ident.timeline,
+        args.ignore_cursor,
+    )?;
     // Backup passes replay archived WAL off the same branch, and outlive a
     // crossing, so they read the chain here rather than re-deriving it
     let (history_tx, history_rx) = watch::channel(Arc::new(history.clone()));
@@ -554,31 +641,12 @@ async fn session_body(
             .map(|m| m.source.timeline_begin.get())
             .unwrap_or(0)
     };
-    match stored_begin {
-        0 if stored_timeline > 1 => tracing::warn!(
-            target: "walshadow",
-            stored_timeline,
-            live_begin = %format_pg_lsn(live_begin),
-            "manifest records no switchpoint for its branch, so a sibling sharing \
-             that number cannot be refused until the next manifest write",
-        ),
-        0 => {}
-        begin if begin != live_begin && !args.ignore_cursor => anyhow::bail!(
-            "sibling_branch: source places timeline {stored_timeline} at {}, \
-             walshadow's artifacts came off it from {}; the branch behind them is \
-             absent from this source's history",
-            format_pg_lsn(live_begin),
-            format_pg_lsn(begin),
-        ),
-        begin if begin != live_begin => tracing::warn!(
-            target: "walshadow",
-            stored_timeline,
-            stored_begin = %format_pg_lsn(begin),
-            live_begin = %format_pg_lsn(live_begin),
-            "--ignore-cursor adopts a branch that begins somewhere else",
-        ),
-        _ => {}
-    }
+    check_branch_begin(
+        stored_timeline,
+        stored_begin,
+        live_begin,
+        args.ignore_cursor,
+    )?;
     if start_timeline != ident.timeline {
         tracing::info!(
             target: "walshadow",
@@ -619,7 +687,7 @@ async fn session_body(
         Duration::from_millis(50),
     )
     .await
-    .with_context(|| format!("bind walsender at {walsender_addr}"))?;
+    .context(format!("bind walsender at {walsender_addr}"))?;
     tasks.adopt("walsender listener", walsender_task);
     tracing::info!(target: "walshadow", addr = %walsender_addr, "walsender listening");
     stream.set_bytes_sink(Box::new(walshadow::shadow_stream::ShadowStreamSink::new(
@@ -679,7 +747,7 @@ async fn session_body(
     if stand_in.is_some() && tenants_cfg.is_none() {
         tokio::fs::write(args.spill_dir.join(ATTACH_MARKER), b"")
             .await
-            .with_context(|| format!("mark {} as attaching", args.spill_dir.display()))?;
+            .context(format!("mark {} as attaching", args.spill_dir.display()))?;
         let source_sql = feed
             .sql_client()
             .await
@@ -690,16 +758,13 @@ async fn session_body(
             .context("source WAL position for the absent database")?;
         let visible_at = walshadow::pg::parse_pg_lsn(visible_at.get::<_, &str>(0))
             .context("parse source WAL position")?;
+        let dbname = &source_conn.dbname;
+        let absent = format!("database {dbname} is configured but not on the source");
         let oid = *list_databases(source_sql)
             .await
             .context("list source databases")?
-            .get(source_conn.dbname.as_str())
-            .with_context(|| {
-                format!(
-                    "database {} is configured but not on the source",
-                    source_conn.dbname
-                )
-            })?;
+            .get(dbname.as_str())
+            .context(absent)?;
         pending_dbs.push(PendingDatabase {
             oid,
             name: source_conn.dbname.clone(),
@@ -756,11 +821,7 @@ async fn session_body(
             .context("write initial resume manifest after bootstrap")?;
     }
 
-    let source_major = (feed.server_version_num() / 10000) as u32;
-    anyhow::ensure!(
-        (16..=19).contains(&source_major),
-        "source PG major {source_major} unsupported (commit-record sinval layout audited for 16-19)",
-    );
+    let source_major = supported_major(feed.server_version_num())?;
     // Decoder and reorder skip header-routed records; a pending database
     // attaches on any record's block locators. Named tenants never boot with
     // pending databases, and header-routed records name no database, so the
@@ -812,6 +873,7 @@ async fn session_body(
         span_tracing: args.otlp_endpoint.is_some()
             || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok(),
         io: io.clone(),
+        metrics: metrics.clone(),
     };
     drop(history_rx);
     let mut router = walshadow::tenant::router::TenantRouter::new(
@@ -868,7 +930,8 @@ async fn session_body(
                 lineage: lineage.clone(),
                 raw_start,
                 aligned,
-                expect_log: manifest_at_boot.is_some(),
+                // A crash after saving manifest can leave descriptor logs missing
+                expect_log: manifest_at_boot.is_some() && bootstrap_end_lsn.is_none(),
                 start_lsn_override,
                 history_rx: shared.history_rx.clone(),
                 shadow_state: shadow_state.clone(),
@@ -891,6 +954,7 @@ async fn session_body(
                     attach.clone(),
                 ),
                 io: io.clone(),
+                metrics: metrics.clone(),
             };
             let (mut t, sink) = tenant::open_tenant(boot, Some(&mut tasks)).await?;
             // SIGHUP and `ctl reload` republish every database's scope
@@ -989,6 +1053,11 @@ async fn session_body(
             }
         }
     }
+    // Manifest and every tenant's descriptor logs now preserve the resume
+    // position, so the bootstrap marker can go
+    if bootstrap_end_lsn.is_some() {
+        walshadow::bootstrap_marker::BootstrapMarker::complete(shadow_start.data_dir()).await?;
+    }
     // Records the filter drops count under the boot tenant's decoder: the
     // single-database layout's one, or the first tenant's, since the filter
     // sees the stream before any routing
@@ -1008,15 +1077,19 @@ async fn session_body(
     )));
     let fsync_fatal = walshadow::pipeline::Fatal::new();
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel::<SegFsync>(SEGMENT_FSYNC_QUEUE);
-    let mut fsync_task = spawn_segment_fsync(
-        args.out_dir.clone(),
-        fsync_rx,
-        durable_lsn.clone(),
-        fsync_fatal.clone(),
-    );
+    // Prior session's writes joined in `run_session`, so no temp is live
+    let stale_temps = remove_stale_temps(&args.out_dir)
+        .await
+        .context("remove stale out-dir write temps")?;
+    if stale_temps > 0 {
+        tracing::info!(target: "walshadow::retention", count = stale_temps, "removed stale write temps");
+    }
     let mut segment_sink =
         DirSegmentSink::with_durability(args.out_dir.clone(), WAL_SEG_SIZE, fsync_tx, io.clone())
             .context("open out-dir")?;
+    let out_dir = std::fs::File::open(&args.out_dir).context("open out-dir for syncfs")?;
+    let mut fsync_task =
+        spawn_segment_fsync(out_dir, fsync_rx, durable_lsn.clone(), fsync_fatal.clone());
     // Pruners' floor for the crossing commit; each tenant's descriptor-log
     // GC follows the floors the pump publishes to it
     let gc_floor = Monotone::<Floor>::default();
@@ -1043,6 +1116,7 @@ async fn session_body(
                 args.retention_bytes,
                 shadow_conninfo.clone(),
                 shadow_replay_lsn.clone(),
+                DEFAULT_TRIM_INTERVAL,
             ),
         );
     }
@@ -1056,38 +1130,13 @@ async fn session_body(
     // attachment fails startup: catalog-boundary holds require a live wire,
     // and archive-only operation can't stop publication at a mid-segment
     // commit (restore_command must never observe unreleased bytes).
-    {
-        let timeout = Duration::from_secs(args.walsender_connect_timeout);
-        let start = Instant::now();
-        loop {
-            let agg = shadow_state.lock().await.aggregate();
-            if agg.active_connections > 0 {
-                break;
-            }
-            // `accepted` separates "shadow never dialed" from "shadow dialed
-            // and stalled in the handshake" — the latter reads as the former
-            // without it, since only START_REPLICATION registers a connection
-            anyhow::ensure!(
-                start.elapsed() < timeout,
-                "no walreceiver streaming from walsender {walsender_addr} within \
-                 {}s (accepted {}, none sent START_REPLICATION); catalog-boundary \
-                 holds require a live wire — point shadow's primary_conninfo here \
-                 or raise --walsender-connect-timeout",
-                args.walsender_connect_timeout,
-                agg.accepted_total,
-            );
-            or_signal(shutdown, async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(())
-            })
-            .await?;
-        }
-        tracing::info!(
-            target: "walshadow",
-            wait = ?start.elapsed(),
-            "walsender connected — starting pump",
-        );
-    }
+    await_walreceiver(
+        &shadow_state,
+        walsender_addr,
+        Duration::from_secs(args.walsender_connect_timeout),
+        shutdown,
+    )
+    .await?;
 
     let mut source_recovery = SourceRecovery {
         system_id: live_identity.system_id,
@@ -1177,7 +1226,7 @@ async fn session_body(
     // ancestor's switchpoint an ordinary reconnect has nothing to ask for
     let mut crossing = CrossingState::default();
     let mut barrier_logged: Option<Instant> = None;
-    let shutdown_reason = 'pump: loop {
+    let shutdown_reason = loop {
         // Switch timelines at a switchpoint. Reconnecting may find a switchpoint
         // missing from `history`; use that connection to fetch updated history.
         if matches!(path, SourcePath::AtSwitchpoint) {
@@ -1571,18 +1620,7 @@ async fn session_body(
         {
             if polled_at.is_none_or(|t| t.elapsed() >= PROMOTION_POLL) {
                 *polled_at = Some(Instant::now());
-                promotion = match tokio::time::timeout(
-                    PROMOTION_POLL,
-                    promotion_gate(&mut feed, *pause_received),
-                )
-                .await
-                {
-                    Ok(gate) => gate,
-                    Err(_) => {
-                        feed.drop_sql_client();
-                        PromotionGate::unreachable()
-                    }
-                };
+                promotion = promotion_gate(&mut feed, *pause_received).await;
             }
         } else {
             promotion = PromotionGate::blocked("not_paused");
@@ -1766,14 +1804,50 @@ async fn session_body(
             .unwrap_or(received.get());
         if let Some(chunk) = chunk {
             let replay_started = Instant::now();
-            stream
-                .push(
-                    chunk.start_lsn,
-                    chunk.data,
-                    &mut record_sink,
-                    &mut segment_sink,
-                )
-                .await?;
+            let push = stream.push(
+                chunk.start_lsn,
+                chunk.data,
+                &mut record_sink,
+                &mut segment_sink,
+            );
+            tokio::pin!(push);
+            loop {
+                let status_due = feed.parked_status_due();
+                tokio::select! {
+                    biased;
+                    result = &mut push => {
+                        result?;
+                        break;
+                    }
+                    () = async {
+                        shutdown.cancelled().await;
+                        // k16 fork: any tenant's catalog-boundary hold can park the pump
+                        let mut parked: futures::stream::FuturesUnordered<_> = tenants
+                            .iter()
+                            .map(|t| {
+                                let mut rx = t.boundary_hold_stats.parked.subscribe();
+                                async move {
+                                    let _ = rx.wait_for(|&parked| parked).await;
+                                }
+                            })
+                            .collect();
+                        if futures::StreamExt::next(&mut parked).await.is_none() {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        // Shadow may never replay the boundary, and a partial push
+                        // cannot publish a new resume cursor
+                        tracing::info!(target: "walshadow", "stopping during catalog boundary hold");
+                        return Ok(());
+                    }
+                    Some(err) = tasks.exited() => return Err(err),
+                    res = &mut fsync_task => return Err(task_stopped("segment fsync", res, &fsync_fatal)),
+                    () = async { tokio::time::sleep_until(status_due.unwrap()).await },
+                        if matches!(path, SourcePath::Live) && status_due.is_some() => {
+                        feed.send_parked_status(status).await;
+                    }
+                }
+            }
             if archived_segment {
                 metrics
                     .update(|snap| {
@@ -1878,35 +1952,14 @@ async fn session_body(
             && !crossing.awaiting_connection()
             && let Some(probed) = crossing.fork().cloned()
         {
-            // Both fork proofs read the decoder's view, so the pump-side queue
-            // drains first: a record still in flight answers for a frontier the
-            // decoder has not reached, which would read as a transaction left
-            // open at the fork
+            // Read before the guards: with the source arms parked, an empty
+            // queue stays empty, so the decoder's view they read is final
             record_sink
                 .decoder_xact
                 .flush()
                 .await
                 .context("flush queueing decoder sink at the fork")?;
-            let fence = Instant::now();
-            let in_flight = loop {
-                let n = record_sink.decoder_xact.in_flight();
-                if n == 0 || fence.elapsed() >= FORK_FENCE_DRAIN {
-                    break n;
-                }
-                tokio::select! {
-                    () = shutdown.cancelled() => break 'pump "signal",
-                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
-                }
-            };
-            // Timeout stops queue drain only, fork guards remain authoritative
-            if in_flight != 0 {
-                tracing::warn!(
-                    target: "walshadow",
-                    in_flight,
-                    waited = ?fence.elapsed(),
-                    "fork fence gave up draining the pump queue — guards decide",
-                );
-            }
+            let pump_in_flight = record_sink.decoder_xact.in_flight();
             let (guards, resume_safe) = {
                 let progress = tenant::aggregate(&tenants, durable).await;
                 (
@@ -1922,6 +1975,7 @@ async fn session_body(
             // meanwhile, so a wait reads as a wait rather than a stall, and the
             // source has stopped producing so nothing queues up behind it
             let open = match (walshadow::transition::ForkBarrier {
+                pump_in_flight,
                 resume_safe_lsn: resume_safe,
                 shadow_apply_lsn: (shadow_replay.get() != 0).then_some(shadow_replay),
                 filter_durable: durable,
@@ -2265,10 +2319,7 @@ async fn session_body(
         .close()
         .await
         .context("write final filtered segment")?;
-    let res = fsync_task.await;
-    if res.is_err() || fsync_fatal.is_set() {
-        return Err(task_stopped("segment fsync", res, &fsync_fatal));
-    }
+    task_finished("segment fsync", fsync_task.await, &fsync_fatal)?;
     drop(gc_floor);
     if let Some(task) = registry_poller.take() {
         task.abort();
@@ -2328,11 +2379,21 @@ async fn session_body(
     tasks.shutdown().await
 }
 
+/// Source PG major, refusing any whose commit-record sinval layout is unaudited
+fn supported_major(server_version_num: i32) -> Result<u32> {
+    let major = (server_version_num / 10000) as u32;
+    anyhow::ensure!(
+        (16..=19).contains(&major),
+        "source PG major {major} unsupported (commit-record sinval layout audited for 16-19)",
+    );
+    Ok(major)
+}
+
 /// Session tasks meant to run until shutdown; any exit before it is fatal
 #[derive(Default)]
 pub(crate) struct SessionTasks {
     set: tokio::task::JoinSet<()>,
-    names: ahash::HashMap<tokio::task::Id, &'static str>,
+    names: foldhash::HashMap<tokio::task::Id, &'static str>,
 }
 
 impl SessionTasks {
@@ -2398,6 +2459,28 @@ pub(crate) fn task_stopped(
     }
 }
 
+/// Join of a task told to finish, failing on a panic or a fatal it set
+fn task_finished(
+    name: &str,
+    res: Result<(), tokio::task::JoinError>,
+    fatal: &walshadow::pipeline::Fatal,
+) -> Result<()> {
+    if res.is_err() || fatal.is_set() {
+        return Err(task_stopped(name, res, fatal));
+    }
+    Ok(())
+}
+
+fn substitute_database(databases: &[String], absent: &str, replacement: &str) -> Vec<String> {
+    let mut seen = foldhash::HashSet::default();
+    databases
+        .iter()
+        .map(|db| if db == absent { replacement } else { db })
+        .filter(|db| seen.insert(*db))
+        .map(str::to_owned)
+        .collect()
+}
+
 async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str) -> Option<String> {
     if probe_blocking(shadow, |s| s.has_database()).await != Some(false) {
         return None;
@@ -2417,6 +2500,20 @@ async fn stand_in_primary(shadow: &Arc<walshadow::shadow::Shadow>, absent: &str)
 mod tests {
     use super::*;
     use walshadow::ch_emitter::InstanceConfig;
+
+    #[test]
+    fn stand_in_reuses_an_already_followed_database() {
+        for databases in [["late", "postgres", "early"], ["postgres", "late", "early"]] {
+            assert_eq!(
+                substitute_database(&databases.map(String::from), "late", "postgres"),
+                ["postgres", "early"]
+            );
+        }
+        assert_eq!(
+            substitute_database(&["early".into(), "late".into()], "late", "postgres"),
+            ["early", "postgres"]
+        );
+    }
 
     #[tokio::test]
     async fn boot_redials_clickhouse_that_drops_connections() {
@@ -2454,5 +2551,156 @@ mod tests {
             "{err}"
         );
         tasks.shutdown().await.expect("idle task aborts cleanly");
+    }
+
+    #[test]
+    fn supported_major_spans_audited_sinval_layouts() {
+        assert_eq!(supported_major(160_004).unwrap(), 16);
+        assert_eq!(supported_major(190_000).unwrap(), 19);
+        let err = supported_major(150_008).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "source PG major 15 unsupported (commit-record sinval layout audited for 16-19)"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_task_panic_propagates_and_fails_shutdown() {
+        let mut tasks = SessionTasks::default();
+        tasks.adopt("quits", tokio::spawn(async {}));
+        let err = tasks.exited().await.unwrap().to_string();
+        assert_eq!(err, "quits task exited");
+        tasks.adopt("panics", tokio::spawn(async { panic!("boom") }));
+        let err = tasks.exited().await.unwrap().to_string();
+        assert!(
+            err.starts_with("panics task failed") && err.ends_with("\"boom\""),
+            "{err}"
+        );
+        tasks.spawn("idle", std::future::pending());
+        tasks.spawn("panics", async { panic!("boom") });
+        tokio::task::yield_now().await;
+        let err = tasks.shutdown().await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("panics task failed") && err.ends_with("\"boom\""),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_stopped_prefers_fatal_over_join_result() {
+        let fatal = walshadow::pipeline::Fatal::new();
+        let exited = task_stopped("gc", Ok(()), &fatal).to_string();
+        assert_eq!(exited, "gc task exited");
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        let failed = task_stopped("gc", panicked, &fatal).to_string();
+        assert!(failed.starts_with("gc task failed") && failed.contains("boom"));
+        fatal.set("disk gone".into());
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        assert_eq!(
+            task_stopped("gc", panicked, &fatal).to_string(),
+            "gc failed: disk gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_task_fails_on_panic_or_fatal() {
+        let fatal = walshadow::pipeline::Fatal::new();
+        task_finished("fsync", Ok(()), &fatal).unwrap();
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        let err = task_finished("fsync", panicked, &fatal).unwrap_err();
+        assert!(err.to_string().starts_with("fsync task failed"), "{err}");
+        fatal.set("syncfs out-dir: EIO".into());
+        let err = task_finished("fsync", Ok(()), &fatal).unwrap_err();
+        assert_eq!(err.to_string(), "fsync failed: syncfs out-dir: EIO");
+    }
+
+    #[tokio::test]
+    async fn walreceiver_wait_names_the_walsender_when_none_attaches() {
+        let state = Mutex::new(walshadow::shadow_stream::ShadowStreamState::new(
+            1,
+            "1".into(),
+            0,
+            1,
+        ));
+        let addr = "127.0.0.1:5555".parse().unwrap();
+        let shutdown = CancellationToken::new();
+        let err = await_walreceiver(&state, addr, Duration::ZERO, &shutdown)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("walsender 127.0.0.1:5555 within 0s (accepted 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn followed_databases_fit_bridge_seats() {
+        assert_eq!(followed_databases(None, "app").unwrap(), ["app"]);
+        let seats = walshadow::bridge::MAX_BRIDGE_DATABASES;
+        let mut cfg = EmitterConfig {
+            databases: (0..seats).map(|i| format!("db{i}")).collect(),
+            ..EmitterConfig::default()
+        };
+        assert_eq!(
+            followed_databases(Some(&cfg), "app").unwrap(),
+            cfg.databases
+        );
+        cfg.databases.push("one-more".into());
+        assert!(followed_databases(Some(&cfg), "app").is_err());
+    }
+
+    #[test]
+    fn boot_manifest_refuses_foreign_and_unreadable_unless_overridden() {
+        let spill = std::path::Path::new("/spill");
+        let identity = |system_id| manifest::SourceIdentity {
+            system_id,
+            timeline: 1,
+            timeline_begin: Pos::ZERO,
+        };
+        let foreign = || manifest::ManifestError::ForeignSource {
+            stored: identity(1),
+            live: identity(2),
+        };
+        assert!(boot_manifest(Ok(None), false, spill).unwrap().is_none());
+        let err = boot_manifest(Err(foreign()), true, spill).unwrap_err();
+        assert!(err.to_string().contains("another source"), "{err}");
+        let unreadable = || Err(manifest::ManifestError::Version(99));
+        let err = boot_manifest(unreadable(), false, spill).unwrap_err();
+        assert!(
+            err.to_string().contains("--ignore-cursor / --start-lsn"),
+            "{err}"
+        );
+        assert!(boot_manifest(unreadable(), true, spill).unwrap().is_none());
+    }
+
+    #[test]
+    fn start_branch_needs_lineage_unless_cursor_ignored() {
+        let promoted = || TimelineHistory::parse(2, b"1\t0/3000000\tpromoted\n").unwrap();
+        let aligned = Pos::new(0x400_0000);
+        let mut history = promoted();
+        assert_eq!(start_branch(&mut history, 2, aligned, 2, false).unwrap(), 2);
+        assert_eq!(history.entries().len(), 2);
+        let err = start_branch(&mut history, 3, aligned, 2, false).unwrap_err();
+        assert!(
+            err.to_string().starts_with("timeline_not_descendant"),
+            "{err}"
+        );
+        assert_eq!(start_branch(&mut history, 3, aligned, 2, true).unwrap(), 2);
+        assert_eq!(
+            history.entries().len(),
+            1,
+            "re-baselined onto a root history"
+        );
+    }
+
+    #[test]
+    fn branch_begin_refuses_sibling_unless_cursor_ignored() {
+        assert!(check_branch_begin(2, 0, 0x300_0000, false).is_ok());
+        assert!(check_branch_begin(1, 0, 0, false).is_ok());
+        assert!(check_branch_begin(2, 0x300_0000, 0x300_0000, false).is_ok());
+        let err = check_branch_begin(2, 0x300_0000, 0x500_0000, false).unwrap_err();
+        assert!(err.to_string().starts_with("sibling_branch"), "{err}");
+        assert!(check_branch_begin(2, 0x300_0000, 0x500_0000, true).is_ok());
     }
 }

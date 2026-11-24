@@ -17,9 +17,8 @@
 //! `'object_store'` coalesce into a backup-sourced page-walk pass
 //! ([`crate::backfill::backup_backfill`], architecture/bootstrap.md). All
 //! converge with the WAL stream via `ReplacingMergeTree(_lsn)` dedup, and the
-//! backfiller's ledger dedups restarts. `None` (backfiller not wired) streams
-//! from the opt-in LSN only; so do unknown mode strings (validate-late, never
-//! crash).
+//! backfiller's ledger dedups restarts. Unknown mode strings stream from the
+//! opt-in LSN only (validate-late, never crash).
 
 use std::sync::Arc;
 
@@ -66,7 +65,7 @@ pub async fn apply_table_opt_in(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    backfiller: Option<&Arc<dyn Backfiller>>,
+    backfiller: &Arc<dyn Backfiller>,
     rel: &RelName,
     row: &TableRow,
     opt_in_lsn: u64,
@@ -93,7 +92,7 @@ pub async fn apply_table_opt_in_deferred(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    backfiller: Option<&Arc<dyn Backfiller>>,
+    backfiller: &Arc<dyn Backfiller>,
     rel: &RelName,
     row: &TableRow,
     opt_in_lsn: u64,
@@ -101,17 +100,26 @@ pub async fn apply_table_opt_in_deferred(
 ) -> Result<(), EmitterError> {
     match row.replicate {
         Some(true) => {
-            let desc = catalog
-                .lock()
-                .await
-                .descriptor_by_name(rel)
-                .await
-                .map_err(|error| EmitterError::Catalog(error.to_string()))?;
-            match desc {
-                Some(desc) => {
-                    if shadow_serves_toast(resolver, catalog, &desc).await? {
+            let resolved = async {
+                let Some(desc) = catalog.lock().await.descriptor_by_name(rel).await? else {
+                    return anyhow::Ok(None);
+                };
+                let served = shadow_serves_toast(resolver, catalog, &desc).await?;
+                anyhow::Ok(Some((desc, served)))
+            }
+            .await
+            .map_err(|error| EmitterError::Catalog(error.to_string()))?;
+            match resolved {
+                Some((desc, served)) => {
+                    if served {
                         opt_in_known(
-                            resolver, applicator, backfiller, &desc, row, opt_in_lsn, deferred,
+                            resolver,
+                            applicator,
+                            Some(backfiller),
+                            &desc,
+                            row,
+                            opt_in_lsn,
+                            deferred,
                         )
                         .await?;
                     }
@@ -143,13 +151,11 @@ async fn shadow_serves_toast(
     resolver: &ConfigResolver,
     catalog: &Arc<Mutex<ShadowCatalog>>,
     desc: &RelDescriptor,
-) -> Result<bool, EmitterError> {
+) -> anyhow::Result<bool> {
     let Some(held) = resolver.shadow_toast() else {
         return Ok(true);
     };
-    crate::toast::shadow_landing::serves_toast(catalog, held, desc)
-        .await
-        .map_err(|error| EmitterError::Catalog(error.to_string()))
+    crate::toast::shadow_landing::serves_toast(catalog, held, desc).await
 }
 
 /// When a `CREATE TABLE` lands, materialise a parked forward-declaration for
@@ -179,8 +185,7 @@ pub async fn materialize_pending_on_added(
     Ok(())
 }
 
-/// Create the CH table (idempotent) then register the opt-in mapping. Skips the
-/// mapping if the shape can't be bridged so no rows route to a missing table.
+/// Create the CH table (idempotent) then register the opt-in mapping
 async fn opt_in_known(
     resolver: &ConfigResolver,
     applicator: &mut DdlApplicator,
@@ -218,9 +223,7 @@ async fn opt_in_known(
     {
         applicator.defer_snowflake_publication(desc)?;
     }
-    if !applicator.ensure_ch_table(desc).await? {
-        return Ok(());
-    }
+    applicator.ensure_ch_table(desc).await?;
     if let Some(mapping) = snowflake_mapping {
         resolver.materialize_prepared_opt_in(desc, mapping).await;
     } else {

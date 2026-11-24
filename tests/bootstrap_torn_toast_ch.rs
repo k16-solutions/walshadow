@@ -19,11 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use futures::StreamExt;
-use tokio_tar::{Archive, Builder};
 use walrus::compression;
 use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup::push::{self, PushArgs};
+use walrus::pg::backup::tarball::{Reader, Writer};
 use walrus::pg::backup::{list, parse_pg_lsn, sentinel_key, tar_partitions_prefix};
 use walrus::pg::replication::conn::PgConfig;
 use walrus::pg::wal;
@@ -40,6 +39,8 @@ const UPDATED_ID: i32 = 1;
 const DELETED_ID: i32 = 2;
 const SCHEMA: &str = "s21";
 
+/// Hint all base rows but last: hinted ones hand back from drain, last one
+/// spools behind visibility gate
 fn load_base_workload(source: &Shadow) -> Result<()> {
     let sql = format!(
         "CREATE SCHEMA {SCHEMA};\n\
@@ -49,7 +50,10 @@ fn load_base_workload(source: &Shadow) -> Result<()> {
          ALTER TABLE {SCHEMA}.t REPLICA IDENTITY FULL;\n\
          INSERT INTO {SCHEMA}.t \
            SELECT g, repeat('base-'||g::text||'---', {BODY_REPEAT}) \
-           FROM generate_series(1, {N_BASE}) g;\n\
+           FROM generate_series(1, {N_BASE} - 1) g;\n\
+         SELECT count(*) FROM {SCHEMA}.t;\n\
+         INSERT INTO {SCHEMA}.t \
+           VALUES ({N_BASE}, repeat('base-{N_BASE}---', {BODY_REPEAT}));\n\
          CHECKPOINT;\n\
          SELECT pg_switch_wal();\n",
     );
@@ -207,24 +211,20 @@ async fn rewrite_tar_entry(tar_path: &Path, rel: &str, body: &[u8]) -> Result<bo
     let file = tokio::fs::File::open(tar_path)
         .await
         .with_context(|| format!("open {}", tar_path.display()))?;
-    let mut archive = Archive::new(file);
-    let mut entries = archive.entries()?;
-    let mut out = Builder::new(Vec::new());
+    let mut archive = Reader::new(file);
+    let mut out = Writer::new(Vec::new());
     let mut replaced = false;
-    while let Some(entry) = entries.next().await {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        let mut header = entry.header().clone();
-        let bare = path.strip_prefix(".").unwrap_or(&path);
-        if bare == Path::new(rel) {
-            header.set_size(body.len() as u64);
-            out.append_data(&mut header, &path, body).await?;
+    while let Some((mut entry, entry_body)) = archive.next().await? {
+        let path = Path::new(&entry.path);
+        if path.strip_prefix(".").unwrap_or(path) == Path::new(rel) {
+            entry.size = body.len() as u64;
+            out.append(&entry, body).await?;
             replaced = true;
         } else {
-            out.append_data(&mut header, &path, &mut entry).await?;
+            out.append(&entry, entry_body).await?;
         }
     }
-    let bytes = out.into_inner().await?;
+    let bytes = out.finish().await?;
     tokio::fs::write(tar_path, bytes)
         .await
         .with_context(|| format!("rewrite {}", tar_path.display()))?;
@@ -441,12 +441,14 @@ async fn torn_backup_drops_window_rows_and_stays_fatal_for_older_ones() {
             !status.success(),
             "daemon exited cleanly after a fatal miss"
         );
-        // Missing values and absent mirrors report different errors
         let stderr = fatal_daemon.stderr();
         ensure!(
-            stderr.contains("remedy: fresher backup") || stderr.contains("no mirror for db"),
-            "load aborted on something other than an unreadable value"
+            stderr.contains("bootstrap deferred resolve: bootstrap: relation")
+                && stderr.contains("remedy: fresher backup"),
+            "load aborted on something other than an unreadable handed-back value"
         );
+        let landed = ch.query("SELECT count() FROM default.t_fatal")?;
+        ensure!(landed == "0", "{landed} rows landed from an aborted load");
         Ok(())
     })();
     fatal_daemon.stop_shadow();

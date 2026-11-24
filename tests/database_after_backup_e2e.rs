@@ -79,6 +79,8 @@ async fn a_database_created_after_the_backup_is_followed_once_replay_creates_it(
 
     let source = fx::start_source(&tmp);
     let _src_stop = fx::StopOnDrop { sh: &source };
+    // k16 fork: upstream also follows an `early` database here through
+    // `[database.*]` sections; the fork follows further databases as tenants
 
     // 1. Back the cluster up before the database exists
     let storage_root = tmp.path().join("wal-g");

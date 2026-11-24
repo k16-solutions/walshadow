@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, TypeAst};
+use clickhouse_c::{Allocator, Block, BlockBuilder, ColumnBuilder, Event, QueryOpts, TypeAst};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -16,16 +16,14 @@ use tokio_util::task::AbortOnDropHandle;
 
 use bytes::Bytes;
 
-use crate::ch::{
-    ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident, with_timeout,
-};
+use crate::ch::{ChConn, EmitterError, drain_to_end_of_stream, is_retryable, quote_ident};
 use crate::decode::heap_decoder::{
     ColumnValue, ToastPointer, VARLENA_EXTSIZE_BITS, VARLENA_EXTSIZE_MASK, decompress_varlena,
 };
 use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, InlineValueOverflow, ToastMode};
 use crate::toast::read_ahead::{PendingReads, ReadValue, retained_bytes};
 use crate::xact::spill::{BodyRef, BodySpoolFile, ToastChunk, ToastDelete};
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// `(toast_relid, value_id) -> chunk_seq -> bytes`; bodies shared with
 /// mirror rows via `Bytes`
@@ -554,27 +552,24 @@ impl ChunkStore for MemChunkStore {
                 })
                 .or_insert(r);
         }
-        let mut newest: HashMap<u32, BTreeMap<u32, (u64, &[u8])>> = HashMap::new();
-        for r in latest.into_values() {
-            if r.is_tombstone() || !wanted.contains(&r.chunk_id) {
-                continue;
-            }
+        let mut live: Vec<&ToastRow> = latest
+            .into_values()
+            .filter(|r| !r.is_tombstone() && wanted.contains(&r.chunk_id))
+            .collect();
+        // Newest copy of a chunk wins, as across TIDs after a rewrite
+        live.sort_by_key(|r| r.lsn);
+        let mut newest: HashMap<u32, BTreeMap<u32, &[u8]>> = HashMap::new();
+        for r in live {
             newest
                 .entry(r.chunk_id)
                 .or_default()
-                .entry(r.chunk_seq)
-                .and_modify(|e| {
-                    if r.lsn >= e.0 {
-                        *e = (r.lsn, &r.chunk_data);
-                    }
-                })
-                .or_insert((r.lsn, &r.chunk_data));
+                .insert(r.chunk_seq, &r.chunk_data);
         }
         values
             .iter()
             .map(|&(value_id, expected_size)| {
                 let mut asm = ChunkAssembler::new(expected_size);
-                for (&seq, (_, body)) in newest.get(&value_id).into_iter().flatten() {
+                for (&seq, body) in newest.get(&value_id).into_iter().flatten() {
                     asm.push(seq, body).map_err(ChunkStoreError::Clickhouse)?;
                 }
                 Ok(asm.finish())
@@ -661,7 +656,6 @@ pub async fn adopt_legacy_mirrors(
         &mut client,
         "SELECT name FROM system.tables \
          WHERE database = currentDatabase() AND match(name, '^pg_toast_[1-9][0-9]*$')",
-        cfg.insert_timeout,
     )
     .await?
     .iter()
@@ -697,7 +691,6 @@ pub async fn adopt_legacy_mirrors(
                 quote_ident(&format!("pg_toast_{relid}")),
                 quote_ident(&mirror_table_name(owner, relid))
             ),
-            cfg.insert_timeout,
         )
         .await?;
     }
@@ -853,21 +846,20 @@ impl ClickHouseChunkStore {
         sql: &str,
         bb: Option<&BlockBuilder<'_>>,
     ) -> Result<(), EmitterError> {
-        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry_when(
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async move {
-                    let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                    let result = async {
+                        client.send_query(sql, &QueryOpts::new()).await?;
                         if let Some(bb) = bb {
-                            client.send_data(Some(bb)).await?;
+                            client.send_data(bb).await?;
                             client.send_data_end().await?;
                         }
                         drain_to_end_of_stream(&mut client).await?;
                         Ok(())
-                    })
+                    }
                     .await;
                     (client, result)
                 },
@@ -946,18 +938,24 @@ impl ClickHouseChunkStore {
         sql: &str,
         parse: impl Fn(&Block, &mut A) -> Result<(), EmitterError>,
     ) -> Result<A, EmitterError> {
-        let insert_timeout = self.dest.current().insert_timeout;
         state
             .client
             .retry_when(
                 |e| is_retryable(e) && !is_missing_mirror(e),
                 |mut client| async {
-                    let result = with_timeout(insert_timeout, async {
-                        client.send_query(sql, None).await?;
+                    let result = async {
+                        client.send_query(sql, &QueryOpts::new()).await?;
                         let mut out = A::default();
                         loop {
                             match client.recv_event().await? {
-                                Event::Data(block) => parse(&block, &mut out)?,
+                                Event::Data(block) => {
+                                    if let Err(e) = parse(&block, &mut out) {
+                                        // Next query on this connection must
+                                        // start at its own answer
+                                        drain_to_end_of_stream(&mut client).await?;
+                                        return Err(e);
+                                    }
+                                }
                                 Event::EndOfStream => break,
                                 Event::Exception(exc) => {
                                     return Err(EmitterError::ServerException {
@@ -970,7 +968,7 @@ impl ClickHouseChunkStore {
                             }
                         }
                         Ok(out)
-                    })
+                    }
                     .await;
                     (client, result)
                 },
@@ -987,8 +985,8 @@ impl ClickHouseChunkStore {
         toast_relid: u32,
         ids: &[u32],
         max_lsn: u64,
-        expected: &HashMap<u32, usize>,
-    ) -> Result<HashMap<u32, ChunkAssembler>, ChunkStoreError> {
+        expected: &HashMap<u32, (usize, usize)>,
+    ) -> Result<Vec<(u32, ChunkAssembler)>, ChunkStoreError> {
         let sql = self.fetch_sql(db_oid, toast_relid, ids, max_lsn);
         let mut state = self.slot().await;
         self.query_locked(&mut state, &sql, |block, out| {
@@ -1017,13 +1015,11 @@ fn is_missing_mirror(error: &EmitterError) -> bool {
     )
 }
 
-/// Feed one result block into per-value assemblers, sized off `expected` at
-/// a value's first chunk. Seq order is validated per value across block
-/// boundaries (final `ORDER BY chunk_id, chunk_seq` is the contract)
+/// SQL orders chunks by value id and sequence across result blocks
 fn read_value_block(
     block: &Block,
-    expected: &HashMap<u32, usize>,
-    out: &mut HashMap<u32, ChunkAssembler>,
+    expected: &HashMap<u32, (usize, usize)>,
+    out: &mut Vec<(u32, ChunkAssembler)>,
 ) -> Result<(), EmitterError> {
     let n = block.n_rows();
     if n == 0 {
@@ -1051,8 +1047,18 @@ fn read_value_block(
         let seq = u32::from_le_bytes(seq_bytes[i * 4..i * 4 + 4].try_into().unwrap());
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
-        out.entry(id)
-            .or_insert_with(|| ChunkAssembler::new(expected.get(&id).copied().unwrap_or_default()))
+        if out.last().is_none_or(|(last, _)| *last != id) {
+            if out.last().is_some_and(|(last, _)| *last > id) {
+                return Err(EmitterError::Type(format!(
+                    "toast fetch: chunk_id {id}: fetch order contract broken"
+                )));
+            }
+            let size = expected.get(&id).map_or(0, |(_, size)| *size);
+            out.push((id, ChunkAssembler::new(size)));
+        }
+        out.last_mut()
+            .expect("assembler for current value")
+            .1
             .push(seq, &data[start..end])
             .map_err(|e| EmitterError::Type(format!("toast fetch: {e}")))?;
     }
@@ -1087,19 +1093,19 @@ impl ChunkStore for ClickHouseChunkStore {
         if values.is_empty() {
             return Ok(Vec::new());
         }
-        let mut expected: HashMap<u32, usize> = HashMap::with_capacity(values.len());
-        for &(id, size) in values {
-            let prev = expected.insert(id, size);
+        let mut expected = HashMap::with_capacity(values.len());
+        for (index, &(id, size)) in values.iter().enumerate() {
+            let prev = expected.insert(id, (index, size));
             debug_assert!(
-                prev.is_none_or(|prev| prev == size),
-                "batch contains value {id} from {} with two different stored sizes",
+                prev.is_none(),
+                "batch repeats value {id} from {}",
                 mirror_table_name(db_oid, toast_relid),
             );
         }
         let mut ids: Vec<u32> = expected.keys().copied().collect();
         // Ascending: a split's ids stay adjacent in the mirror's granules
         ids.sort_unstable();
-        let mut assembled: HashMap<u32, ChunkAssembler> = HashMap::with_capacity(ids.len());
+        let mut assembled = vec![FetchedValue::Missing; values.len()];
         let queries = ids.len().div_ceil(FETCH_QUERY_IDS).max(1);
         let width = ids.len().div_ceil(queries);
         let concurrency = queries.min(self.states.len());
@@ -1109,16 +1115,13 @@ impl ChunkStore for ClickHouseChunkStore {
             .collect();
         let mut batches = futures::stream::iter(split).buffer_unordered(concurrency);
         while let Some(batch) = batches.next().await {
-            assembled.extend(batch?);
+            for (id, chunks) in batch? {
+                if let Some(&(index, _)) = expected.get(&id) {
+                    assembled[index] = chunks.finish();
+                }
+            }
         }
-        Ok(values
-            .iter()
-            .map(|(id, _)| {
-                assembled
-                    .remove(id)
-                    .map_or(FetchedValue::Missing, ChunkAssembler::finish)
-            })
-            .collect())
+        Ok(assembled)
     }
 
     async fn truncate_mirror(&self, db_oid: u32, toast_relid: u32) -> Result<(), ChunkStoreError> {
@@ -1941,10 +1944,6 @@ impl GatedStore {
 #[cfg(test)]
 #[async_trait]
 impl ChunkStore for GatedStore {
-    fn accepts_writes(&self) -> bool {
-        true
-    }
-
     async fn put(&self, rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
         self.puts_started.fetch_add(1, Ordering::Relaxed);
         self.permits.acquire().await.unwrap().forget();
@@ -1978,6 +1977,28 @@ mod tests {
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
     use std::time::Duration;
+
+    /// Query orders by value id, so a smaller id after a larger one fails
+    #[test]
+    fn value_ids_out_of_order_are_refused() {
+        use clickhouse_c::{BlockOpts, BlockReader, SliceIo};
+        // chunk_id [8, 7], chunk_seq [0, 0], chunk_data ['a', 'b']
+        let native = b"\x03\x02\x08chunk_id\x06UInt32\x08\0\0\0\x07\0\0\0\
+            \x09chunk_seq\x06UInt32\0\0\0\0\0\0\0\0\
+            \x0achunk_data\x06String\x01a\x01b";
+        let mut io = SliceIo::new(native);
+        let mut reader =
+            BlockReader::new(io.as_mut(), Allocator::default(), BlockOpts::default()).unwrap();
+        let block = reader.read().unwrap().unwrap();
+        let expected = [(8, (0, 1)), (7, (1, 1))].into_iter().collect();
+        let mut out = Vec::new();
+        let e = read_value_block(&block, &expected, &mut out).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "type: toast fetch: chunk_id 7: fetch order contract broken"
+        );
+        assert_eq!(out.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [8]);
+    }
 
     fn row(value_id: u32, seq: u32, tid: (u32, u16), lsn: u64, body: &[u8]) -> ToastRow {
         ToastRow {
@@ -2050,6 +2071,80 @@ mod tests {
         puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
         let err = puts.flush().await.unwrap_err();
         assert!(err.to_string().contains("gated failure"), "{err}");
+    }
+
+    /// Put task panic resurfaces on the joining caller
+    #[tokio::test]
+    async fn flush_resumes_put_panic() {
+        let (store, mut puts) = gated_puts(GatedStore::new());
+        store.permits.close();
+        puts.push(row(7, 0, (1, 1), 1, b"a")).await.unwrap();
+        let joined = tokio::spawn(async move { puts.flush().await }).await;
+        assert!(joined.unwrap_err().is_panic());
+    }
+
+    /// Put cancelled by its runtime shutting down surfaces as an error
+    #[test]
+    fn flush_surfaces_put_cancelled_by_shutdown() {
+        let rt = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let (_store, mut puts) = gated_puts(GatedStore::new());
+        let doomed = rt();
+        doomed
+            .block_on(puts.push(row(7, 0, (1, 1), 1, b"a")))
+            .unwrap();
+        doomed.shutdown_background();
+        let err = rt().block_on(puts.flush()).unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storeless_and_empty_calls_are_noops() {
+        let r = ToastResolver::disabled();
+        r.put_batched(&[row(7, 0, (1, 1), 1, b"a")]).await.unwrap();
+        r.put_row_refs(None, &[]).await.unwrap();
+        let stored = ToastResolver::with_store(Arc::new(MemChunkStore::new()), Arc::default());
+        let got = stored.fetch_stored(0, 16500, &[], 1).await.unwrap();
+        assert_eq!(got, Some(Vec::new()));
+    }
+
+    /// Older row of a TID arriving after a newer one keeps the newer as
+    /// latest; only a live latest below the marker earns a residual tombstone
+    #[tokio::test(flavor = "current_thread")]
+    async fn mem_rewrite_barrier_keys_latest_row_per_tid() {
+        let store = MemChunkStore::new();
+        let tomb = ToastRow::tombstone(&ToastDelete {
+            db_oid: 0,
+            toast_relid: 16500,
+            blkno: 1,
+            offnum: 1,
+            source_lsn: 20,
+        });
+        store
+            .put(&[
+                tomb,
+                row(7, 0, (1, 1), 10, b"a"),
+                row(8, 0, (1, 2), 10, b"b"),
+            ])
+            .await
+            .unwrap();
+        store.rewrite_barrier(0, 16500, 30, 40).await.unwrap();
+        assert_eq!(
+            store.fetch(0, 16500, 7, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 8, 39, 1).await.unwrap(),
+            assembled(b"b")
+        );
+        assert_eq!(
+            store.fetch(0, 16500, 8, u64::MAX, 1).await.unwrap(),
+            FetchedValue::Missing
+        );
     }
 
     const PG_LZ4_CHUNKS: &[u8] = include_bytes!("testdata/compressed_external_lz4.bin");
@@ -2839,28 +2934,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_mirror_flush_stays_failed_and_keeps_rows() {
-        #[derive(Default)]
-        struct Failing(AtomicUsize);
-        #[async_trait]
-        impl ChunkStore for Failing {
-            fn accepts_writes(&self) -> bool {
-                true
-            }
-            async fn put(&self, _rows: &[ToastRow]) -> Result<(), ChunkStoreError> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                Err(ChunkStoreError::Clickhouse("down".into()))
-            }
-            async fn fetch_many(
-                &self,
-                _db_oid: u32,
-                _toast_relid: u32,
-                _values: &[(u32, usize)],
-                _max_lsn: u64,
-            ) -> Result<Vec<FetchedValue>, ChunkStoreError> {
-                unreachable!()
-            }
-        }
-        let store = Arc::new(Failing::default());
+        let store = Arc::new(GatedStore {
+            fail: true,
+            ..GatedStore::new()
+        });
+        store.permits.add_permits(8);
         let budget = crate::budget::MemoryBudget::new(1 << 20);
         let r =
             ToastResolver::with_store(store.clone(), Arc::default()).with_budget(budget.clone());
@@ -2869,7 +2947,8 @@ mod tests {
         assert!(held > 0);
         assert!(r.flush_mirror().await.is_err());
         assert!(r.flush_mirror().await.is_err());
-        assert_eq!(store.0.load(Ordering::Relaxed), 1, "no retry after failure");
+        let puts = store.puts_started.load(Ordering::Relaxed);
+        assert_eq!(puts, 1, "no retry after failure");
         assert_eq!(budget.resident_bytes(), held, "rows outlive failed INSERT");
     }
 

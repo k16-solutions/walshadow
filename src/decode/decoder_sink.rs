@@ -3,8 +3,7 @@
 //!
 //! WAL commits drain through the parallel [`pipeline`](crate::emit::pipeline);
 //! [`TupleObserver`] is the greenfield-bootstrap page-walk drain destination
-//! (`drain_backfill`). Catalog gate timeouts poison the stream, so no
-//! `replay_timeout` counter: silent loss is impossible by construction.
+//! (`drain_backfill`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -125,7 +124,6 @@ crate::atomic_stats! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SkipReason {
     UnfollowedDb,
-    ForeignDb,
     NotCovered,
     Retired,
     Unresolvable,
@@ -140,7 +138,6 @@ impl SkipReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::UnfollowedDb => "unfollowed_db",
-            Self::ForeignDb => "foreign_db",
             Self::NotCovered => "not_covered",
             Self::Retired => "retired",
             Self::Unresolvable => "unresolvable",
@@ -155,11 +152,7 @@ impl SkipReason {
     pub fn expected(self) -> bool {
         matches!(
             self,
-            Self::UnfollowedDb
-                | Self::ForeignDb
-                | Self::Retired
-                | Self::NoTuple
-                | Self::IndexDropped
+            Self::UnfollowedDb | Self::Retired | Self::NoTuple | Self::IndexDropped
         )
     }
 }
@@ -314,7 +307,7 @@ impl DecoderStats {
         use std::fmt::Write as _;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!("decoded={}", ld(&self.decoded));
-        let pairs: [(&str, u64); 11] = [
+        let pairs: [(&str, u64); 12] = [
             ("ins", ld(&self.inserts)),
             ("upd", ld(&self.updates)),
             ("hot", ld(&self.hot_updates)),
@@ -326,15 +319,12 @@ impl DecoderStats {
             ("toast", ld(&self.toast_chunks_buffered)),
             ("toast_bad", ld(&self.toast_chunks_malformed)),
             ("toast_del", ld(&self.toast_chunk_deletes)),
+            ("skip_op", ld(&self.skipped_op)),
         ];
         for (label, n) in pairs {
             if n > 0 {
                 write!(&mut s, " {label}={n}").unwrap();
             }
-        }
-        let skip_op = ld(&self.skipped_op);
-        if skip_op > 0 {
-            write!(&mut s, " skip_op={skip_op}").unwrap();
         }
         s
     }
@@ -433,6 +423,8 @@ mod tests {
         assert!(!out.contains("upd="), "{out}");
         assert!(!out.contains("hot="), "{out}");
         assert!(!out.contains("no_blk="), "{out}");
+        s.skipped_op.store(4, Ordering::Relaxed);
+        assert!(s.summary().ends_with(" skip_op=4"));
     }
 
     #[test]

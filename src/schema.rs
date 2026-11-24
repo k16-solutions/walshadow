@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// `FirstNormalObjectId`, PG src/include/access/transam.h
 pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -163,15 +163,15 @@ impl ReplIdent {
             'd' => Ok(ReplIdent::Default { pk_attnums }),
             'n' => Ok(ReplIdent::Nothing),
             'f' => Ok(ReplIdent::Full { pk_attnums }),
-            'i' => {
-                let (index_oid, key_attnums) = using_index.ok_or_else(|| {
-                    "relreplident='i' but no pg_index row with indisreplident=true".to_owned()
-                })?;
-                Ok(ReplIdent::UsingIndex {
-                    index_oid,
-                    key_attnums,
-                })
-            }
+            // PG treats a dropped identity index as NOTHING, relreplident stays 'i'
+            'i' => Ok(
+                using_index.map_or(ReplIdent::Nothing, |(index_oid, key_attnums)| {
+                    ReplIdent::UsingIndex {
+                        index_oid,
+                        key_attnums,
+                    }
+                }),
+            ),
             other => Err(format!(
                 "unknown relreplident {other:?} (expected one of d/n/f/i)"
             )),
@@ -347,6 +347,19 @@ pub(crate) fn int4_rel(oid: Oid, name: &str, kind: char, columns: &[(i16, &str)]
 mod tests {
     use super::*;
     use tokio_postgres::types::Oid;
+
+    #[test]
+    fn replident_missing_index_is_nothing_and_unknown_code_errors() {
+        assert_eq!(
+            ReplIdent::from_parts('i', None, None).unwrap(),
+            ReplIdent::Nothing
+        );
+        assert!(
+            ReplIdent::from_parts('x', None, None)
+                .unwrap_err()
+                .contains("'x'")
+        );
+    }
 
     fn mk_attr(attnum: i16, name: &str, oid: Oid, not_null: bool) -> RelAttr {
         RelAttr {

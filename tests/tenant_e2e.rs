@@ -168,8 +168,6 @@ impl Harness {
             "direct",
             "--bootstrap-shadow-data-dir",
             shadow_data.to_str().unwrap(),
-            "--bootstrap-shadow-replay-timeout",
-            "120",
             "--bridge-lib-dir",
             pgext_dir.to_str().unwrap(),
         ]

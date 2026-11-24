@@ -4,8 +4,8 @@
 //! landed in place by the backup, then replayed. Index filenodes are absent
 //! from the catalog seed, so the source answers for them.
 
-use ahash::{HashMap, HashSet, HashSetExt};
 use anyhow::{Context, Result, bail, ensure};
+use foldhash::{HashMap, HashSet, HashSetExt};
 use tokio::sync::Mutex;
 
 use crate::catalog::shadow_catalog::ShadowCatalog;
@@ -137,9 +137,6 @@ pub async fn toast_relations<'a>(
         heaps.push(d.rfn.rel_node);
         out.insert((db_oid, d.rfn.rel_node));
     }
-    if heaps.is_empty() {
-        return Ok(out);
-    }
     // Reuse authenticated sidecar client from catalog seed
     // Interpolate because client has no `oid[]` Rust mapping
     let list = heaps
@@ -166,11 +163,11 @@ pub async fn toast_relations<'a>(
         .context("bootstrap: read toast index filenodes")?;
     for row in &rows {
         let spc = row.get::<_, i64>(2) as u32;
+        let index: String = row.get(1);
         ensure!(
             spc == DEFAULT_TABLESPACE_OID,
-            "bootstrap: TOAST index {} is in tablespace {spc}; \
+            "bootstrap: TOAST index {index} is in tablespace {spc}; \
              [toast] mode = shadow keeps files from default tablespace only",
-            row.get::<_, String>(1),
         );
         out.insert((db_oid, row.get::<_, i64>(0) as u32));
     }

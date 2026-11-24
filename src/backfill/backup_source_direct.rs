@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
-use walrus::pg::backup::format_pg_lsn;
+use walrus::pg::backup::{format_pg_lsn, tarball};
 use walrus::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, run_base_backup,
 };
@@ -155,21 +155,21 @@ impl BackupSource for DirectSource {
             bail!("DirectSource: BASE_BACKUP pump task panicked: {e:#}");
         }
 
-        let start = start.ok_or_else(|| anyhow::anyhow!("DirectSource: no StartInfo emitted"))?;
-        let end = end.ok_or_else(|| anyhow::anyhow!("DirectSource: no EndInfo emitted"))?;
+        let start = start.context("DirectSource: no StartInfo emitted")?;
+        let end = end.context("DirectSource: no EndInfo emitted")?;
         Ok((start, end))
     }
 }
 
 /// Drain one archive body through `pump_tar_to_sink`. wal-rus's
-/// `ChannelReader` is `AsyncRead`, so tokio_tar takes it directly, no
+/// `ChannelReader` is `AsyncRead`, so the tar reader takes it directly, no
 /// SyncIoBridge / spawn_blocking.
 async fn drive_archive(
     body: mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     target: &PumpTarget,
 ) -> Result<()> {
     let reader = ChannelReader::new(body);
-    let mut archive = tokio_tar::Archive::new(reader);
+    let mut archive = tarball::Reader::new(reader);
     pump_tar_to_sink(&mut archive, target)
         .await
         .context("DirectSource: tar unpack")?;

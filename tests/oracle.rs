@@ -314,6 +314,71 @@ async fn bootstrap_oracle_stops_cluster_on_source_error() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_names_catalog_it_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    source
+        .sh
+        .psql_one(
+            "CREATE ROLE restricted LOGIN;
+             REVOKE SELECT ON pg_catalog.pg_enum FROM PUBLIC",
+        )
+        .unwrap();
+    let client = source_client(&source.sh, "restricted", "oracle-seed").await;
+    let base = tmp.path().join("oracle");
+    let err = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[],
+        Some(pgext_dir()),
+        1,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .expect("provision fails");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.starts_with("seed catalog: copy pg_enum: ") && msg.contains("permission denied"),
+        "{msg}"
+    );
+    assert!(!oracle_shadow(&base).is_running().unwrap());
+}
+
+/// Bridge socket name outgrows `sun_path` where PG's own socket still fits
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_oracle_reports_bridge_sockets_it_cannot_dial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
+        return;
+    };
+    let client = source_client(&source.sh, "postgres", "oracle-seed").await;
+    let socket_dir_len = 90;
+    let pad = socket_dir_len - tmp.path().as_os_str().len() - "/sock".len() - 1;
+    let base = tmp.path().join("o".repeat(pad));
+    let err = BootstrapOracle::provision(
+        base.clone(),
+        &client,
+        &[],
+        Some(pgext_dir()),
+        1,
+        Duration::from_millis(300),
+    )
+    .await
+    .err()
+    .expect("provision fails");
+    let msg = format!("{err:#}");
+    let want = format!(
+        "bridge connect (0 of 1 worker sockets present under {}/sock; ",
+        base.display()
+    );
+    assert!(msg.starts_with(&want), "{msg}");
+    assert!(!oracle_shadow(&base).is_running().unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bootstrap_oracle_keeps_rows_sharing_oids_with_staging_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(source) = start_pg(&tmp, ports::PG_SOURCE_PORT) else {
@@ -362,7 +427,7 @@ async fn bootstrap_oracle_keeps_rows_sharing_oids_with_staging_objects() {
     .await
     .unwrap();
     let got = oracle_shadow(&base).psql_one(copied).unwrap();
-    let have: ahash::HashSet<&str> = got.split(',').collect();
+    let have: foldhash::HashSet<&str> = got.split(',').collect();
     let missing: Vec<&str> = expected.split(',').filter(|t| !have.contains(t)).collect();
     assert!(
         missing.is_empty(),
@@ -656,6 +721,43 @@ async fn oracle_defaults_fill_absent_cells() {
         .collect();
     assert_eq!(values, [b"".as_slice(), b"dictionary", b""]);
     assert_eq!(block.column(6).unwrap().array_offsets().unwrap(), [0, 0, 0]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oracle_text_value_routes_by_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(guard) = start_pg(&tmp, ports::PG_SHADOW_PORT) else {
+        return;
+    };
+    let bridge = Arc::new(bridge_on(&guard.sh).await);
+    let oracle = Oracle::per_database(vec![(5, bridge.clone()), (6, bridge)]);
+    let text = oracle
+        .text_value(6, NUMERICOID, -1, OracleCell::TextInput(b"042.50".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(text, "42.50");
+    let absent = oracle
+        .text_value(7, NUMERICOID, -1, OracleCell::TextInput(b"1".to_vec()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&absent, walshadow::oracle::OracleError::Absent(m) if m.contains("database 7")),
+        "{absent}"
+    );
+    let short = buf(NUMERICOID, Vec::new());
+    let columns = [OracleRequestColumn {
+        ordinal: 0,
+        name: "v",
+        target_type: "String",
+        buf: &short,
+    }];
+    let err = oracle
+        .encode_batch(5, &columns, 1, alloc())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("holds 0 cells"), "{err}");
+    assert_eq!(oracle.stats.blocks.load(Ordering::Relaxed), 1);
+    assert_eq!(oracle.stats.errors.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

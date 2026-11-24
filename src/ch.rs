@@ -2,16 +2,18 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use backon::BackoffBuilder;
 use clickhouse_c::tls::rustls::pki_types::ServerName;
 use clickhouse_c::{
-    AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind, Event,
+    Allocator, AsyncClient, Block, BoxedAsyncClient, ClientOpts, Codec, Compression, ErrorKind,
+    Event, Exception, QueryOpts,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 
 use crate::config::DestEmitter;
@@ -48,8 +50,6 @@ pub enum EmitterError {
     },
     #[error("CH server exception {code}: {message}")]
     ServerException { code: i32, message: String },
-    #[error("CH operation timed out after {secs}s")]
-    Timeout { secs: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,29 +89,32 @@ impl CompressionChoice {
     /// is configured for, so a client that installed one codec — or none —
     /// fails on the first frame it cannot decode
     pub fn build_codec(self) -> Result<Option<Pin<Box<Codec>>>, EmitterError> {
-        match self {
-            Self::Lz4 if !cfg!(feature = "lz4") => {
-                return Err(EmitterError::CompressionUnsupported("lz4"));
+        #[cfg(not(feature = "lz4"))]
+        if self == Self::Lz4 {
+            return Err(EmitterError::CompressionUnsupported("lz4"));
+        }
+        #[cfg(not(feature = "zstd"))]
+        if self == Self::Zstd {
+            return Err(EmitterError::CompressionUnsupported("zstd"));
+        }
+        #[cfg(any(feature = "lz4", feature = "zstd"))]
+        {
+            let mut codec = Codec::empty();
+            // Slots are per method and each init fills only its own, so one codec
+            // decodes both
+            unsafe {
+                let raw = codec.as_mut().raw_mut();
+                #[cfg(feature = "lz4")]
+                clickhouse_c::sys::chc_lz4_codec_init(raw);
+                #[cfg(feature = "zstd")]
+                clickhouse_c::sys::chc_zstd_codec_init(raw);
             }
-            Self::Zstd if !cfg!(feature = "zstd") => {
-                return Err(EmitterError::CompressionUnsupported("zstd"));
-            }
-            _ => {}
+            Ok(Some(codec))
         }
-        if !cfg!(any(feature = "lz4", feature = "zstd")) {
-            return Ok(None);
+        #[cfg(not(any(feature = "lz4", feature = "zstd")))]
+        {
+            Ok(None)
         }
-        let mut codec = Codec::empty();
-        // Slots are per method and each init fills only its own, so one codec
-        // decodes both
-        unsafe {
-            let raw = codec.as_mut().raw_mut();
-            #[cfg(feature = "lz4")]
-            clickhouse_c::sys::chc_lz4_codec_init(raw);
-            #[cfg(feature = "zstd")]
-            clickhouse_c::sys::chc_zstd_codec_init(raw);
-        }
-        Ok(Some(codec))
     }
 }
 
@@ -141,8 +144,10 @@ pub async fn connect_client(
         .user(config.user())
         .password(config.password());
     opts.compression = compression.to_wire();
+    let alloc = Allocator::global(&mimalloc::MiMalloc);
     let sock = TcpStream::connect((config.host(), config.port())).await?;
     sock.set_nodelay(true)?;
+    set_dead_peer_limits(&sock)?;
     let client = if config.secure() {
         let tls = config
             .tls_config()
@@ -152,11 +157,11 @@ pub async fn connect_client(
             .connect(server_name, sock)
             .await
             .map_err(|e| std::io::Error::new(e.kind(), format!("TLS handshake: {e}")))?;
-        AsyncClient::handshake_on(stream, opts, codec)
+        AsyncClient::handshake_on(stream, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     } else {
-        AsyncClient::handshake_on(sock, opts, codec)
+        AsyncClient::handshake_on(sock, &opts, alloc, codec)
             .await
             .map(AsyncClient::boxed)
     };
@@ -164,6 +169,22 @@ pub async fn connect_client(
         ErrorKind::Io | ErrorKind::Eof => EmitterError::HelloDropped(e),
         _ => e.into(),
     })
+}
+
+/// Fail I/O on a half-open connection without capping how long CH may run a
+/// query: keepalive probes go unanswered only when peer is gone, user timeout
+/// covers writes stuck unacknowledged, where keepalive does not probe
+fn set_dead_peer_limits(sock: &TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(sock);
+    sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(10))
+            .with_interval(Duration::from_secs(5))
+            .with_retries(3),
+    )?;
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(Duration::from_secs(30)))?;
+    Ok(())
 }
 
 /// SNI + certificate name for the TLS handshake: `tls_server_name` when
@@ -178,6 +199,15 @@ fn tls_server_name(config: &impl ConnectionConfig) -> Result<ServerName<'static>
         .map_err(|e| EmitterError::Config(format!("TLS server name `{name}`: {e}")))
 }
 
+impl From<Exception> for EmitterError {
+    fn from(exc: Exception) -> Self {
+        Self::ServerException {
+            code: exc.code(),
+            message: String::from_utf8_lossy(exc.display_text()).into_owned(),
+        }
+    }
+}
+
 /// Server finished the query; an INSERT's rows are durable
 pub struct EndOfStream(());
 
@@ -187,67 +217,61 @@ pub async fn drain_to_end_of_stream(
     loop {
         match client.recv_event().await? {
             Event::EndOfStream => return Ok(EndOfStream(())),
-            Event::Exception(exc) => {
-                return Err(EmitterError::ServerException {
-                    code: exc.code(),
-                    message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                });
-            }
+            Event::Exception(exc) => return Err(exc.into()),
             _ => {}
         }
     }
 }
 
-pub async fn with_timeout<T>(
-    duration: Duration,
-    future: impl Future<Output = Result<T, EmitterError>>,
-) -> Result<T, EmitterError> {
-    tokio::time::timeout(duration, future)
-        .await
-        .unwrap_or_else(|_| {
-            Err(EmitterError::Timeout {
-                secs: duration.as_secs(),
-            })
-        })
+pub async fn exec_drain(client: &mut BoxedAsyncClient, sql: &str) -> Result<(), EmitterError> {
+    client.send_query(sql, &QueryOpts::new()).await?;
+    drain_to_end_of_stream(client).await?;
+    Ok(())
 }
 
-pub async fn exec_drain(
-    client: &mut BoxedAsyncClient,
-    sql: &str,
-    timeout: Duration,
-) -> Result<(), EmitterError> {
-    with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
-        drain_to_end_of_stream(client).await?;
-        Ok(())
-    })
-    .await
-}
-
-/// Single-column String SELECT, one attempt under `timeout`
+/// Single-column String SELECT, one attempt
 pub async fn query_strings(
     client: &mut BoxedAsyncClient,
     sql: &str,
-    timeout: Duration,
 ) -> Result<Vec<String>, EmitterError> {
-    with_timeout(timeout, async {
-        client.send_query(sql, None).await?;
-        let mut out = Vec::new();
-        loop {
-            match client.recv_event().await? {
-                Event::Data(block) => read_string_column(&block, &mut out)?,
-                Event::EndOfStream => return Ok(out),
-                Event::Exception(exc) => {
-                    return Err(EmitterError::ServerException {
-                        code: exc.code(),
-                        message: String::from_utf8_lossy(exc.display_text()).into_owned(),
-                    });
-                }
-                _ => {}
-            }
+    client.send_query(sql, &QueryOpts::new()).await?;
+    let mut out = Vec::new();
+    loop {
+        match client.recv_event().await? {
+            Event::Data(block) => read_string_column(&block, &mut out)?,
+            Event::EndOfStream => return Ok(out),
+            Event::Exception(exc) => return Err(exc.into()),
+            _ => {}
         }
-    })
-    .await
+    }
+}
+
+/// Live INSERT attempts in flight, grouped by generation. INSERT resolves its
+/// table when it starts, so attempts begun before `EXCHANGE TABLES` may still
+/// write to the pre-swap storage
+pub struct InsertGate(Mutex<watch::Sender<()>>);
+
+pub static INSERT_GATE: LazyLock<InsertGate> = LazyLock::new(InsertGate::new);
+
+impl InsertGate {
+    fn new() -> Self {
+        Self(Mutex::new(watch::Sender::new(())))
+    }
+
+    /// Hold for the length of one INSERT attempt
+    #[must_use]
+    pub fn enter(&self) -> watch::Receiver<()> {
+        self.0.lock().expect("insert gate poisoned").subscribe()
+    }
+
+    /// Wait out every attempt entered before this call
+    pub async fn settle(&self) {
+        let next = watch::Sender::new(());
+        // A later settle waits on `next`, so it also waits out this generation
+        let _chain = next.subscribe();
+        let prior = std::mem::replace(&mut *self.0.lock().expect("insert gate poisoned"), next);
+        prior.closed().await;
+    }
 }
 
 /// Append one Data block's single String column into `out`; the 0-row
@@ -257,12 +281,10 @@ fn read_string_column(block: &Block, out: &mut Vec<String>) -> Result<(), Emitte
     if n == 0 {
         return Ok(());
     }
-    let col = block
-        .column(0)
-        .ok_or_else(|| EmitterError::Type("missing result column".into()))?;
-    let (offsets, data) = col
-        .string()
-        .ok_or_else(|| EmitterError::Type("result column not String".into()))?;
+    let col = block.column(0);
+    let Some((offsets, data)) = col.as_ref().and_then(|c| c.string()) else {
+        return Err(EmitterError::Type("result is not one String column".into()));
+    };
     for i in 0..n {
         let start = if i == 0 { 0 } else { offsets[i - 1] as usize };
         let end = offsets[i] as usize;
@@ -290,7 +312,6 @@ pub async fn connect_creating_database(
             "CREATE DATABASE IF NOT EXISTS {}",
             quote_ident(&cfg.conn.database)
         ),
-        cfg.insert_timeout,
     )
     .await?;
     tracing::info!(database = %cfg.conn.database, "created destination database");
@@ -318,7 +339,7 @@ pub struct ChConn {
     instance: Option<String>,
     selected: Option<Arc<EmitterConfig>>,
     active: Connection,
-    parked: ahash::HashMap<Option<String>, Connection>,
+    parked: foldhash::HashMap<Option<String>, Connection>,
     dest: Arc<DestEmitter>,
     dials: u64,
 }
@@ -474,7 +495,6 @@ pub fn is_retryable(error: &EmitterError) -> bool {
             | EmitterError::Client(_)
             | EmitterError::HelloDropped(_)
             | EmitterError::ServerException { .. }
-            | EmitterError::Timeout { .. }
     )
 }
 
@@ -487,6 +507,22 @@ pub fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::emit::ch_emitter::InstanceConfig;
+
+    #[tokio::test]
+    async fn settle_waits_for_attempts_entered_before_it() {
+        let gate = InsertGate::new();
+        let early = gate.enter();
+        let mut first = std::pin::pin!(gate.settle());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let late = gate.enter();
+        let mut second = std::pin::pin!(gate.settle());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        drop(early);
+        first.await;
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        drop(late);
+        second.await;
+    }
 
     /// `compression = "none"` still has to decode a compressed response: the
     /// wire flag says what we send, not what the server answers in. A server
@@ -531,13 +567,29 @@ mod tests {
             ..EmitterConfig::default()
         };
         let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()) });
-        let Err(e) = connect_client(&config).await else {
-            panic!("handshake succeeded against a dropped connection");
-        };
+        let e = connect_client(&config)
+            .await
+            .err()
+            .expect("handshake fails");
         server.await.unwrap();
         assert!(matches!(e, EmitterError::HelloDropped(_)), "{e:?}");
         assert!(is_retryable(&e));
         assert!(e.to_string().contains("IP access list"), "{e}");
+    }
+
+    #[test]
+    fn non_string_result_column_is_refused() {
+        use clickhouse_c::{Allocator, BlockOpts, BlockReader, SliceIo};
+        // One UInt8 column x, one row 42
+        let native = b"\x01\x01\x01x\x05UInt8\x2a";
+        let mut io = SliceIo::new(native);
+        let mut reader =
+            BlockReader::new(io.as_mut(), Allocator::default(), BlockOpts::default()).unwrap();
+        let block = reader.read().unwrap().unwrap();
+        let mut out = Vec::new();
+        let e = read_string_column(&block, &mut out).unwrap_err();
+        assert_eq!(e.to_string(), "type: result is not one String column");
+        assert_eq!(out, Vec::<String>::new());
     }
 
     #[test]

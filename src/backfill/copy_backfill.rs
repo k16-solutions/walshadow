@@ -59,8 +59,10 @@
 //! read at COPY EOF (the replay position when COPY reads a standby); nothing
 //! is gated on it.
 
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -75,7 +77,7 @@ use walrus::pg::backup::format_pg_lsn;
 use walrus::pg::replication::conn::PgConfig;
 
 use crate::backfill::backfill_staging::{self, StagingPlan, StagingRel, StagingSession};
-use crate::backfill::backfill_types::{BackupRequest, PassContext, PassOutcome};
+use crate::backfill::backfill_types::{BackupRequest, PassContext, PassError, PassOutcome};
 use crate::backfill::backup_checkpoint::BackupCheckpoint;
 use crate::backfill::backup_page_walk::{BOOTSTRAP_TUPLE_CHANNEL_CAP, BackfillTuple, CatalogMap};
 use crate::backfill::opt_in::Backfiller;
@@ -108,7 +110,7 @@ const COPY_SLAB_ROWS: usize = 1024;
 /// Decoded value bytes per hop. With
 /// [`BOOTSTRAP_TUPLE_CHANNEL_CAP`] this is the resident payload ceiling
 pub const COPY_SLAB_BYTES: usize = 1 << 20;
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
 const LEDGER_VERSION: u32 = 1;
@@ -129,6 +131,8 @@ const XID_STATUS_SQL: &str = "SELECT x, pg_xact_status((n - ((n - x) & 429496729
 /// an opt-in burst (several rows in one xact, or a boot seed) coalesces into
 /// one cluster-sized backup pass instead of one per table.
 const BACKUP_COALESCE_WINDOW: Duration = Duration::from_millis(1000);
+const PREFLIGHT_RETRY_FIRST: Duration = Duration::from_secs(30);
+const PREFLIGHT_RETRY_MAX: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // Resume ledger
@@ -343,6 +347,25 @@ impl Ledger {
         crate::fs::write_atomic(&self.dir, LEDGER_FILENAME, text.as_bytes()).await
     }
 
+    /// `false` when persist failed; entry stays swapped
+    async fn clear_swapped(&mut self, name: &RelName) -> bool {
+        let Some(rec) = self.entries.get_mut(name) else {
+            return true;
+        };
+        let prior = std::mem::replace(&mut rec.phase, Phase::Pending { copy: None });
+        let persisted = self.persist().await;
+        if let Err(e) = &persisted {
+            tracing::warn!(
+                target: "walshadow::backfill",
+                qname = %name,
+                error = %e,
+                "backfill ledger persist failed on swap clear",
+            );
+            self.entries.get_mut(name).expect("just present").phase = prior;
+        }
+        persisted.is_ok()
+    }
+
     async fn fallback_to_copy(
         &mut self,
         rel: &RelName,
@@ -380,6 +403,13 @@ impl Ledger {
         self.persist().await
     }
 
+    fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
+        let Phase::Pending { copy } = self.entries.get(rel)?.phase else {
+            return None;
+        };
+        copy
+    }
+
     fn pending_count(&self) -> u64 {
         self.entries.values().filter(|r| !r.done()).count() as u64
     }
@@ -390,6 +420,38 @@ impl Ledger {
             .filter(|r| !r.done() && r.mode == mode)
             .count() as u64
     }
+}
+
+pub async fn record_bootstrap_loads(
+    spill_dir: &Path,
+    system_id: u64,
+    mode: InitialLoadMode,
+    end_lsn: u64,
+    rels: impl IntoIterator<Item = RelName>,
+) -> std::io::Result<usize> {
+    let mut ledger = Ledger::load(spill_dir, system_id).await?;
+    let mut recorded = 0;
+    for rel in rels {
+        if let Some(rec) = ledger.entries.get(&rel)
+            && matches!(rec.phase, Phase::Swapped { .. })
+        {
+            continue;
+        }
+        ledger.entries.insert(
+            rel,
+            LedgerRec {
+                s_lsn: Pos::new(end_lsn),
+                mode,
+                phase: Phase::Done,
+                toast_seeded: false,
+            },
+        );
+        recorded += 1;
+    }
+    if recorded > 0 {
+        ledger.persist().await?;
+    }
+    Ok(recorded)
 }
 
 // ---------------------------------------------------------------------------
@@ -588,13 +650,13 @@ pub async fn copy_rows_into(
             slab_bytes = 0;
             tx.send(std::mem::take(&mut slab))
                 .await
-                .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+                .context("backfill: drain closed early")?;
         }
     }
     if !slab.is_empty() {
         tx.send(slab)
             .await
-            .map_err(|_| anyhow::anyhow!("backfill: drain closed early"))?;
+            .context("backfill: drain closed early")?;
     }
     Ok(rows)
 }
@@ -631,18 +693,17 @@ pub async fn copy_toast_into(
         quote_ident(&nsp),
         quote_ident(&rel),
     );
-    let copy = client.copy_out(&sql).await.map_err(|e| {
-        if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
-            anyhow::anyhow!(
+    let copy = match client.copy_out(&sql).await {
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => {
+            anyhow::bail!(
                 "backfill: source role cannot read {nsp}.{rel} of {}: seeding the chunk mirror \
                  needs USAGE on schema pg_toast and SELECT on its TOAST heaps; grant \
                  pg_read_all_data to the source role: {e}",
                 desc.rel_name,
             )
-        } else {
-            anyhow::Error::new(e).context("backfill: TOAST COPY out")
         }
-    })?;
+        copy => copy.context("backfill: TOAST COPY out")?,
+    };
     let stream = BinaryCopyOutStream::new(copy, &[Type::BYTEA; 4]);
     futures::pin_mut!(stream);
     let mut chunks = 0u64;
@@ -742,6 +803,8 @@ struct Inner {
     /// Backup-mode opt-ins awaiting their coalesce window; a mode's first
     /// enqueue spawns the pass runner, later ones ride the same pass.
     queued: HashMap<InitialLoadMode, Vec<BackupRequest>>,
+    preflight_retry: (Duration, Duration),
+    preflight_backoff: HashMap<InitialLoadMode, Duration>,
 }
 
 /// Owns the resume ledger and dispatches per-mode backfills: `'copy'` spawns
@@ -850,6 +913,8 @@ impl CopyBackfiller {
                 ledger,
                 active: HashSet::new(),
                 queued: HashMap::new(),
+                preflight_retry: (PREFLIGHT_RETRY_FIRST, PREFLIGHT_RETRY_MAX),
+                preflight_backoff: HashMap::new(),
             }),
             pending,
             pending_by_mode,
@@ -1031,32 +1096,26 @@ impl CopyBackfiller {
             });
             return;
         }
-        match mode {
-            InitialLoadMode::None => {}
-            InitialLoadMode::Copy => {
-                // Caller releases live apply past `S` once this returns
-                if let Err(e) = self.seed_toast(desc, s_lsn).await {
-                    tracing::error!(
-                        target: "walshadow::backfill",
-                        qname = %rel,
-                        error = %format!("{e:#}"),
-                        "backfill failed; entry stays pending (re-COPY on next boot)",
-                    );
-                    let mut inner = self.inner.lock().await;
-                    inner.active.remove(&rel);
-                    self.refresh_gauges(&inner.ledger);
-                    return;
-                }
-                let this = self.clone();
-                let desc = desc.clone();
-                tokio::spawn(async move { this.run(desc, s_lsn).await });
+        if spawn_pass {
+            let this = self.clone();
+            tokio::spawn(async move { this.run_backup_pass(mode).await });
+        } else if mode == InitialLoadMode::Copy {
+            // Caller releases live apply past `S` once this returns
+            if let Err(e) = self.seed_toast(desc, s_lsn).await {
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    qname = %rel,
+                    error = %format!("{e:#}"),
+                    "backfill failed; entry stays pending (re-COPY on next boot)",
+                );
+                let mut inner = self.inner.lock().await;
+                inner.active.remove(&rel);
+                self.refresh_gauges(&inner.ledger);
+                return;
             }
-            InitialLoadMode::BaseBackup | InitialLoadMode::ObjectStore => {
-                if spawn_pass {
-                    let this = self.clone();
-                    tokio::spawn(async move { this.run_backup_pass(mode).await });
-                }
-            }
+            let this = self.clone();
+            let desc = desc.clone();
+            tokio::spawn(async move { this.run(desc, s_lsn).await });
         }
     }
 
@@ -1064,6 +1123,10 @@ impl CopyBackfiller {
     pub fn with_backup_loads(mut self, allowed: bool) -> Self {
         self.backup_loads = allowed;
         self
+    }
+
+    pub async fn set_preflight_retry(&self, first: Duration, max: Duration) {
+        self.inner.lock().await.preflight_retry = (first, max);
     }
 
     /// Opt-out / row removal: drop the ledger entry so a later re-insert
@@ -1097,7 +1160,14 @@ impl CopyBackfiller {
     /// run one cluster-sized pass for every queued rel. Regime A: a failed
     /// pass falls back to COPY when enabled, otherwise stays pending.
     /// Failure never poisons the pump.
-    async fn run_backup_pass(self: Arc<Self>, mode: InitialLoadMode) {
+    fn run_backup_pass(
+        self: Arc<Self>,
+        mode: InitialLoadMode,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(self.backup_pass(mode))
+    }
+
+    async fn backup_pass(self: Arc<Self>, mode: InitialLoadMode) {
         tokio::time::sleep(self.coalesce_window).await;
         let reqs: Vec<BackupRequest> = {
             let mut inner = self.inner.lock().await;
@@ -1112,6 +1182,7 @@ impl CopyBackfiller {
         };
         match outcome {
             Ok(outcome) => {
+                self.inner.lock().await.preflight_backoff.remove(&mode);
                 tracing::info!(
                     target: "walshadow::backfill",
                     mode = mode.as_str(),
@@ -1131,7 +1202,26 @@ impl CopyBackfiller {
                     "backup backfill pass complete",
                 );
             }
-            Err(e) => {
+            Err(PassError::Preflight(e)) => {
+                let tables = reqs.len();
+                let delay = self.requeue_after_preflight(mode, reqs).await;
+                tracing::error!(
+                    target: "walshadow::backfill",
+                    mode = mode.as_str(),
+                    tables,
+                    retry_in = ?delay,
+                    error = %format!("{e:#}"),
+                    "backup backfill pass failed before reading the backup; tables stay pending",
+                );
+                let this = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    this.run_backup_pass(mode).await
+                });
+                return;
+            }
+            Err(PassError::Load(e)) => {
+                self.inner.lock().await.preflight_backoff.remove(&mode);
                 tracing::error!(
                     target: "walshadow::backfill",
                     mode = mode.as_str(),
@@ -1162,6 +1252,19 @@ impl CopyBackfiller {
             }
         }
         self.refresh_gauges(&inner.ledger);
+    }
+
+    async fn requeue_after_preflight(
+        &self,
+        mode: InitialLoadMode,
+        reqs: Vec<BackupRequest>,
+    ) -> Duration {
+        let mut inner = self.inner.lock().await;
+        let (first, max) = inner.preflight_retry;
+        let delay = inner.preflight_backoff.get(&mode).copied().unwrap_or(first);
+        inner.preflight_backoff.insert(mode, (delay * 2).min(max));
+        inner.queued.entry(mode).or_default().extend(reqs);
+        delay
     }
 
     async fn prepare_copy_fallback(&self, mode: InitialLoadMode, req: &BackupRequest) -> bool {
@@ -1199,13 +1302,39 @@ impl CopyBackfiller {
         &self,
         mode: InitialLoadMode,
         reqs: &[BackupRequest],
-    ) -> anyhow::Result<PassOutcome> {
+    ) -> Result<PassOutcome, PassError> {
         let emitter = self.dest.current();
         if let Some(runtime) = emitter.snowflake.clone() {
+            // Snowflake failures keep the copy fallback they had before the
+            // preflight/load split
             return self
                 .staged_pass_snowflake(mode, reqs, emitter, runtime)
-                .await;
+                .await
+                .map_err(PassError::Load);
         }
+        let (staging, ctx) = self
+            .prepare_staged(mode, reqs)
+            .await
+            .map_err(PassError::Preflight)?;
+        let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
+        self.hold_pending(&outcome).await;
+        self.publish_staged(&staging, reqs).await;
+        self.release_pending(&outcome).await;
+        BackupCheckpoint::discard(&ctx.scratch_dir)
+            .await
+            .map_err(PassError::Load)?;
+        tokio::fs::remove_file(ctx.scratch_dir.join("bootstrap_deferred.bin"))
+            .await
+            .ok();
+        Ok(outcome)
+    }
+
+    async fn prepare_staged(
+        &self,
+        mode: InitialLoadMode,
+        reqs: &[BackupRequest],
+    ) -> anyhow::Result<(StagingPlan, PassContext)> {
+        let emitter = self.dest.current();
         let scratch_dir = self.spill_dir.join("backup_backfill");
         let config = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
         let mut checkpoint = BackupCheckpoint::new(
@@ -1252,16 +1381,9 @@ impl CopyBackfiller {
             oracle: self.oracle.clone(),
             source_major: self.source_major,
             checkpoint,
+            checkpoint_period: crate::backfill::walk_barrier::WALK_CHECKPOINT_PERIOD,
         };
-        let outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, reqs).await?;
-        self.hold_pending(&outcome).await;
-        self.publish_staged(&staging, reqs).await;
-        self.release_pending(&outcome).await;
-        BackupCheckpoint::discard(&ctx.scratch_dir).await?;
-        tokio::fs::remove_file(ctx.scratch_dir.join("bootstrap_deferred.bin"))
-            .await
-            .ok();
-        Ok(outcome)
+        Ok((staging, ctx))
     }
 
     /// Record before EXCHANGE so a swap failing past `mark_swapped` leaves
@@ -1434,10 +1556,9 @@ impl CopyBackfiller {
         if swapped.is_empty() {
             return;
         }
-        // In-flight live INSERTs that resolved the pre-swap storage finish
-        // within one attempt cap (later attempts re-resolve the name to the
-        // swapped-in table); copy-back may start only once they've landed
-        tokio::time::sleep(self.dest.current().insert_timeout).await;
+        // Copy-back may start only once live INSERTs that resolved the
+        // pre-swap storage have landed; later attempts resolve the swapped-in table
+        crate::ch::INSERT_GATE.settle().await;
         for rel in swapped {
             if let Err(e) = self.finish_swapped(&mut sess, rel).await {
                 tracing::error!(
@@ -1580,11 +1701,15 @@ impl CopyBackfiller {
                     .schema_fingerprint(&rel.target.database, &rel.staging_table())
                     .await?;
                 if real_fp != staging_fp {
+                    // Swapped entry over missing staging reads as published
+                    anyhow::ensure!(
+                        self.inner.lock().await.ledger.clear_swapped(name).await,
+                        "swap clear unrecorded; staging kept for next boot"
+                    );
                     sess.drop_staging(&rel).await?;
                     if self.pending_rows.lock().await.discard_held(name) {
                         self.persist_pending().await;
                     }
-                    self.clear_swapped(name).await;
                     anyhow::bail!(
                         "destination schema changed before exchange; load discarded, entry re-pends"
                     );
@@ -1595,7 +1720,7 @@ impl CopyBackfiller {
             Some(_) => {}
         }
         self.activate_pending(name).await;
-        tokio::time::sleep(self.dest.current().insert_timeout).await;
+        crate::ch::INSERT_GATE.settle().await;
         sess.copy_back(&rel).await?;
         sess.drop_staging(&rel).await?;
         self.mark_done_entry(name).await;
@@ -1635,31 +1760,24 @@ impl CopyBackfiller {
     }
 
     async fn mark_done_entry(&self, name: &RelName) {
-        let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(name) {
+        self.update_entry(name, "next boot resumes (idempotent)", |rec| {
             rec.phase = Phase::Done;
-            if let Err(e) = inner.ledger.persist().await {
-                tracing::warn!(
-                    target: "walshadow::backfill",
-                    qname = %name,
-                    error = %e,
-                    "backfill ledger persist failed; next boot resumes (idempotent)",
-                );
-            }
-        }
-        self.refresh_gauges(&inner.ledger);
+        })
+        .await;
     }
 
-    async fn clear_swapped(&self, name: &RelName) {
+    /// Persist `update` of an entry opt-out has not removed; `lost` names
+    /// what a failed persist costs
+    async fn update_entry(&self, name: &RelName, lost: &str, update: impl FnOnce(&mut LedgerRec)) {
         let mut inner = self.inner.lock().await;
         if let Some(rec) = inner.ledger.entries.get_mut(name) {
-            rec.phase = Phase::Pending { copy: None };
+            update(rec);
             if let Err(e) = inner.ledger.persist().await {
                 tracing::warn!(
                     target: "walshadow::backfill",
                     qname = %name,
                     error = %e,
-                    "backfill ledger persist failed on swap clear",
+                    "backfill ledger persist failed; {lost}",
                 );
             }
         }
@@ -1961,28 +2079,16 @@ impl CopyBackfiller {
             chunks,
             "chunk mirror seeded from source TOAST heap",
         );
-        let mut inner = self.inner.lock().await;
-        if let Some(rec) = inner.ledger.entries.get_mut(&desc.rel_name) {
+        // Loss only repeats the seed, idempotent at equal TID and version
+        self.update_entry(&desc.rel_name, "restart re-seeds the chunk mirror", |rec| {
             rec.toast_seeded = true;
-            // Loss only repeats the seed, idempotent at equal TID and version
-            if let Err(e) = inner.ledger.persist().await {
-                tracing::warn!(
-                    target: "walshadow::backfill",
-                    qname = %desc.rel_name,
-                    error = %e,
-                    "backfill ledger persist failed; restart re-seeds the chunk mirror",
-                );
-            }
-        }
+        })
+        .await;
         Ok(())
     }
 
     async fn copy_cursor(&self, rel: &RelName) -> Option<CopyCursor> {
-        let inner = self.inner.lock().await;
-        let Phase::Pending { copy } = inner.ledger.entries.get(rel)?.phase else {
-            return None;
-        };
-        copy
+        self.inner.lock().await.ledger.copy_cursor(rel)
     }
 
     /// Cursor loss only costs a repeated chunk, so a failed persist logs
@@ -2199,6 +2305,141 @@ mod tests {
             decode_field(WireKind::Text, 0, &[0xFF, 0xFE]).unwrap(),
             ColumnValue::Bytea(vec![0xFF, 0xFE]),
         );
+        assert_eq!(
+            decode_field(WireKind::CastText, 1007, &[0xFF]).unwrap(),
+            ColumnValue::Bytea(vec![0xFF]),
+        );
+        assert!(decode_field(WireKind::NumericText, 0, &[0xFF]).is_err());
+    }
+
+    /// PostgreSQL binary COPY uses each type's `typsend` format
+    #[test]
+    fn every_native_kind_decodes_its_send_bytes() {
+        let uuid = *b"0123456789abcdef";
+        for (oid, kind, raw, want) in [
+            (BOOLOID, WireKind::Bool, vec![0], ColumnValue::Bool(false)),
+            (
+                CHAROID,
+                WireKind::Char,
+                vec![b'x'],
+                ColumnValue::Char(b'x' as i8),
+            ),
+            (
+                INT2OID,
+                WireKind::Int2,
+                (-2i16).to_be_bytes().to_vec(),
+                ColumnValue::Int2(-2),
+            ),
+            (
+                INT4OID,
+                WireKind::Int4,
+                5i32.to_be_bytes().to_vec(),
+                ColumnValue::Int4(5),
+            ),
+            (
+                MONEYOID,
+                WireKind::Int8,
+                1234i64.to_be_bytes().to_vec(),
+                ColumnValue::Int8(1234),
+            ),
+            (
+                XIDOID,
+                WireKind::Oid,
+                77u32.to_be_bytes().to_vec(),
+                ColumnValue::Oid(77),
+            ),
+            (
+                PG_LSNOID,
+                WireKind::Oid8,
+                (1u64 << 40).to_be_bytes().to_vec(),
+                ColumnValue::Oid8(1 << 40),
+            ),
+            (
+                FLOAT4OID,
+                WireKind::Float4,
+                1.5f32.to_be_bytes().to_vec(),
+                ColumnValue::Float4(1.5),
+            ),
+            (
+                FLOAT8OID,
+                WireKind::Float8,
+                (-0.25f64).to_be_bytes().to_vec(),
+                ColumnValue::Float8(-0.25),
+            ),
+            (
+                DATEOID,
+                WireKind::Date,
+                (-1i32).to_be_bytes().to_vec(),
+                ColumnValue::Date(-1),
+            ),
+            (
+                TIMEOID,
+                WireKind::Time,
+                3_600_000_000i64.to_be_bytes().to_vec(),
+                ColumnValue::Time(3_600_000_000),
+            ),
+            (
+                TIMESTAMPOID,
+                WireKind::Timestamp,
+                9i64.to_be_bytes().to_vec(),
+                ColumnValue::Timestamp(9),
+            ),
+            (
+                TIMESTAMPTZOID,
+                WireKind::TimestampTz,
+                10i64.to_be_bytes().to_vec(),
+                ColumnValue::TimestampTz(10),
+            ),
+            (
+                UUIDOID,
+                WireKind::Uuid,
+                uuid.to_vec(),
+                ColumnValue::Uuid(uuid),
+            ),
+            (
+                BYTEAOID,
+                WireKind::Bytea,
+                vec![0, 0xFF],
+                ColumnValue::Bytea(vec![0, 0xFF]),
+            ),
+            (
+                BPCHAROID,
+                WireKind::Text,
+                b"ab ".to_vec(),
+                ColumnValue::Text("ab ".into()),
+            ),
+            (
+                NAMEOID,
+                WireKind::Name,
+                b"rel".to_vec(),
+                ColumnValue::Name("rel".into()),
+            ),
+            (
+                JSONOID,
+                WireKind::Json,
+                b"[]".to_vec(),
+                ColumnValue::Json("[]".into()),
+            ),
+        ] {
+            assert_eq!(wire_kind(oid), Some(kind), "oid {oid}");
+            assert_eq!(decode_field(kind, oid, &raw).unwrap(), want, "oid {oid}");
+            let variable = matches!(
+                kind,
+                WireKind::Bytea | WireKind::Text | WireKind::Name | WireKind::Json
+            );
+            assert_eq!(
+                decode_field(kind, oid, &[0; 17]).is_ok(),
+                variable,
+                "oid {oid}: only fixed-width kinds reject a wrong width"
+            );
+        }
+        for oid in [OIDOID, CIDOID] {
+            assert_eq!(wire_kind(oid), Some(WireKind::Oid));
+        }
+        for oid in [OID8OID, XID8OID] {
+            assert_eq!(wire_kind(oid), Some(WireKind::Oid8));
+        }
+        assert_eq!(wire_kind(NUMERICOID), None);
     }
 
     #[tokio::test]
@@ -2256,6 +2497,92 @@ mod tests {
         assert_eq!(resumed.entries[&rel].mode, InitialLoadMode::Copy);
         assert_eq!(resumed.entries[&rel].s_lsn.get(), 100);
         assert!(!resumed.entries[&rel].done());
+    }
+
+    #[tokio::test]
+    async fn clear_swap_after_opt_out_leaves_ledger_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        let name = RelName::new("app", "orders");
+        ledger.entries.insert(
+            name.clone(),
+            LedgerRec {
+                s_lsn: 100.into(),
+                mode: InitialLoadMode::BaseBackup,
+                phase: Phase::Swapped {
+                    staging_uuid: "uuid".into(),
+                    staging_target: None,
+                },
+                toast_seeded: false,
+            },
+        );
+        ledger.entries.remove(&name);
+        ledger.persist().await.unwrap();
+        assert!(ledger.clear_swapped(&name).await);
+        assert!(
+            Ledger::load(tmp.path(), 7)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_loads_record_done_entries_and_keep_swaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orders = RelName::new("app", "orders");
+        let users = RelName::new("app", "users");
+        let swapped = RelName::new("app", "swapped");
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        ledger.entries.insert(
+            orders.clone(),
+            LedgerRec {
+                s_lsn: 50.into(),
+                mode: InitialLoadMode::Copy,
+                phase: Phase::Pending { copy: None },
+                toast_seeded: false,
+            },
+        );
+        ledger.entries.insert(
+            swapped.clone(),
+            LedgerRec {
+                s_lsn: 50.into(),
+                mode: InitialLoadMode::ObjectStore,
+                phase: Phase::Swapped {
+                    staging_target: None,
+                    staging_uuid: "uuid".into(),
+                },
+                toast_seeded: false,
+            },
+        );
+        ledger.persist().await.unwrap();
+        let recorded = record_bootstrap_loads(
+            tmp.path(),
+            7,
+            InitialLoadMode::ObjectStore,
+            100,
+            [orders.clone(), users.clone(), swapped.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded, 2);
+        let again = Ledger::load(tmp.path(), 7).await.unwrap();
+        for rel in [&orders, &users] {
+            assert!(again.entries[rel].done());
+            assert_eq!(again.entries[rel].s_lsn.get(), 100);
+            assert_eq!(again.entries[rel].mode, InitialLoadMode::ObjectStore);
+        }
+        assert!(matches!(
+            again.entries[&swapped].phase,
+            Phase::Swapped { .. }
+        ));
+        assert_eq!(
+            record_bootstrap_loads(tmp.path(), 7, InitialLoadMode::ObjectStore, 100, [])
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2379,6 +2706,67 @@ mod tests {
             corrupt.to_string().contains("orphan `__wsstg`"),
             "corrupt ledger stops boot rather than orphaning staging: {corrupt}"
         );
+
+        tokio::fs::write(
+            tmp.path().join(LEDGER_FILENAME),
+            "version = 99\nsystem_id = 7\n",
+        )
+        .await
+        .unwrap();
+        let future = Ledger::load(tmp.path(), 7).await.err().unwrap();
+        assert!(
+            future.to_string().contains("unsupported version 99"),
+            "{future}"
+        );
+
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(LEDGER_FILENAME)).unwrap();
+        let unreadable = Ledger::load(unreadable.path(), 7).await.err().unwrap();
+        assert_eq!(unreadable.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn copy_cursor_advances_only_pending_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(tmp.path(), 7).await.unwrap();
+        let cursor = CopyCursor {
+            relfilenode: 16400,
+            next_block: 8,
+        };
+        let pending = RelName::new("app", "orders");
+        let done = RelName::new("app", "done");
+        ledger
+            .note_copy(&RelName::new("app", "absent"), cursor)
+            .await
+            .unwrap();
+        assert!(
+            !tmp.path().join(LEDGER_FILENAME).exists(),
+            "absent entry writes nothing"
+        );
+        for (rel, phase) in [
+            (&pending, Phase::Pending { copy: None }),
+            (&done, Phase::Done),
+        ] {
+            ledger.entries.insert(
+                rel.clone(),
+                LedgerRec {
+                    s_lsn: 100.into(),
+                    mode: InitialLoadMode::Copy,
+                    phase,
+                    toast_seeded: false,
+                },
+            );
+        }
+        ledger.note_copy(&pending, cursor).await.unwrap();
+        ledger.note_copy(&done, cursor).await.unwrap();
+        assert_eq!(ledger.copy_cursor(&pending), Some(cursor));
+        assert_eq!(ledger.copy_cursor(&done), None);
+        let again = Ledger::load(tmp.path(), 7).await.unwrap();
+        assert_eq!(
+            again.entries[&pending].phase,
+            Phase::Pending { copy: Some(cursor) }
+        );
+        assert_eq!(again.entries[&done].phase, Phase::Done);
     }
 
     #[tokio::test]

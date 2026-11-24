@@ -106,6 +106,7 @@ impl CopyBackfiller {
                 oracle: self.oracle.clone(),
                 source_major: self.source_major,
                 checkpoint,
+                checkpoint_period: crate::backfill::walk_barrier::WALK_CHECKPOINT_PERIOD,
             };
             outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, &active_reqs).await?;
             BackupCheckpoint::discard(&ctx.scratch_dir).await?;

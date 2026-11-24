@@ -2,9 +2,9 @@
 //!
 //! Consumes raw pg_wal segment files (16 MiB each by default, the on-disk
 //! format pg_receivewal and a running primary write to pg_wal/).
-//! Compressed archives (`.zst`/`.gz`/`.lz4`/`.lzma`/`.br`, optional
+//! Compressed archives (`.zst`/`.lz4`/`.gz`/`.lzma`/`.br`, optional
 //! `.partial` peer) are auto-detected by suffix and decoded via wal-rus's
-//! `open_segment_file`.
+//! `open_segment_file`, each codec gated on its cargo feature.
 
 use std::path::PathBuf;
 
@@ -23,7 +23,8 @@ use walshadow::classify::Summary;
 )]
 struct Args {
     /// WAL segment files to scan, in LSN order. Compression suffix
-    /// (.zst .gz .lz4 .lzma .br) auto-detected; `.partial` peer accepted.
+    /// (.zst .lz4 .gz .lzma .br) auto-detected, each needs its cargo feature;
+    /// `.partial` peer accepted.
     #[arg(required = true)]
     files: Vec<PathBuf>,
 
@@ -68,14 +69,9 @@ async fn walk_segment<R: AsyncRead + Unpin>(
             return Ok(());
         }
         let buf = &page[..n];
-        let (_, records) = parser
-            .parse_records_from_page(buf)
-            .map_err(|e| anyhow::anyhow!("parse page: {e}"))?;
+        let (_, records) = parser.parse_records_from_page(buf).context("parse page")?;
         for rec in &records {
             summary.observe(rec);
-        }
-        if n < page.len() {
-            return Ok(());
         }
     }
 }

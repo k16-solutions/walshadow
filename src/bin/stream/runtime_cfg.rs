@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use ahash::HashSet;
 use anyhow::Context;
+use foldhash::HashSet;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use walshadow::config::ResolvedConfig;
@@ -14,11 +14,13 @@ use walshadow::runtime_config::InitialLoadMode;
 use walshadow::schema::RelName;
 use walshadow::shadow_catalog::ShadowCatalog;
 
+/// Reload on each `sig` item, returning once signals end
 pub(crate) async fn sighup_reload(
-    mut sig: tokio::signal::unix::Signal,
+    mut sig: impl futures::Stream<Item = ()> + Unpin,
     reloader: Arc<walshadow::control::Reloader>,
 ) {
-    while sig.recv().await.is_some() {
+    use futures::StreamExt;
+    while sig.next().await.is_some() {
         tracing::info!(target: "walshadow", "SIGHUP — live reload");
         match reloader.reload().await {
             Err(e) => {
@@ -91,18 +93,17 @@ pub(crate) async fn load_runtime_config(
     // errors here, so a schema named but not installed refuses to start rather
     // than silently no-op (explicit opt-in). config_global is the singleton, so
     // 0 rows (greenfield) is fine — all TOML defaults then apply.
+    let missing = format!(
+        "runtime_config schema {schema:?} not installed (config_global unreadable); \
+         set [runtime_config] schema = \"\" to disable the overlay"
+    );
     if let Some(row) = client
         .query_opt(
             &format!("SELECT * FROM {s}.config_global WHERE id = 1"),
             &[],
         )
         .await
-        .with_context(|| {
-            format!(
-                "runtime_config schema {schema:?} not installed (config_global unreadable); \
-                 set [runtime_config] schema = \"\" to disable the overlay"
-            )
-        })?
+        .context(missing)?
     {
         overlay.global = Some(GlobalRow {
             row_budget: row.get("row_budget"),
@@ -217,45 +218,28 @@ pub(crate) async fn load_runtime_config(
 
 pub(crate) async fn apply_toml_initial_loads(
     catalog: &Arc<Mutex<ShadowCatalog>>,
-    backfiller: Option<&Arc<walshadow::copy_backfill::CopyBackfiller>>,
-    table_initial_loads: &ahash::HashMap<RelName, String>,
+    backfiller: &Arc<walshadow::copy_backfill::CopyBackfiller>,
+    table_initial_loads: &foldhash::HashMap<RelName, InitialLoadMode>,
     active_tables: &HashSet<RelName>,
     sql_scoped_tables: &HashSet<RelName>,
     raw_start: u64,
 ) -> anyhow::Result<()> {
-    for (rel, mode) in table_initial_loads {
-        if !active_tables.contains(rel) || sql_scoped_tables.contains(rel) {
-            continue;
-        }
-        match mode.parse() {
-            Ok(InitialLoadMode::None) => {}
-            Ok(parsed) => {
-                let desc = catalog.lock().await.descriptor_by_name(rel).await?;
-                let Some(desc) = desc else {
-                    tracing::warn!(
-                        target: "walshadow::config",
-                        qname = %rel,
-                        "TOML initial_load ignored: source rel unknown",
-                    );
-                    continue;
-                };
-                match backfiller {
-                    Some(b) => b.note_opt_in(&desc, parsed, raw_start).await,
-                    None => tracing::info!(
-                        target: "walshadow::config",
-                        qname = %rel,
-                        mode,
-                        "TOML initial_load requested but no backfiller wired; streaming from start LSN only",
-                    ),
-                }
-            }
-            Err(_) => tracing::warn!(
+    let wanted = table_initial_loads.iter().filter(|(rel, mode)| {
+        **mode != InitialLoadMode::None
+            && active_tables.contains(*rel)
+            && !sql_scoped_tables.contains(*rel)
+    });
+    for (rel, &mode) in wanted {
+        let desc = catalog.lock().await.descriptor_by_name(rel).await?;
+        let Some(desc) = desc else {
+            tracing::warn!(
                 target: "walshadow::config",
                 qname = %rel,
-                mode,
-                "unknown TOML initial_load mode; streaming from start LSN only",
-            ),
-        }
+                "TOML initial_load ignored: source rel unknown",
+            );
+            continue;
+        };
+        backfiller.note_opt_in(&desc, mode, raw_start).await;
     }
     Ok(())
 }
@@ -277,5 +261,34 @@ pub(crate) async fn refresh_mapping(
             target: "walshadow::config",
             "routing map refreshed from resolved config",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sighup_reload_runs_per_signal_and_returns_once_they_end() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let messages = crate::housekeeping::tests::Messages::default();
+        let reloader = Arc::new(walshadow::control::Reloader::default());
+        sighup_reload(futures::stream::iter([(), ()]), reloader)
+            .with_subscriber(tracing_subscriber::registry().with(messages.clone()))
+            .await;
+        assert_eq!(messages.count("SIGHUP — live reload"), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_mapping_republishes_until_sender_drops() {
+        let (tx, rx) = watch::channel(Arc::new(ResolvedConfig::default()));
+        let mapping = walshadow::mapping::mapping_handle(Default::default());
+        let before = mapping.snapshot();
+        let task = tokio::spawn(refresh_mapping(rx, mapping.clone()));
+        tx.send(Arc::new(ResolvedConfig::default())).unwrap();
+        drop(tx);
+        task.await.unwrap();
+        assert!(!mapping.unmoved(&before));
     }
 }

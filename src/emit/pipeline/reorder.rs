@@ -33,7 +33,7 @@ use crate::emit::ch_ddl::{DdlApplicator, Stamp};
 use crate::emit::ch_emitter::EmitterStats;
 use crate::record::{Record, RecordSink, SinkError};
 use crate::schema::{RelDescriptor, RelName, SchemaEvent, TableKey};
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use tracing::Instrument;
 
 use crate::decode::wal_xact::{
@@ -45,13 +45,14 @@ use crate::xact::xact_buffer::{
     DrainEntry, SubxactTracker, ToastRowBatch, XactBuffer, XactBufferError,
 };
 
-use crate::config::ResolvedConfig;
-use crate::emit::pipeline::Fatal;
+use crate::backfill::opt_in::Backfiller;
+use crate::config::{ConfigResolver, ResolvedConfig};
 use crate::emit::pipeline::ack::{AckHandle, BufferedRowSender, Publish, SeqAlloc};
 use crate::emit::pipeline::batcher::{BatcherMsg, RowChunk};
 use crate::emit::pipeline::decode;
 use crate::emit::pipeline::plan_spool::{PlanItem, PlanPath, PlanTable, PlannedHeap, SealedPlan};
 use crate::emit::pipeline::planner::{PlanRouteView, Planner, drain_reason};
+use crate::emit::pipeline::{DbDdl, Fatal};
 use crate::emit::route::{RouteSnapshot, RowPolicy, route_via};
 use crate::mapping::{MappingSnapshot, TableMapping};
 use crate::pos::{Floor, Monotone, Pos};
@@ -61,17 +62,21 @@ use crate::toast::ToastResolver;
 use crate::toast::toast_retire::{RetireEntry, RetireLedger};
 use tokio_postgres::types::Oid;
 
-/// One followed database's ClickHouse-side state. Every transaction writes
-/// one database, so a commit selects one of these and keeps it for the whole
-/// drain
+/// One followed database's state. Every transaction writes one database, so
+/// a commit selects one of these and keeps it for the whole drain
 struct DbScope {
     db: Arc<SourceDb>,
-    /// `None` observes schema events without applying CH DDL
-    applicator: Option<DdlApplicator>,
+    /// `None` observes schema events and truncates without applying CH DDL
+    ch: Option<ChScope>,
+}
+
+/// ClickHouse side of a database applying DDL under live config
+struct ChScope {
+    applicator: DdlApplicator,
+    backfiller: Arc<dyn Backfiller>,
+    resolver: Arc<ConfigResolver>,
     /// Live-reload receiver; see [`ReorderSink::maybe_apply_reload`]
-    reload_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
-    /// COPY backfiller for this database's `initial_load` opt-ins
-    backfiller: Option<Arc<dyn crate::backfill::opt_in::Backfiller>>,
+    reload_rx: watch::Receiver<Arc<ResolvedConfig>>,
     applied_opt_ins: HashSet<RelName>,
     /// Opt-ins whose descriptor the shadow catalog can't resolve yet — a table
     /// created just before `ctl tables select` races the CREATE's replay into
@@ -80,16 +85,211 @@ struct DbScope {
     pending_opt_ins: HashMap<RelName, TableRow>,
 }
 
-impl DbScope {
-    /// Republished config to diff or opt-ins to retry; mirrors the early
-    /// returns of [`ReorderSink::apply_reload_for`]
+impl ChScope {
+    /// Republished config to diff or opt-ins to retry
     fn reload_due(&self) -> bool {
-        self.db.resolver.is_some()
-            && (!self.pending_opt_ins.is_empty()
-                || self
-                    .reload_rx
-                    .as_ref()
-                    .is_some_and(|rx| rx.has_changed().unwrap_or(false)))
+        !self.pending_opt_ins.is_empty() || self.reload_rx.has_changed().unwrap_or(false)
+    }
+
+    async fn apply_reload(&mut self, source: &SourceDb, commit_lsn: u64) -> Result<(), SinkError> {
+        // On a republish, re-diff `table_opt_ins`: opt-outs drain now, new
+        // opt-ins queue as pending, dropped intents leave the queue.
+        if self.reload_rx.has_changed().unwrap_or(false) {
+            let desired: Vec<(RelName, TableRow)> = {
+                let log = source.desc_log.clone();
+                let applied = &self.applied_opt_ins;
+                let config_schema = self.applicator.config().runtime_config_schema.clone();
+                let snap = self.reload_rx.borrow_and_update();
+                // Keep prior pattern opt-ins in desired set
+                let scoped = snap.rules.pattern_scoped(
+                    || log.user_rel_names_at(commit_lsn, config_schema.as_deref()),
+                    |rel| snap.tables.contains_key(rel) && !applied.contains(rel),
+                );
+                snap.table_opt_ins
+                    .iter()
+                    .map(|(rel, row)| (rel.clone(), row.clone()))
+                    .chain(scoped)
+                    .collect()
+            };
+            let desired_in: HashSet<RelName> = desired
+                .iter()
+                .filter(|(_, row)| row.replicate == Some(true))
+                .map(|(rel, _)| rel.clone())
+                .collect();
+            let stale: Vec<RelName> = self
+                .applied_opt_ins
+                .iter()
+                .filter(|rel| !desired_in.contains(*rel))
+                .cloned()
+                .collect();
+            for rel in stale {
+                self.resolver.exclude_table(&rel).await;
+                self.backfiller.note_opt_out(&rel).await;
+                self.applied_opt_ins.remove(&rel);
+            }
+            self.pending_opt_ins
+                .retain(|rel, _| desired_in.contains(rel));
+            for (rel, row) in desired {
+                if row.replicate == Some(true) && !self.applied_opt_ins.contains(&rel) {
+                    self.pending_opt_ins.insert(rel, row);
+                }
+            }
+            tracing::info!(
+                target: "walshadow::config",
+                pending = self.pending_opt_ins.len(),
+                applied = self.applied_opt_ins.len(),
+                "reload diff applied",
+            );
+        }
+        // Each commit, apply any pending opt-in the shadow catalog can now
+        // resolve — a table created just before `select` races the CREATE's
+        // replay, so retry until the descriptor lands, then create + backfill.
+        if self.pending_opt_ins.is_empty() {
+            return Ok(());
+        }
+        let candidates: Vec<(RelName, TableRow)> = self
+            .pending_opt_ins
+            .iter()
+            .map(|(rel, row)| (rel.clone(), row.clone()))
+            .collect();
+        let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
+        for (rel, row) in candidates {
+            let known = source
+                .catalog
+                .lock()
+                .await
+                .descriptor_by_name(&rel)
+                .await
+                .map_err(SinkError::ctx("opt-in descriptor lookup"))?
+                .is_some();
+            if !known {
+                tracing::debug!(
+                    target: "walshadow::config",
+                    qname = %rel,
+                    "opt-in retry: descriptor unknown",
+                );
+                continue;
+            }
+            crate::backfill::opt_in::apply_table_opt_in_deferred(
+                &self.resolver,
+                &mut self.applicator,
+                &source.catalog,
+                &self.backfiller,
+                &rel,
+                &row,
+                commit_lsn,
+                &mut deferred,
+            )
+            .await
+            .map_err(SinkError::ctx("reload opt-in"))?;
+            self.pending_opt_ins.remove(&rel);
+            self.applied_opt_ins.insert(rel);
+        }
+        deferred.start(&self.backfiller).await;
+        Ok(())
+    }
+
+    /// Apply a config-table change inside the barrier fence, so the fenced
+    /// routing-map write lands before the trailing segment dispatches. Merge
+    /// itself is infallible (Regime A: a malformed value is rejected + logged,
+    /// never fatal); the per-table opt-in dispatch can create a CH table, so it
+    /// surfaces CH errors like a DDL apply.
+    async fn apply_config(
+        &mut self,
+        _: Fenced,
+        source: &SourceDb,
+        event: &ConfigEvent,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        // Overlay merge first (target overrides, global/namespace knobs).
+        self.resolver.apply_config_event(event.clone()).await;
+        // Then inclusion dispatch for table rows: create the CH table +
+        // register / drop the descriptor-derived mapping. `commit_lsn` is the
+        // backfill boundary `S` for an `initial_load` opt-in.
+        match event {
+            ConfigEvent::TableUpserted { rel, row } if !row.is_pattern() => {
+                crate::backfill::opt_in::apply_table_opt_in(
+                    &self.resolver,
+                    &mut self.applicator,
+                    &source.catalog,
+                    &self.backfiller,
+                    rel,
+                    row,
+                    commit_lsn,
+                )
+                .await
+                .map_err(SinkError::ctx("opt-in"))?;
+            }
+            ConfigEvent::TableRemoved {
+                rel,
+                pattern: false,
+            } => {
+                self.resolver.exclude_table(rel).await;
+                self.backfiller.note_opt_out(rel).await;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Planning predicted routes under `frozen`, so apply under it too
+    async fn apply_event(
+        &mut self,
+        _: Fenced,
+        source: &SourceDb,
+        event: &SchemaEvent,
+        frozen: Option<&ResolvedConfig>,
+        at: Stamp,
+    ) -> Result<(), SinkError> {
+        let commit_lsn = at.lsn;
+        // Pinned mappings outlive DROP, so only Added/Changed must match
+        let predicted = if cfg!(debug_assertions) && !matches!(event, SchemaEvent::Dropped { .. }) {
+            let before = source.mapping.snapshot();
+            self.applicator
+                .predict_route_mapping(event, &before, frozen)
+                .await
+        } else {
+            None
+        };
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::BeforeDdl, commit_lsn);
+        self.applicator
+            .apply_at(event, frozen, at)
+            .await
+            .map_err(SinkError::ctx("ddl apply"))?;
+        #[cfg(feature = "test-support")]
+        crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
+        if let Some((rel, m)) = predicted {
+            let after = source.mapping.snapshot();
+            debug_assert_eq!(
+                after.get(&rel).map(|a| a.as_ref()),
+                m.as_ref(),
+                "{rel}: apply diverged from plan"
+            );
+        }
+        // `ATTACH` brings rows that never streamed into the root's destination
+        if let SchemaEvent::Changed { old, new, .. } = event
+            && new.is_partition()
+            && old.parent_oid() != new.parent_oid()
+        {
+            let mode = self.applicator.partition_load(new);
+            self.backfiller
+                .clone()
+                .note_opt_in(new.clone(), mode, commit_lsn)
+                .await;
+        }
+        // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
+        // the same barrier before this xact's trailing rows dispatch.
+        if let SchemaEvent::Added { desc } = event {
+            crate::backfill::opt_in::materialize_pending_on_added(
+                &self.resolver,
+                &mut self.applicator,
+                desc,
+            )
+            .await
+            .map_err(SinkError::ctx("opt-in materialize"))?;
+        }
+        Ok(())
     }
 }
 
@@ -173,14 +373,6 @@ struct Outbox {
 }
 
 impl Outbox {
-    fn fatal_err(&self) -> SinkError {
-        SinkError::Other(
-            self.fatal
-                .message()
-                .unwrap_or_else(|| "pipeline fatal".into()),
-        )
-    }
-
     /// Admission permit for `bytes`. Staged rows hold permits only shipping
     /// releases, so ship before waiting on the pool
     async fn admit(
@@ -196,9 +388,19 @@ impl Outbox {
         self.flush_pending().await?;
         tokio::select! {
             biased;
-            _ = self.fatal.wait() => Err(self.fatal_err()),
+            msg = self.fatal.wait() => Err(SinkError::Other(msg)),
             p = budget.admit(bytes) => Ok(Some(p)),
         }
+    }
+
+    /// Batcher exits only past a fatal or after this sink drops its sender
+    async fn send(&mut self, msg: BatcherMsg) -> Result<(), SinkError> {
+        let sent = tokio::select! {
+            biased;
+            msg = self.fatal.wait() => return Err(SinkError::Other(msg)),
+            r = self.msg_tx.send(msg) => r,
+        };
+        sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
     }
 }
 
@@ -214,12 +416,7 @@ impl BufferedRowSender for Outbox {
         let chunks = std::mem::take(&mut self.staged);
         self.staged_rows = 0;
         self.staged_bytes = 0;
-        let sent = tokio::select! {
-            biased;
-            _ = self.fatal.wait() => return Err(self.fatal_err()),
-            r = self.msg_tx.send(BatcherMsg::Chunks(chunks)) => r,
-        };
-        sent.map_err(|_| SinkError::Other("batcher channel closed".into()))
+        self.send(BatcherMsg::Chunks(chunks)).await
     }
 }
 
@@ -244,12 +441,11 @@ impl ReorderSink {
         subxact_tracker: Arc<Mutex<SubxactTracker>>,
         // One per database that applies CH DDL; absent leaves that
         // database's events observed only
-        mut applicators: HashMap<Oid, DdlApplicator>,
+        mut ddl: HashMap<Oid, DbDdl>,
         ack: AckHandle,
         msg_tx: mpsc::Sender<BatcherMsg>,
         stats: Arc<EmitterStats>,
         resolver: ToastResolver,
-        mut backfillers: HashMap<Oid, Arc<dyn crate::backfill::opt_in::Backfiller>>,
         fatal: Fatal,
         span_registry: Option<TxnSpanRegistry>,
         batch_rows: usize,
@@ -273,19 +469,19 @@ impl ReorderSink {
             .all()
             .iter()
             .map(|db| {
-                let reload_rx = db.resolver.as_ref().map(|r| {
-                    let mut rx = r.subscribe();
-                    rx.mark_changed();
-                    rx
+                let ch = ddl.remove(&db.oid).map(|ddl| {
+                    let mut reload_rx = ddl.resolver.subscribe();
+                    reload_rx.mark_changed();
+                    ChScope {
+                        applicator: ddl.applicator,
+                        backfiller: ddl.backfiller,
+                        resolver: ddl.resolver,
+                        reload_rx,
+                        applied_opt_ins: HashSet::new(),
+                        pending_opt_ins: HashMap::new(),
+                    }
                 });
-                let scope = DbScope {
-                    db: db.clone(),
-                    applicator: applicators.remove(&db.oid),
-                    backfiller: backfillers.remove(&db.oid),
-                    reload_rx,
-                    applied_opt_ins: HashSet::new(),
-                    pending_opt_ins: HashMap::new(),
-                };
+                let scope = DbScope { db: db.clone(), ch };
                 (db.oid, scope)
             })
             .collect();
@@ -341,7 +537,7 @@ impl ReorderSink {
             return;
         };
         self.route_mapping = Some(scope.db.mapping.snapshot());
-        self.route_config = scope.reload_rx.as_ref().map(|rx| rx.borrow().clone());
+        self.route_config = scope.ch.as_ref().map(|ch| ch.reload_rx.borrow().clone());
     }
 
     /// Apply a live config reload's table opt-in/opt-out diff at a commit
@@ -351,192 +547,15 @@ impl ReorderSink {
     async fn maybe_apply_reload(&mut self, commit_lsn: u64) -> Result<(), SinkError> {
         // A reload republishes every database's config, so the diff is not
         // scoped to whichever database is committing
-        let dbs: Vec<Oid> = self
-            .dbs
-            .oids()
-            .filter(|db| self.scopes.get(db).is_some_and(DbScope::reload_due))
-            .collect();
-        for db in dbs {
-            Box::pin(self.apply_reload_for(db, commit_lsn)).await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_reload_for(&mut self, db: Oid, commit_lsn: u64) -> Result<(), SinkError> {
-        let Some(scope) = self.scopes.get_mut(&db) else {
-            return Ok(());
-        };
-        let Some(resolver) = scope.db.resolver.clone() else {
-            return Ok(());
-        };
-        // On a republish, re-diff `table_opt_ins`: opt-outs drain now, new
-        // opt-ins queue as pending, dropped intents leave the queue.
-        let changed = scope
-            .reload_rx
-            .as_mut()
-            .is_some_and(|rx| rx.has_changed().unwrap_or(false));
-        if changed {
-            let desired: Vec<(RelName, TableRow)> = {
-                let log = scope.db.desc_log.clone();
-                let applied = &scope.applied_opt_ins;
-                let config_schema = scope
-                    .applicator
-                    .as_ref()
-                    .and_then(|a| a.config().runtime_config_schema.clone());
-                let rx = scope.reload_rx.as_mut().unwrap();
-                let snap = rx.borrow_and_update();
-                // Keep prior pattern opt-ins in desired set
-                let scoped = snap.rules.pattern_scoped(
-                    || log.user_rel_names_at(commit_lsn, config_schema.as_deref()),
-                    |rel| snap.tables.contains_key(rel) && !applied.contains(rel),
-                );
-                snap.table_opt_ins
-                    .iter()
-                    .map(|(rel, row)| (rel.clone(), row.clone()))
-                    .chain(scoped)
-                    .collect()
-            };
-            let desired_in: HashSet<RelName> = desired
-                .iter()
-                .filter(|(_, row)| row.replicate == Some(true))
-                .map(|(rel, _)| rel.clone())
-                .collect();
-            let stale: Vec<RelName> = scope
-                .applied_opt_ins
-                .iter()
-                .filter(|rel| !desired_in.contains(*rel))
-                .cloned()
-                .collect();
-            for rel in stale {
-                resolver.exclude_table(&rel).await;
-                if let Some(b) = &scope.backfiller {
-                    b.note_opt_out(&rel).await;
-                }
-                scope.applied_opt_ins.remove(&rel);
+        for db in self.dbs.oids() {
+            if let Some(DbScope {
+                db: source,
+                ch: Some(ch),
+            }) = self.scopes.get_mut(&db)
+                && ch.reload_due()
+            {
+                Box::pin(ch.apply_reload(source, commit_lsn)).await?;
             }
-            scope
-                .pending_opt_ins
-                .retain(|rel, _| desired_in.contains(rel));
-            for (rel, row) in desired {
-                if row.replicate == Some(true) && !scope.applied_opt_ins.contains(&rel) {
-                    scope.pending_opt_ins.insert(rel, row);
-                }
-            }
-            tracing::info!(
-                target: "walshadow::config",
-                pending = scope.pending_opt_ins.len(),
-                applied = scope.applied_opt_ins.len(),
-                "reload diff applied",
-            );
-        }
-        // Each commit, apply any pending opt-in the shadow catalog can now
-        // resolve — a table created just before `select` races the CREATE's
-        // replay, so retry until the descriptor lands, then create + backfill.
-        if scope.pending_opt_ins.is_empty() {
-            return Ok(());
-        }
-        // No applicator (bootstrap drain / tests without DDL) → can't create
-        // CH tables, so opt-ins stay pending.
-        let Some(applicator) = scope.applicator.as_mut() else {
-            return Ok(());
-        };
-        let candidates: Vec<(RelName, TableRow)> = scope
-            .pending_opt_ins
-            .iter()
-            .map(|(rel, row)| (rel.clone(), row.clone()))
-            .collect();
-        let mut deferred = crate::backfill::opt_in::DeferredBackfills::default();
-        for (rel, row) in candidates {
-            let known = scope
-                .db
-                .catalog
-                .lock()
-                .await
-                .descriptor_by_name(&rel)
-                .await
-                .map_err(|e| SinkError::Other(format!("opt-in descriptor lookup: {e}")))?
-                .is_some();
-            if !known {
-                tracing::debug!(
-                    target: "walshadow::config",
-                    qname = %rel,
-                    "opt-in retry: descriptor unknown",
-                );
-                continue;
-            }
-            crate::backfill::opt_in::apply_table_opt_in_deferred(
-                &resolver,
-                applicator,
-                &scope.db.catalog,
-                scope.backfiller.as_ref(),
-                &rel,
-                &row,
-                commit_lsn,
-                &mut deferred,
-            )
-            .await
-            .map_err(|e| SinkError::Other(format!("reload opt-in: {e}")))?;
-            scope.pending_opt_ins.remove(&rel);
-            scope.applied_opt_ins.insert(rel);
-        }
-        deferred.start(scope.backfiller.as_ref()).await;
-        Ok(())
-    }
-
-    /// Apply a config-table change inside the barrier fence, so the fenced
-    /// routing-map write lands before the trailing segment dispatches. Merge
-    /// itself is infallible (Regime A: a malformed value is rejected + logged,
-    /// never fatal); the per-table opt-in dispatch can create a CH table, so it
-    /// surfaces CH errors like a DDL apply.
-    ///
-    /// `&mut self` (like [`Self::apply_event`]): the opt-in dispatch needs
-    /// `&mut applicator` (the `!Sync` CH client) + `&catalog`, both fields of
-    /// self. `&mut self`-across-await stays `Send`; only a shared `&self` would
-    /// poison the sink future's `Send` bound.
-    async fn apply_config(
-        &mut self,
-        _: Fenced,
-        db: Oid,
-        event: &ConfigEvent,
-        commit_lsn: u64,
-    ) -> Result<(), SinkError> {
-        let Some(scope) = self.scopes.get_mut(&db) else {
-            return Ok(());
-        };
-        let Some(resolver) = scope.db.resolver.clone() else {
-            return Ok(());
-        };
-        // Overlay merge first (target overrides, global/namespace knobs).
-        resolver.apply_config_event(event.clone()).await;
-        // Then inclusion dispatch for table rows: create the CH table +
-        // register / drop the descriptor-derived mapping. `commit_lsn` is the
-        // backfill boundary `S` for an `initial_load` opt-in.
-        match event {
-            ConfigEvent::TableUpserted { rel, row } if !row.is_pattern() => {
-                if let Some(applicator) = scope.applicator.as_mut() {
-                    crate::backfill::opt_in::apply_table_opt_in(
-                        &resolver,
-                        applicator,
-                        &scope.db.catalog,
-                        scope.backfiller.as_ref(),
-                        rel,
-                        row,
-                        commit_lsn,
-                    )
-                    .await
-                    .map_err(|e| SinkError::Other(format!("opt-in: {e}")))?;
-                }
-            }
-            ConfigEvent::TableRemoved {
-                rel,
-                pattern: false,
-            } => {
-                resolver.exclude_table(rel).await;
-                if let Some(b) = &scope.backfiller {
-                    b.note_opt_out(rel).await;
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -546,18 +565,10 @@ impl ReorderSink {
     async fn flush_all_batcher(&mut self) -> Result<(), SinkError> {
         self.out.flush_pending().await?;
         let (tx, rx) = oneshot::channel();
-        if self
-            .out
-            .msg_tx
-            .send(BatcherMsg::FlushAll(tx))
-            .await
-            .is_err()
-        {
-            return Err(SinkError::Other("batcher channel closed".into()));
-        }
+        self.out.send(BatcherMsg::FlushAll(tx)).await?;
         tokio::select! {
             biased;
-            _ = self.out.fatal.wait() => Err(self.out.fatal_err()),
+            msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
             r = rx => r.map_err(|_| SinkError::Other("batcher dropped flush ack".into())),
         }
     }
@@ -570,10 +581,8 @@ impl ReorderSink {
         let through = self.out.seqs.next();
         tokio::select! {
             biased;
-            _ = self.out.fatal.wait() => Err(self.out.fatal_err()),
-            r = self.ack.wait_through(through) => r.map_err(|e| {
-                SinkError::Other(format!("durability barrier through {through}: {e}"))
-            }),
+            msg = self.out.fatal.wait() => Err(SinkError::Other(msg)),
+            r = self.ack.wait_through(through) => r.map_err(SinkError::ctx(format_args!("durability barrier through {through}"))),
         }
     }
 
@@ -584,88 +593,6 @@ impl ReorderSink {
         self.flush_all_batcher().await?;
         self.wait_all_durable().await?;
         Ok(Fenced(()))
-    }
-
-    async fn apply_event(
-        &mut self,
-        _: Fenced,
-        db: Oid,
-        event: &SchemaEvent,
-        at: Stamp,
-    ) -> Result<(), SinkError> {
-        let commit_lsn = at.lsn;
-        let Some(scope) = self.scopes.get_mut(&db) else {
-            return Ok(());
-        };
-        let resolver_cfg = scope.db.resolver.clone();
-        let mapping = scope.db.mapping.clone();
-        let backfiller = scope.backfiller.clone();
-        let Some(applicator) = scope.applicator.as_mut() else {
-            return Ok(());
-        };
-        // Same frozen config planning predicted with, so planned routes match
-        let frozen = self.route_config.as_deref();
-        // Pinned mappings outlive DROP, so only Added/Changed must match
-        let predicted = if cfg!(debug_assertions) && !matches!(event, SchemaEvent::Dropped { .. }) {
-            let before = mapping.snapshot();
-            applicator
-                .predict_route_mapping(event, &before, frozen)
-                .await
-                .map_err(|e| SinkError::Other(format!("ddl predict: {e}")))?
-        } else {
-            None
-        };
-        #[cfg(feature = "test-support")]
-        crash_test::hit(crash_test::Point::BeforeDdl, commit_lsn);
-        applicator
-            .apply_at(event, frozen, at)
-            .await
-            .map_err(|e| SinkError::Other(format!("ddl apply: {e}")))?;
-        #[cfg(feature = "test-support")]
-        crash_test::hit(crash_test::Point::AfterDdl, commit_lsn);
-        if let Some((rel, m)) = predicted {
-            let after = mapping.snapshot();
-            debug_assert_eq!(
-                after.get(&rel).map(|a| a.as_ref()),
-                m.as_ref(),
-                "{rel}: apply diverged from plan"
-            );
-        }
-        // `ATTACH` brings rows that never streamed into the root's destination
-        if let SchemaEvent::Changed { old, new, .. } = event
-            && new.is_partition()
-            && old.parent_oid() != new.parent_oid()
-            && let Some(backfiller) = backfiller
-        {
-            let mode = applicator.partition_load(new);
-            backfiller.note_opt_in(new.clone(), mode, commit_lsn).await;
-        }
-        // A `CREATE TABLE` for a forward-declared opt-in materialises here, in
-        // the same barrier before this xact's trailing rows dispatch.
-        if let SchemaEvent::Added { desc } = event
-            && let Some(resolver) = resolver_cfg
-        {
-            crate::backfill::opt_in::materialize_pending_on_added(&resolver, applicator, desc)
-                .await
-                .map_err(|e| SinkError::Other(format!("opt-in materialize: {e}")))?;
-        }
-        // Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
-        // here precedes this commit's ack publication, so any persisted
-        // cursor whose floor passed the drop already holds the entry.
-        if let SchemaEvent::Dropped { oid, rel_name, .. } = event
-            && &*rel_name.namespace == "pg_toast"
-            && self.resolver.stores_chunks()
-        {
-            self.retires
-                .push(RetireEntry {
-                    db_oid: db,
-                    toast_relid: *oid,
-                    commit_lsn: Pos::new(commit_lsn),
-                })
-                .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
-        }
-        Ok(())
     }
 
     /// Boot Added pass: every relation `Present` in the descriptor log at
@@ -685,15 +612,24 @@ impl ReorderSink {
             if desc.kind == 't' {
                 continue;
             }
-            let db = desc.rfn.db_node;
-            self.apply_event(
+            let Some(DbScope {
+                db: source,
+                ch: Some(ch),
+            }) = self.scopes.get_mut(&desc.rfn.db_node)
+            else {
+                continue;
+            };
+            let at = Stamp {
+                lsn: resume_lsn,
+                ..Stamp::default()
+            };
+            let frozen = self.route_config.as_deref();
+            ch.apply_event(
                 Fenced::pre_pump(),
-                db,
+                source,
                 &SchemaEvent::Added { desc },
-                Stamp {
-                    lsn: resume_lsn,
-                    ..Stamp::default()
-                },
+                frozen,
+                at,
             )
             .await?;
         }
@@ -719,11 +655,11 @@ impl ReorderSink {
             self.resolver
                 .retire_mirror_at(entry.db_oid, entry.toast_relid, entry.commit_lsn.get())
                 .await
-                .map_err(|e| SinkError::Other(format!("toast mirror retire: {e}")))?;
+                .map_err(SinkError::ctx("toast mirror retire"))?;
             self.retires
                 .remove(entry)
                 .await
-                .map_err(|e| SinkError::Other(format!("toast retire ledger: {e}")))?;
+                .map_err(SinkError::ctx("toast retire ledger"))?;
         }
         Ok(())
     }
@@ -752,15 +688,12 @@ impl ReorderSink {
     async fn settle_pending(&mut self) -> Result<(), SinkError> {
         let ledger = self.pending_rows.clone();
         let mut ledger = ledger.lock().await;
-        if ledger.is_empty() {
-            return Ok(());
-        }
         let sess = match &mut self.pending_session {
             Some(sess) => sess,
             None => self.pending_session.insert(
                 StagingSession::connect(self.dest.clone())
                     .await
-                    .map_err(|e| SinkError::Other(format!("pending visibility: connect: {e}")))?,
+                    .map_err(SinkError::ctx("pending visibility: connect"))?,
             ),
         };
         visibility_pending::settle(&mut ledger, sess, &self.stats)
@@ -771,7 +704,7 @@ impl ReorderSink {
     /// Recover outcomes from shadow transaction logs before resumed WAL
     async fn settle_pending_boot(
         &mut self,
-        shadow_data_dir: Option<&std::path::Path>,
+        shadow_data_dir: &std::path::Path,
     ) -> Result<(), SinkError> {
         if let Some(runtime) = &self.dest.current().snowflake {
             self.pending_rows
@@ -784,29 +717,27 @@ impl ReorderSink {
         if self.pending_rows.lock().await.is_empty() {
             return Ok(());
         }
-        if let Some(dir) = shadow_data_dir.filter(|d| d.join("pg_xact").is_dir()) {
-            let accum = read_pg_xact(dir).await.map_err(|e| {
-                SinkError::Other(format!("pending visibility: shadow pg_xact: {e}"))
-            })?;
-            let patch = SealedPatch::default();
-            let fold = self
-                .pending_rows
-                .lock()
-                .await
-                .note_view(&PgXactView::new(&accum, &patch));
-            self.stats
-                .pending_xacts_settled
-                .fetch_add(fold.settled, Ordering::Relaxed);
-            self.stats
-                .pending_undecidable_xids
-                .store(fold.undecidable, Ordering::Relaxed);
-            if fold.undecidable > 0 {
-                tracing::warn!(
-                    target: "walshadow::visibility_pending",
-                    xids = fold.undecidable,
-                    "shadow pg_xact lacks deciding xids; retain pending rows and tables",
-                );
-            }
+        let accum = read_pg_xact(shadow_data_dir)
+            .await
+            .map_err(SinkError::ctx("pending visibility: shadow pg_xact"))?;
+        let patch = SealedPatch::default();
+        let fold = self
+            .pending_rows
+            .lock()
+            .await
+            .note_view(&PgXactView::new(&accum, &patch));
+        self.stats
+            .pending_xacts_settled
+            .fetch_add(fold.settled, Ordering::Relaxed);
+        self.stats
+            .pending_undecidable_xids
+            .store(fold.undecidable, Ordering::Relaxed);
+        if fold.undecidable > 0 {
+            tracing::warn!(
+                target: "walshadow::visibility_pending",
+                xids = fold.undecidable,
+                "shadow pg_xact lacks deciding xids; retain pending rows and tables",
+            );
         }
         self.settle_pending().await
     }
@@ -823,9 +754,11 @@ impl ReorderSink {
         self.resolver
             .rewrite_barrier(db, toast_relid, marker_lsn, commit_lsn)
             .await
-            .map_err(|e| SinkError::Other(format!("toast rewrite barrier: {e}")))
+            .map_err(SinkError::ctx("toast rewrite barrier"))
     }
 
+    /// Observe-only database skips every entry: CH state is all they change,
+    /// and its disabled TOAST store makes barriers no-ops
     async fn apply_drain_entry(
         &mut self,
         fenced: Fenced,
@@ -833,18 +766,53 @@ impl ReorderSink {
         entry: &DrainEntry,
         at: Stamp,
     ) -> Result<(), SinkError> {
-        let commit_lsn = at.lsn;
+        let Some(DbScope {
+            db: source,
+            ch: Some(ch),
+        }) = self.scopes.get_mut(&db)
+        else {
+            return Ok(());
+        };
         match entry {
-            DrainEntry::Catalog(ev) => self.apply_event(fenced, db, ev, at).await,
-            DrainEntry::Config(ev) => self.apply_config(fenced, db, ev, commit_lsn).await,
+            DrainEntry::Catalog(ev) => {
+                let frozen = self.route_config.as_deref();
+                ch.apply_event(fenced, source, ev, frozen, at).await?;
+                self.retire_dropped_toast(db, ev, at.lsn).await
+            }
+            DrainEntry::Config(ev) => ch.apply_config(fenced, source, ev, at.lsn).await,
             DrainEntry::ToastBarrier {
                 toast_relid,
                 marker_lsn,
             } => {
-                self.apply_toast_barrier(db, *toast_relid, *marker_lsn, commit_lsn)
+                self.apply_toast_barrier(db, *toast_relid, *marker_lsn, at.lsn)
                     .await
             }
         }
+    }
+
+    /// Immediate DROP wipe corrupts same-LSN replay fills. Ledger fsync
+    /// here precedes this commit's ack publication, so any persisted
+    /// cursor whose floor passed the drop already holds the entry.
+    async fn retire_dropped_toast(
+        &mut self,
+        db: Oid,
+        event: &SchemaEvent,
+        commit_lsn: u64,
+    ) -> Result<(), SinkError> {
+        if let SchemaEvent::Dropped { oid, rel_name, .. } = event
+            && &*rel_name.namespace == "pg_toast"
+            && self.resolver.stores_chunks()
+        {
+            self.retires
+                .push(RetireEntry {
+                    db_oid: db,
+                    toast_relid: *oid,
+                    commit_lsn: Pos::new(commit_lsn),
+                })
+                .await
+                .map_err(SinkError::ctx("toast retire ledger"))?;
+        }
+        Ok(())
     }
 
     async fn apply_truncate(
@@ -854,10 +822,7 @@ impl ReorderSink {
         heap: &DecodedHeap,
         commit_ts: i64,
     ) -> Result<(), SinkError> {
-        let Some(scope) = self.scopes.get_mut(&rel.rfn.db_node) else {
-            return Ok(());
-        };
-        let Some(applicator) = scope.applicator.as_mut() else {
+        let Some(DbScope { ch: Some(ch), .. }) = self.scopes.get_mut(&rel.rfn.db_node) else {
             return Ok(());
         };
         // Attached at truncate fan-out (record time = pre-capture Present),
@@ -868,10 +833,10 @@ impl ReorderSink {
             xid: heap.xid,
             commit_ts,
         };
-        applicator
+        ch.applicator
             .truncate(rel, at)
             .await
-            .map_err(|e| SinkError::Other(format!("truncate: {e}")))?;
+            .map_err(SinkError::ctx("ch truncate"))?;
         self.stats.truncates_emitted.fetch_add(1, Ordering::Relaxed);
         // PG swaps TOAST relfilenode without listing it in `xl_heap_truncate`;
         // the descriptor carries the owner's toast oid
@@ -879,7 +844,7 @@ impl ReorderSink {
             self.resolver
                 .truncate_mirror_at(rel.rfn.db_node, rel.toast_oid, heap.source_lsn)
                 .await
-                .map_err(|e| SinkError::Other(format!("toast mirror truncate: {e}")))?;
+                .map_err(SinkError::ctx("toast mirror truncate"))?;
         }
         Ok(())
     }
@@ -899,7 +864,7 @@ impl ReorderSink {
                 self.resolver
                     .put_row_refs(rb.spool(), &rb[lo - base..hi - base])
                     .await
-                    .map_err(|e| SinkError::Other(format!("toast store put: {e}")))?;
+                    .map_err(SinkError::ctx("toast store put"))?;
             }
             base += rb.len();
         }
@@ -973,18 +938,13 @@ impl ReorderSink {
             xid,
             commit_ts,
         };
-        let mut rd = plan
-            .replay()
-            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?;
+        let mut rd = plan.replay().map_err(SinkError::ctx("plan replay"))?;
         let mut pending: Vec<PlannedHeap> = Vec::new();
         let mut pending_bytes = 0usize;
         let mut rows_cursor = 0usize;
         let total_rows: usize = rd.row_batches.iter().map(|rb| rb.len()).sum();
         let mut rows_total = 0u64;
-        while let Some(item) = rd
-            .next_item()
-            .map_err(|e| SinkError::Other(format!("plan replay: {e}")))?
-        {
+        while let Some(item) = rd.next_item().map_err(SinkError::ctx("plan replay"))? {
             match item {
                 PlanItem::Control(c) => {
                     Box::pin(async {
@@ -1185,7 +1145,9 @@ impl ReorderSink {
                     self.route_mapping.clone(),
                     self.route_config.clone(),
                     row_policy.clone(),
-                    scope.and_then(|scope| scope.applicator.as_mut()),
+                    scope
+                        .and_then(|scope| scope.ch.as_mut())
+                        .map(|ch| &mut ch.applicator),
                     self.stats.clone(),
                     maps,
                 );
@@ -1198,33 +1160,29 @@ impl ReorderSink {
                 loop {
                     let Some(batch) = drain
                         .next_batch_admitting(batch_rows, batch_bytes, async |bytes| {
-                            out.admit(bytes).await.map_err(PullError::Admit)
+                            out.admit(bytes).await.map_err(|e| PullError(None, e))
                         })
                         .instrument(drain_span.clone())
                         .await
-                        .map_err(|e| match e {
-                            PullError::Drain(e) => {
-                                bump_plan_failure(&stats, drain_reason(&e));
-                                SinkError::from(e)
-                            }
-                            PullError::Admit(e) => e,
+                        .map_err(|PullError(drain, err)| {
+                            drain.inspect(|reason| bump_plan_failure(&stats, reason));
+                            err
                         })?
                     else {
                         break;
                     };
                     let is_final = batch.is_final;
-                    planner.plan_batch(batch).await.map_err(|e| {
-                        bump_plan_failure(&stats, e.reason());
-                        SinkError::Other(format!("plan: {e}"))
-                    })?;
+                    planner
+                        .plan_batch(batch)
+                        .await
+                        .map_err(plan_failed(&stats, "plan"))?;
                     if is_final {
                         break;
                     }
                 }
-                let plan = planner.seal(commit_lsn, commit_ts).map_err(|e| {
-                    bump_plan_failure(&stats, e.reason());
-                    SinkError::Other(format!("plan seal: {e}"))
-                })?;
+                let plan = planner
+                    .seal(commit_lsn, commit_ts)
+                    .map_err(plan_failed(&stats, "plan seal"))?;
                 // Folded catalog events make routes this transaction's own
                 let ReorderRouteView {
                     mapping,
@@ -1308,37 +1266,42 @@ impl BootingReorder {
     /// Added pass over relations `present` at `resume_lsn`
     pub async fn boot(
         self,
-        shadow_data_dir: Option<&std::path::Path>,
+        shadow_data_dir: &std::path::Path,
         present: Vec<Arc<RelDescriptor>>,
         resume_lsn: u64,
     ) -> Result<ReorderSink, SinkError> {
         let mut sink = self.0;
         sink.flush_due_retires()
             .await
-            .map_err(|e| boot_step("flush of due toast-mirror retires", e))?;
+            .map_err(SinkError::ctx("boot flush of due toast-mirror retires"))?;
         sink.settle_pending_boot(shadow_data_dir)
             .await
-            .map_err(|e| boot_step("settle of pending backup rows", e))?;
+            .map_err(SinkError::ctx("boot settle of pending backup rows"))?;
         sink.apply_boot_events(present, resume_lsn)
             .await
-            .map_err(|e| boot_step("Added pass over descriptor log", e))?;
+            .map_err(SinkError::ctx("boot Added pass over descriptor log"))?;
         Ok(sink)
     }
 }
 
-fn boot_step(step: &str, e: SinkError) -> SinkError {
-    SinkError::Other(format!("boot {step}: {e}"))
-}
-
-/// Drain errors count as plan failures, admission errors are pipeline fatal
-enum PullError {
-    Drain(XactBufferError),
-    Admit(SinkError),
-}
+/// Drain errors count as plan failures under their reason, admission
+/// errors carry none and are pipeline fatal
+struct PullError(Option<&'static str>, SinkError);
 
 impl From<XactBufferError> for PullError {
     fn from(e: XactBufferError) -> Self {
-        Self::Drain(e)
+        Self(Some(drain_reason(&e)), e.into())
+    }
+}
+
+/// Count a planning failure under its reason, failing the commit
+fn plan_failed(
+    stats: &EmitterStats,
+    step: &'static str,
+) -> impl FnOnce(crate::emit::pipeline::planner::PlanError) -> SinkError {
+    move |e| {
+        bump_plan_failure(stats, e.reason());
+        SinkError::Other(format!("{step}: {e}"))
     }
 }
 
@@ -1541,9 +1504,10 @@ impl ReorderSink {
             XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => self.on_commit(xid, info, record).await,
             XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => self.on_abort(xid, info, record).await,
             XLOG_XACT_ASSIGNMENT => {
-                if let Some((xtop, subs)) = parse_xact_assignment(&record.parsed.main_data) {
-                    self.subxact_tracker.lock().await.assign(xtop, &subs);
-                }
+                // Malformed one assigns nothing
+                let (xtop, subs) =
+                    parse_xact_assignment(&record.parsed.main_data).unwrap_or_default();
+                self.subxact_tracker.lock().await.assign(xtop, &subs);
                 Ok(())
             }
             // PREPARE allocates no seq; COMMIT_PREPARED drains it later
@@ -1564,7 +1528,7 @@ impl RecordSink for ReorderSink {
             self.resolver
                 .flush_mirror()
                 .await
-                .map_err(|e| SinkError::Other(format!("toast store flush: {e}")))?;
+                .map_err(SinkError::ctx("toast store flush"))?;
             self.out.flush_pending().await
         })
     }
@@ -1854,6 +1818,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmetered_outbox_admits_without_a_permit() {
+        let budget = crate::budget::MemoryBudget::new(1);
+        let (mut out, _tail) = outbox(&budget, &Fatal::new());
+        out.budget = None;
+        assert!(out.admit(1 << 30).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn admit_returns_on_fatal_while_pool_held() {
         let budget = crate::budget::MemoryBudget::new(1 << 20);
         let fatal = Fatal::new();
@@ -1867,9 +1839,44 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), out.admit(512 << 10)),
             trip,
         );
-        let Err(err) = admitted.expect("admit ignored fatal") else {
-            panic!("admit passed a held pool");
-        };
+        let err = admitted
+            .expect("admit ignored fatal")
+            .map(drop)
+            .expect_err("admit passed a held pool");
         assert!(err.to_string().contains("inserter down"), "{err}");
+    }
+
+    #[test]
+    fn plan_failure_reasons_bump_their_counters() {
+        let stats = EmitterStats::default();
+        let counters = [
+            ("spool", &stats.plan_failures_spool),
+            (
+                "fail_closed_image_only",
+                &stats.plan_failures_fail_closed_image_only,
+            ),
+            (
+                "fail_closed_malformed",
+                &stats.plan_failures_fail_closed_malformed,
+            ),
+            (
+                "fail_closed_unsupported_op",
+                &stats.plan_failures_fail_closed_unsupported_op,
+            ),
+            ("stash_ambiguous", &stats.plan_failures_stash_ambiguous),
+            ("incomplete_toast", &stats.plan_failures_incomplete_toast),
+            (
+                "missing_stash_resolution",
+                &stats.plan_failures_missing_stash_resolution,
+            ),
+            ("detoast", &stats.plan_failures_detoast),
+            ("partial_update", &stats.plan_failures_partial_update),
+            ("view", &stats.plan_failures_view),
+            ("unknown", &stats.plan_failures_drain),
+        ];
+        for (reason, counter) in counters {
+            bump_plan_failure(&stats, reason);
+            assert_eq!(counter.load(Ordering::Relaxed), 1, "{reason}");
+        }
     }
 }

@@ -152,7 +152,7 @@ pub(super) fn bootstrap_skips_initial(
             emitter
                 .table_initial_loads
                 .get(relation)
-                .map(String::as_str)
+                .map(|mode| mode.as_str())
         });
     match table_mode {
         Some(mode) => mode.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),

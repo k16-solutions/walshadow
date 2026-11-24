@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
+use foldhash::{HashMap, HashMapExt};
 use tokio::sync::{Mutex, watch};
 use tokio_postgres::types::Oid;
 use walrus::pg::backup::format_pg_lsn;
@@ -105,7 +105,7 @@ pub(crate) struct TenantBoot<'a> {
     pub priming: bool,
     /// Tables the tenant started with and their initial loads, re-applied
     /// so an unfinished load resumes
-    pub activation_opt_ins: ahash::HashMap<RelName, walshadow::runtime_config::TableRow>,
+    pub activation_opt_ins: foldhash::HashMap<RelName, walshadow::runtime_config::TableRow>,
     /// Database owning TOAST mirrors and retire entries written before they
     /// carried a database oid. A declared tenant owns its own
     pub legacy_owner: Option<u32>,
@@ -113,6 +113,8 @@ pub(crate) struct TenantBoot<'a> {
     pub pending: PendingDatabases,
     /// Session I/O tracker, waited out before an attach restart reopens files
     pub io: tokio_util::task::TaskTracker,
+    /// Registry the boundary gate publishes stalls to while the pump is parked
+    pub metrics: walshadow::metrics::MetricsRegistry,
 }
 
 /// Session parts every tenant shares, cloned into each [`TenantBoot`]
@@ -133,6 +135,7 @@ pub(crate) struct SessionShared {
     pub decoder_queue_capacity: usize,
     pub span_tracing: bool,
     pub io: tokio_util::task::TaskTracker,
+    pub metrics: walshadow::metrics::MetricsRegistry,
 }
 
 impl SessionShared {
@@ -189,6 +192,7 @@ impl SessionShared {
             legacy_owner: None,
             pending: PendingDatabases::default(),
             io: self.io.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -257,7 +261,7 @@ pub(crate) async fn publish_tenant_bridges(
 /// Start tables as the resolver's opt-in rows
 pub(crate) fn start_opt_ins(
     tables: &[walshadow::tenant::StartTable],
-) -> ahash::HashMap<RelName, walshadow::runtime_config::TableRow> {
+) -> foldhash::HashMap<RelName, walshadow::runtime_config::TableRow> {
     tables
         .iter()
         .map(|t| {
@@ -361,10 +365,12 @@ impl Tenant {
                 .with_context(|| format!("tenant {}: drain queueing decoder sink", self.id))?;
         }
         if let Some(pipeline) = self.pipeline.take() {
-            pipeline
-                .join()
-                .await
-                .map_err(|m| anyhow::anyhow!("tenant {}: pipeline drain failed: {m}", self.id))?;
+            pipeline.join().await.map_err(|m| {
+                anyhow::anyhow!(
+                    "tenant {}: decode+insert pipeline drain failed: {m}",
+                    self.id
+                )
+            })?;
         }
         let resume_safe = self.resume_safe().await;
         // Close the floor channel and join: nothing else may own a
@@ -439,6 +445,7 @@ pub(crate) async fn open_tenant(
         legacy_owner,
         pending,
         io,
+        metrics,
     } = boot;
     let mut tasks = tasks;
     tokio::fs::create_dir_all(&dir)
@@ -710,8 +717,7 @@ pub(crate) async fn open_tenant(
             walshadow::pipeline::build_budget(&emitter_cfg, emitter_cfg.decoder_pool_size)
                 .map_err(|e| anyhow::anyhow!("memory budget: {e}"))?;
         let mut dbs: Vec<Arc<SourceDb>> = Vec::with_capacity(db_conns.len());
-        let mut applicators: HashMap<Oid, walshadow::ch_ddl::DdlApplicator> = HashMap::new();
-        let mut backfillers: HashMap<Oid, Arc<dyn walshadow::opt_in::Backfiller>> = HashMap::new();
+        let mut ddl: HashMap<Oid, walshadow::pipeline::DbDdl> = HashMap::new();
         let activation = walshadow::config::Activation {
             priming,
             opt_ins: activation_opt_ins,
@@ -720,6 +726,7 @@ pub(crate) async fn open_tenant(
             let built = build_source_db(SourceDbInputs {
                 args,
                 conn,
+                cfg: conn.emitter.clone().expect("destination present"),
                 primary: i == primary,
                 desc_log: &desc_logs[i],
                 spill_dir: db_dir(conn),
@@ -750,21 +757,19 @@ pub(crate) async fn open_tenant(
                 emitter_cfg.conn.compression = rc.conn.compression;
                 emitter_cfg.retry.max_attempts = rc.retry_max_attempts;
             }
-            if let Some(applicator) = built.applicator {
-                applicators.insert(conn.oid, applicator);
+            let db_ddl = walshadow::pipeline::DbDdl {
+                applicator: built.applicator,
+                backfiller: built.backfiller.clone(),
+                resolver: built.resolver.clone(),
+            };
+            ddl.insert(conn.oid, db_ddl);
+            copy_backfillers.insert(conn.oid, built.backfiller);
+            if i == primary {
+                config_resolvers.insert(0, built.resolver.clone());
+            } else {
+                config_resolvers.push(built.resolver.clone());
             }
-            if let Some(backfiller) = built.backfiller.clone() {
-                backfillers.insert(conn.oid, backfiller as _);
-                copy_backfillers.insert(conn.oid, built.backfiller.expect("just cloned"));
-            }
-            if let Some(resolver) = &built.db.resolver {
-                if i == primary {
-                    config_resolvers.insert(0, resolver.clone());
-                } else {
-                    config_resolvers.push(resolver.clone());
-                }
-                resolvers_by_db.insert(conn.oid, resolver.clone());
-            }
+            resolvers_by_db.insert(conn.oid, built.resolver);
             dbs.push(built.db);
         }
         let (decoders, inserters) = (
@@ -785,16 +790,15 @@ pub(crate) async fn open_tenant(
             emitter: emitter_cfg,
             decoder_pool_size: decoders,
             inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_oid)),
+            dbs: Arc::new(SourceDbs::new(dbs, primary)),
             oracle: oracle.clone(),
-            applicators,
+            ddl,
             tail: TailKind::ClickHouse,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             pending: pending_catalog.clone(),
             stats: stats.clone(),
             span_registry: span_registry.clone(),
-            backfillers,
             retires,
             pending_rows,
             resume_floor: resume_floor.clone(),
@@ -833,16 +837,15 @@ pub(crate) async fn open_tenant(
             emitter: EmitterConfig::default(),
             decoder_pool_size: decoders,
             inserter_pool_size: inserters,
-            dbs: Arc::new(SourceDbs::new(dbs, primary_oid)),
+            dbs: Arc::new(SourceDbs::new(dbs, primary)),
             oracle: None,
-            applicators: HashMap::new(),
+            ddl: HashMap::new(),
             tail: TailKind::Null,
             buffer: xact_buffer.clone(),
             subxact_tracker: Arc::new(Mutex::new(SubxactTracker::new())),
             pending: pending_catalog.clone(),
             stats: Arc::new(EmitterStats::default()),
             span_registry: span_registry.clone(),
-            backfillers: HashMap::new(),
             retires,
             pending_rows: walshadow::visibility_pending::PendingLedger::empty().shared(),
             resume_floor: resume_floor.clone(),
@@ -856,7 +859,7 @@ pub(crate) async fn open_tenant(
     let ack_probe = pipeline_handle.ack_probe.clone();
     let reorder_sink = booting_reorder
         .boot(
-            Some(&args.bootstrap_shadow_data_dir),
+            &args.bootstrap_shadow_data_dir,
             desc_logs
                 .iter()
                 .flat_map(|log| log.active_present_at(raw_start.get()))
@@ -881,10 +884,11 @@ pub(crate) async fn open_tenant(
     let boundary_gate = CatalogBoundaryGate::new(
         shadow_state,
         BoundaryGateConfig {
-            hold_timeout: Duration::from_secs(args.catalog_hold_timeout),
+            warn_after: Duration::from_secs(args.catalog_hold_timeout),
             ..BoundaryGateConfig::default()
         },
-    );
+    )
+    .with_local_shadow(db_conns[primary].bridge.clone(), metrics);
     let boundary_hold_stats = boundary_gate.stats.clone();
     // One capture per database: a boundary's catalog reads answer over the
     // connection to the database that wrote them

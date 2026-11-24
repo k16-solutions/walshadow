@@ -71,9 +71,7 @@ impl<D: RecordSink + Send> RecordSink for DecoderXactPair<D> {
 ///
 /// `metrics` stays synchronous on the pump task (counter bumps, never
 /// await). The decoder/xact-drain pair runs behind a [`QueueingRecordSink`](walshadow::queueing_record_sink::QueueingRecordSink)
-/// so its `wait_for_replay` waits don't park the pump task: each gate
-/// would freeze wire delivery for a full shadow apply round-trip and
-/// couple wire pacing to decode.
+/// so decode and drain cost doesn't pace wire delivery.
 pub(crate) struct DaemonSinks {
     pub(crate) metrics: MetricsRecordSink,
     /// Per-tenant queueing sinks, each wrapped with the catalog-boundary
@@ -121,5 +119,73 @@ impl RecordSink for DaemonSinks {
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + '_>> {
         self.observe(&record);
         self.decoder_xact.on_record_owned(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use walshadow::record::{CountingRecordSink, WAL_SEG_SIZE};
+
+    #[tokio::test]
+    async fn decoder_pair_forwards_single_record_to_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = walshadow::desc_log::DescLogIdentity {
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            db_oid: 5,
+            wal_seg_size: WAL_SEG_SIZE as u32,
+        };
+        let log = walshadow::desc_log::DescriptorLog::open(tmp.path(), identity)
+            .await
+            .unwrap();
+        let config = walshadow::xact_buffer::XactBufferConfig::new(tmp.path().join("spill"));
+        let buffer = walshadow::xact_buffer::XactBuffer::new(config).unwrap();
+        let mut pair = DecoderXactPair {
+            decoder: BufferingDecoderSink::new(
+                walshadow::desc_log::DescriptorLogs::single(Arc::new(log)),
+                Arc::new(tokio::sync::Mutex::new(buffer)),
+            ),
+            xact_drain: CountingRecordSink::default(),
+        };
+        let record = Record {
+            source_lsn: 40,
+            next_lsn: 64,
+            ..Default::default()
+        };
+        pair.on_record(&record).await.unwrap();
+        assert_eq!(pair.xact_drain.count, 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_sinks_count_borrowed_record_and_queue_it() {
+        use walshadow::boundary_hold::{BoundaryGateConfig, CatalogBoundaryGate};
+        use walshadow::queueing_record_sink::QueueingRecordSink;
+        let queue = QueueingRecordSink::spawn(CountingRecordSink::default(), 1, 4, None);
+        let state = walshadow::shadow_stream::ShadowStreamState::new(1, "1".into(), 0, 1);
+        let gate = CatalogBoundaryGate::new(
+            Arc::new(tokio::sync::Mutex::new(state)),
+            BoundaryGateConfig::default(),
+        );
+        // k16 fork: the pump feeds a tenant router, here with one tenant
+        let mut router =
+            walshadow::tenant::router::TenantRouter::new(std::time::Duration::from_secs(60), false);
+        router.attach(walshadow::tenant::router::RoutedTenant::new(
+            walshadow::tenant::LEGACY_TENANT.into(),
+            vec![0],
+            0,
+            walshadow::boundary_hold::BoundaryHoldSink::new(queue, gate),
+        ));
+        let mut sinks = DaemonSinks {
+            metrics: MetricsRecordSink::default(),
+            decoder_xact: router,
+            span_registry: None,
+        };
+        let record = Record::default();
+        sinks.on_record(&record).await.unwrap();
+        assert_eq!(sinks.metrics.total, 1);
+        sinks.decoder_xact.flush().await.unwrap();
     }
 }

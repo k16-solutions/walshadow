@@ -11,7 +11,7 @@ use crate::emit::ch_emitter::EmitterConfig;
 use crate::mapping::MappingHandle;
 use crate::snowflake::runtime::SnowflakeRuntime;
 use crate::snowflake::state::GenerationPhase;
-use ahash::HashSet;
+use foldhash::HashSet;
 
 impl BootstrapConfig {
     pub fn with_snapshot_lsn(mut self, lsn: u64) -> Self {

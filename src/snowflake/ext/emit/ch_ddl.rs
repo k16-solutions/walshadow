@@ -177,9 +177,27 @@ impl DdlApplicator {
                 (new.rel_name.clone(), Some(next)),
             ]);
         }
+        if let Some(runtime) = self.snowflake.clone() {
+            // Planning surfaces Snowflake's refusals; `predict_route_mapping`
+            // is infallible upstream, so it can only drop them
+            let excluded = match event {
+                SchemaEvent::Added { desc } | SchemaEvent::Changed { new: desc, .. }
+                    if !mapping.contains_key(&desc.rel_name) =>
+                {
+                    self.is_excluded(desc).await
+                }
+                _ => false,
+            };
+            let cfg = self.plan_config(config);
+            return Ok(
+                predict_snowflake_route_effect(&cfg, mapping, event, excluded, &runtime)?
+                    .into_iter()
+                    .collect(),
+            );
+        }
         Ok(self
             .predict_route_mapping(event, mapping, config)
-            .await?
+            .await
             .into_iter()
             .collect())
     }
@@ -249,7 +267,7 @@ impl DdlApplicator {
         &mut self,
         desc: &RelDescriptor,
         snowflake: &SnowflakeRuntime,
-    ) -> Result<bool, EmitterError> {
+    ) -> Result<(), EmitterError> {
         snowflake_columns(desc, &self.config.column_rules)?;
         if let Some(mapping) = self.mapping_for(&desc.rel_name) {
             validate_snowflake_route(desc, &mapping, snowflake)?;
@@ -259,7 +277,7 @@ impl DdlApplicator {
             .await
             .map_err(|e| EmitterError::Config(e.to_string()))?;
         self.stats.creates_applied += 1;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -365,7 +383,7 @@ pub(super) fn predict_snowflake_route_effect(
             new.rel_name
         )));
     }
-    let effect = predict_route_effect(cfg, mapping, event, excluded)?;
+    let effect = predict_route_effect(cfg, mapping, event, excluded);
     if let SchemaEvent::Changed { new, .. } = event
         && let Some((_, Some(mapped))) = &effect
     {

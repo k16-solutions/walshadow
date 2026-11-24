@@ -43,6 +43,8 @@ pub struct PassContext {
     /// Source PG major: picks the backup's pg_multixact offsets width
     pub source_major: u32,
     pub checkpoint: crate::backfill::backup_checkpoint::BackupCheckpoint,
+    /// Interval between walk and gap replay checkpoints
+    pub checkpoint_period: std::time::Duration,
 }
 
 /// Walk-phase counters a resumed pass reports rather than re-deriving from
@@ -55,6 +57,32 @@ pub struct WalkCounts {
     pub multixact: u64,
     pub pg_xact_segments: usize,
 }
+
+#[derive(Debug)]
+pub enum PassError {
+    Preflight(anyhow::Error),
+    Load(anyhow::Error),
+}
+
+impl PassError {
+    pub fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::Preflight(e) | Self::Load(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for PassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.inner())
+        } else {
+            write!(f, "{}", self.inner())
+        }
+    }
+}
+
+impl std::error::Error for PassError {}
 
 #[derive(Debug, Default, Clone)]
 pub struct PassOutcome {

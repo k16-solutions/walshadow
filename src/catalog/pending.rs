@@ -23,7 +23,7 @@ use tokio_postgres::types::Oid;
 use walrus::pg::walparser::RelFileNode;
 
 use crate::schema::RelDescriptor;
-use ahash::HashMap;
+use foldhash::HashMap;
 
 /// Why one transaction's pending coverage stopped being trustworthy. Every
 /// reason falls back to commit-time capture, which is sound
@@ -451,6 +451,16 @@ mod tests {
             Some(DegradeReason::QueryError),
             "a member's degrade degrades the tree"
         );
+    }
+
+    #[test]
+    fn consolidate_moves_a_tree_only_its_child_captured() {
+        let p = PendingCatalog::default();
+        let rfn = desc(16400, 7000, "t").rfn;
+        p.record(101, vec![slot(200, 101, desc(16400, 7000, "child"))]);
+        p.consolidate(100, &[100, 101]);
+        assert_eq!(p.tracked_xacts(), 1);
+        assert_eq!(&*p.chain(100, rfn)[0].desc.rel_name.name, "child");
     }
 
     #[test]

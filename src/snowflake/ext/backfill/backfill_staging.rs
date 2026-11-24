@@ -12,7 +12,7 @@ use crate::runtime_config::InitialLoadMode;
 use crate::schema::RelDescriptor;
 use crate::snowflake::runtime::SnowflakeRuntime;
 use crate::snowflake::state::GenerationPhase;
-use ahash::HashSetExt;
+use foldhash::HashSetExt;
 use futures::{StreamExt, TryStreamExt};
 
 /// One backup-walk snapshot generation. `Replayed` means a prior successful

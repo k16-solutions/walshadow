@@ -33,7 +33,7 @@ use crate::source::source_feed::{SourceEvent, SourceFeed, StandbyStatus};
 use crate::source::wal_stream::WalStream;
 use crate::toast::ToastResolver;
 use crate::xact::xact_buffer::{XactBuffer, XactBufferConfig};
-use ahash::HashSet;
+use foldhash::HashSet;
 
 /// Wind-down poll while source sends no WAL
 const STOP_POLL: Duration = Duration::from_millis(100);
@@ -194,7 +194,7 @@ impl Leg {
                 drain_batch_bytes: cfg.dest.current().drain_batch_bytes,
                 ..XactBufferConfig::new(spill)
             })
-            .map_err(|e| anyhow::anyhow!("bootstrap window leg: xact buffer: {e}"))?,
+            .context("bootstrap window leg: xact buffer")?,
         ));
         buffer.lock().await.clear_scratch_dir().ok();
 
@@ -339,7 +339,7 @@ async fn run_live(
         .await
         .context("bootstrap window leg: START_REPLICATION")?;
     let mut stream = WalStream::builder(timeline, WAL_SEG_SIZE, Pos::new(begin))
-        .map_err(|e| anyhow::anyhow!("bootstrap window leg: WalStream: {e}"))?;
+        .context("bootstrap window leg: WalStream")?;
     stream.filter_mut().set_target_db(leg.db_oid);
     let mut stream = stream.start();
     let mut seg_sink = DropSegments;
@@ -476,6 +476,17 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn scratch_log_below_a_file_fails_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        tokio::fs::write(&file, b"").await.unwrap();
+        let err = seed_scratch_log(&file.join("log"), ident(), &CatalogMap::new(), 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("create "), "{err}");
+    }
+
     /// TOAST records decode but do not route directly
     #[test]
     fn toast_rels_filter_but_do_not_target() {
@@ -550,6 +561,41 @@ mod tests {
         assert_eq!(
             segs.iter().map(|(s, _)| s.format()).collect::<Vec<_>>(),
             names,
+        );
+    }
+
+    #[tokio::test]
+    async fn leg_reports_spill_dir_it_cannot_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("xact_spill"), b"").unwrap();
+        let mut catalog = CatalogMap::new();
+        catalog.insert(desc(16400, 16400, "public", "t"));
+        let stats = Arc::new(EmitterStats::default());
+        let cfg = WindowLegConfig {
+            dest: crate::config::DestEmitter::new(Arc::default(), None),
+            mapping: crate::mapping::mapping_handle(Default::default()),
+            config: Arc::new(ResolvedConfig::default()),
+            stats,
+            resolver: ToastResolver::disabled(),
+            oracle: None,
+            fatal: Fatal::new(),
+            scratch_dir: tmp.path().to_path_buf(),
+            patch: Arc::default(),
+            catalog,
+            pg_major: 17,
+            system_id: "7300000000000000001".into(),
+            timeline: 1,
+            wind_down: Duration::ZERO,
+        };
+        let err = replay_segments(cfg, &[], WAL_SEG_SIZE, WAL_SEG_SIZE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "bootstrap window leg: open: create {}: File exists (os error 17)",
+                tmp.path().join("xact_spill").display()
+            )
         );
     }
 }

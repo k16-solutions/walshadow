@@ -36,7 +36,7 @@ use crate::mapping::MappingSnapshot;
 use crate::schema::RelName;
 use crate::ticker::Ticker;
 use crate::toast::ToastResolver;
-use ahash::HashSet;
+use foldhash::HashSet;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GateStats {
@@ -65,7 +65,7 @@ pub async fn stream_phase(
 ) -> Result<(), String> {
     let mut forwarded = 0u64;
     let mut popped: Vec<(String, u64)> = Vec::new();
-    let mut ticker = Ticker::new(WALK_CHECKPOINT_PERIOD);
+    let mut ticker = Ticker::new(barrier.map_or(WALK_CHECKPOINT_PERIOD, |b| b.period()));
     while let Some(slab) = rx.recv().await {
         // Empty slab means one walked file's tuples are all behind us
         if slab.is_empty() {
@@ -551,11 +551,11 @@ mod tests {
     use crate::backfill::spool::DEFERRED_SPOOL_MEM_MAX;
     use crate::backfill::spool::SpoolMark;
     use crate::decode::visibility::{
-        HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMIN_COMMITTED,
-        HEAP_XMIN_INVALID,
+        HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY,
+        HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
     };
     use crate::decode::visibility::{PgMultiXactAccum, PgXactAccum};
-    use ahash::HashSetExt;
+    use foldhash::HashSetExt;
     use std::path::PathBuf;
     use walrus::pg::walparser::RelFileNode;
 
@@ -622,7 +622,10 @@ mod tests {
             };
             let mut entry = expect_tap(sink.begin(&meta).await.unwrap());
             for page in 0..pages {
-                entry.chunk(&visible_page(page as i32)).await.unwrap();
+                entry
+                    .chunk(visible_page(page as i32).to_vec())
+                    .await
+                    .unwrap();
             }
             entry.end().await.unwrap();
         }
@@ -716,6 +719,45 @@ mod tests {
         );
     }
 
+    /// Zero period hands every slab's files over at once; an end-of-file
+    /// slab with no finished file pairs nothing
+    #[tokio::test]
+    async fn zero_period_barrier_publishes_per_slab() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let barrier = Arc::new(WalkBarrier::new(std::time::Duration::ZERO));
+        let (walk_tx, mut walk_rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let (tx, mut rx) = mpsc::channel::<Vec<BackfillTuple>>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = DeferredSpool::new(dir.path().join("gate.bin"), DEFERRED_SPOOL_MEM_MAX);
+        let visible = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
+        walk_tx.send(Vec::new()).await.unwrap();
+        walk_tx.send(vec![tuple(10, 0, visible)]).await.unwrap();
+        barrier.finished_file("base/5/16400".into()).await;
+        walk_tx.send(Vec::new()).await.unwrap();
+        walk_tx.send(vec![tuple(11, 0, visible)]).await.unwrap();
+        drop(walk_tx);
+
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            &mut spool,
+            &mut GateStats::default(),
+            &EmitterStats::default(),
+            Some(&barrier),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await.map(|s| s.len()), Some(1));
+        barrier.publish_drain(1, 3, SpoolMark::default()).await;
+        assert_eq!(
+            barrier.collect().await.unwrap().files(),
+            vec!["base/5/16400".to_string()]
+        );
+    }
+
     /// A failed lane surfaces its own message, not a channel-closure artifact
     #[tokio::test]
     async fn drain_failure_surfaces_through_join() {
@@ -787,7 +829,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = CatalogMap::new();
         catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
-        let mut tables = ahash::HashMap::default();
+        let mut tables = foldhash::HashMap::default();
         tables.insert(
             RelName::new("public", "t"),
             TableMapping {
@@ -1130,6 +1172,37 @@ mod tests {
         assert_eq!(stats.gated, 1);
     }
 
+    /// Lock-only multixact xmax leaves the row live in either phase
+    #[tokio::test]
+    async fn lock_only_multixact_rows_emit_and_count() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let locked = || {
+            tuple(
+                100,
+                10,
+                HEAP_XMIN_COMMITTED | HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY,
+            )
+        };
+        let (stats, passed) = run_stream_phase(&catalog, vec![locked()]).await;
+        assert_eq!((stats.emitted, stats.multixact_emitted), (1, 1));
+        assert_eq!(passed.len(), 1);
+
+        let accum = PgXactAccum::new();
+        let patch = SealedPatch::default();
+        let multi = PgMultiXactAccum::new(17);
+        let view = PgXactView::new(&accum, &patch).with_multixact(&multi);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stats = GateStats::default();
+        let spool = spool_at("lock-only", vec![locked()]).await;
+        resolve_phase(spool, &view, &tx, None, &mut stats)
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!((stats.emitted, stats.multixact_emitted), (1, 1));
+        assert_eq!(rx.recv().await.map(|slab| slab.len()), Some(1));
+    }
+
     #[tokio::test]
     async fn undecidable_multixact_aborts_the_pass() {
         let accum = PgXactAccum::new();
@@ -1185,5 +1258,227 @@ mod tests {
         .unwrap();
         assert_eq!(stats.emitted, 7);
         assert!(pending_tables.is_empty());
+    }
+
+    /// Spool whose file sits below a regular file, so creating it fails
+    fn unwritable_spool(dir: &tempfile::TempDir, mem_max: usize) -> DeferredSpool {
+        std::fs::write(dir.path().join("file"), b"").unwrap();
+        DeferredSpool::new(dir.path().join("file/spool.bin"), mem_max)
+    }
+
+    async fn stream_err(spool: &mut DeferredSpool, barrier: Option<&Arc<WalkBarrier>>) -> String {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let (walk_tx, mut walk_rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
+        walk_tx.send(vec![tuple(100, 0, 0)]).await.unwrap();
+        drop(walk_tx);
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            spool,
+            &mut GateStats::default(),
+            &EmitterStats::default(),
+            barrier,
+        )
+        .await
+        .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn stream_phase_reports_spool_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = stream_err(&mut unwritable_spool(&dir, 0), None).await;
+        assert!(
+            err.starts_with("visibility gate: deferred spool: "),
+            "{err}"
+        );
+
+        let barrier = Arc::new(WalkBarrier::new(std::time::Duration::ZERO));
+        let mut spool = unwritable_spool(&dir, DEFERRED_SPOOL_MEM_MAX);
+        let err = stream_err(&mut spool, Some(&barrier)).await;
+        assert!(
+            err.starts_with("visibility gate: deferred spool checkpoint: "),
+            "{err}"
+        );
+    }
+
+    /// Closed drain ends the walk phase without reading further slabs
+    #[tokio::test]
+    async fn stream_phase_stops_when_drain_hangs_up() {
+        let mut catalog = CatalogMap::new();
+        catalog.insert(make_rel_named(16400, 16400, 0, RelName::new("public", "t")));
+        let visible = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
+        let (walk_tx, mut walk_rx) = mpsc::channel(2);
+        walk_tx.send(vec![tuple(100, 0, visible)]).await.unwrap();
+        walk_tx.send(vec![tuple(101, 0, visible)]).await.unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut stats = GateStats::default();
+        stream_phase(
+            &mut walk_rx,
+            &tx,
+            &catalog,
+            &mut spool_of(Vec::new()).await,
+            &mut stats,
+            &EmitterStats::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.emitted, 1);
+        assert_eq!(walk_rx.recv().await.map(|slab| slab.len()), Some(1));
+    }
+
+    async fn resolve_err(spool: DeferredSpool) -> String {
+        let accum = PgXactAccum::new();
+        let patch = SealedPatch::default();
+        let view = PgXactView::new(&accum, &patch);
+        let (tx, _rx) = mpsc::channel(1);
+        resolve_phase(spool, &view, &tx, None, &mut GateStats::default())
+            .await
+            .unwrap_err()
+    }
+
+    /// File-backed spool of one visible tuple
+    async fn file_spool(dir: &tempfile::TempDir) -> DeferredSpool {
+        let mut spool = DeferredSpool::new(dir.path().join("spool.bin"), 0);
+        spool
+            .push(tuple(100, 0, HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID))
+            .await
+            .unwrap();
+        spool.checkpoint().await.unwrap();
+        spool
+    }
+
+    #[tokio::test]
+    async fn resolve_phase_reports_spool_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = file_spool(&dir).await;
+        std::fs::remove_file(spool.path()).unwrap();
+        let err = resolve_err(spool).await;
+        assert!(
+            err.starts_with("visibility gate: deferred spool seal: "),
+            "{err}"
+        );
+
+        let spool = file_spool(&dir).await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(spool.path())
+            .unwrap()
+            .set_len(6)
+            .unwrap();
+        let err = resolve_err(spool).await;
+        assert!(
+            err.starts_with("visibility gate: deferred spool replay: "),
+            "{err}"
+        );
+
+        // Directory without write permission keeps replayed file in place
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::remove_file(dir.path().join("spool.bin")).unwrap();
+        let spool = file_spool(&dir).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = resolve_err(spool).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.starts_with("visibility gate: deferred spool cleanup: "),
+            "{err}"
+        );
+    }
+
+    /// Closed drain ends the replay at the first slab that cannot go out
+    #[tokio::test]
+    async fn resolve_phase_stops_when_drain_hangs_up() {
+        let visible = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
+        let spool = spool_at(
+            "hang-up",
+            (0..=GATE_SLAB_ROWS as u32)
+                .map(|xid| tuple(100 + xid, 0, visible))
+                .collect(),
+        )
+        .await;
+        let accum = PgXactAccum::new();
+        let patch = SealedPatch::default();
+        let view = PgXactView::new(&accum, &patch);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut stats = GateStats::default();
+        resolve_phase(spool, &view, &tx, None, &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(stats.emitted, GATE_SLAB_ROWS as u64);
+    }
+
+    #[tokio::test]
+    async fn panicked_lane_surfaces_as_join_failure() {
+        let lanes = DrainLanes::spawn_all(
+            "drain",
+            [true, false].map(|panics| async move {
+                assert!(!panics, "lane");
+                Ok(BootstrapDrainOutcome::default())
+            }),
+        );
+        let err = lanes.join().await.unwrap_err();
+        assert!(err.starts_with("bootstrap drain join: "), "{err}");
+    }
+
+    /// Resumed attempt reopens each lane's handback spool at its counted size
+    #[tokio::test]
+    async fn spawn_inherits_checkpointed_handback_spools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("inherit_deferred.0.bin");
+        let mut spool = DeferredSpool::new(path.clone(), 0);
+        spool
+            .push(tuple(100, 0, HEAP_XMIN_COMMITTED))
+            .await
+            .unwrap();
+        spool.checkpoint().await.unwrap();
+        drop(spool);
+        let sink = |records| GreenfieldSink {
+            catalog: CatalogMap::new(),
+            mapping: Default::default(),
+            config: Arc::new(ResolvedConfig::default()),
+            dest: crate::config::DestEmitter::new(Arc::default(), None),
+            stats: Arc::new(EmitterStats::default()),
+            resolver: ToastResolver::disabled(),
+            skip_initial: HashSet::new(),
+            scratch_dir: tmp.path().to_path_buf(),
+            inherit_spools: vec![SpooledRecords {
+                path: path.clone(),
+                records,
+            }],
+        };
+        let (ack, ack_task) = crate::emit::pipeline::ack::spawn(
+            Arc::new(Default::default()),
+            crate::emit::pipeline::Fatal::new(),
+        );
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+
+        let err = sink(2)
+            .spawn(vec![(msg_tx.clone(), ack.clone())], "inherit")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.starts_with("bootstrap: reopen handback spool: "),
+            "{err}"
+        );
+
+        let (txs, lanes) = sink(1)
+            .spawn(vec![(msg_tx, ack.clone())], "inherit")
+            .await
+            .unwrap();
+        drop(txs);
+        let drained = lanes.join().await.unwrap();
+        assert_eq!(
+            drained[0].deferred.as_ref().map(DeferredSpool::records),
+            Some(1)
+        );
+        drop(drained);
+        drop(ack);
+        ack_task.await.unwrap();
     }
 }

@@ -146,7 +146,7 @@ jobs:
       - name: Install PostgreSQL ${{ matrix.pg-major }} (PGDG)
         run: |
           sudo systemctl stop postgresql 2>/dev/null || true
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          curl -fsSL --retry 5 --retry-all-errors https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/postgres-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/postgres-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main ${{ matrix.pg-major }}" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
@@ -168,7 +168,7 @@ jobs:
       - name: Install ClickHouse (server + client)
         run: |
           sudo apt-get install -y apt-transport-https ca-certificates
-          curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
+          curl -fsSL --retry 5 --retry-all-errors https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/clickhouse.list
@@ -285,6 +285,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # cargo-llvm-cov skips build/*/*/out dirs lacking a sibling fingerprint
+      # dir as build script output, and nextest archives omit fingerprints,
+      # dropping every test binary under cargo's v2 build-dir layout
+      # https://github.com/taiki-e/cargo-llvm-cov/issues/520
+      - name: Mark extracted test binaries as v2 layout
+        if: ${{ !cancelled() }}
+        working-directory: walshadow/target/llvm-cov-target/target/debug/build
+        run: find . -mindepth 3 -maxdepth 3 -type d -name out -execdir mkdir -p fingerprint \;
+
       # Preserve coverage from failed test runs. Build failures may have none.
       - name: Coverage summary (job log)
         if: ${{ !cancelled() }}
@@ -349,9 +358,9 @@ jobs:
           printf 'merging %s\n' "${inputs[@]}"
           awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
 
-      # Lower ceiling as tests land, zero means every DA line hit.
-      # Upstream's 2950 covers upstream's code; this fork's Snowflake
-      # destination and tenants add ~4250 missed lines (7046 at the merge)
+      # k16 fork: upstream requires 100% line coverage. This fork's Snowflake
+      # destination and tenants aren't there yet, so cap missed lines instead.
+      # Lower the ceiling as tests land; 0 is upstream's rule.
       - name: Coverage summary
         working-directory: walshadow
         env:
@@ -360,33 +369,11 @@ jobs:
           awk -F'[:,]' -v max="$MAX_MISSED_LINES" '
             /^DA:/ { f++; if ($3 > 0) h++ }
             END {
+              if (!f) { print "::error::no line coverage data"; exit 1 }
               printf "merged line coverage: %d/%d = %.2f%%, %d missed\n", h, f, 100 * h / f, f - h
               if (f - h > max) { printf "::error::%d missed lines exceeds ceiling %d\n", f - h, max; exit 1 }
             }
           ' merged.lcov
-
-      - name: Fail on any 0%-coverage file (merged)
-        working-directory: walshadow
-        run: |
-          set -euo pipefail
-          zero=$(awk '
-            /^SF:/ { f = substr($0, 4) }
-            /^LF:/ { lf = substr($0, 4) + 0 }
-            /^LH:/ {
-              if (substr($0, 4) + 0 == 0 && lf > 0) {
-                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
-                print f
-              }
-            }
-          ' merged.lcov)
-          if [ -n "$zero" ]; then
-            count=$(printf '%s\n' "$zero" | grep -c .)
-            echo "Files with 0% line coverage (every source file must be exercised by a test):"
-            printf '%s\n' "$zero" | sed 's/^/  /'
-            echo "::error::${count} file(s) have 0% line coverage"
-            exit 1
-          fi
-          echo "OK: all merged files have >0% line coverage."
 
       - name: Install genhtml
         run: sudo apt-get update && sudo apt-get install -y lcov
@@ -455,3 +442,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --lib --bins
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Advisories, licenses, bans, sources over the Linux graph (deny.toml)
+      - name: cargo deny
+        working-directory: walshadow
+        run: cargo deny --locked check

@@ -17,7 +17,6 @@
 //! Single-database model: instance bound to one DB.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU64;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -34,7 +33,7 @@ use crate::ops::bridge::{
 #[cfg(test)]
 use crate::pg::socket_conninfo;
 use crate::schema::{FIRST_NORMAL_OBJECT_ID, RelDescriptor, RelName, ReplIdent};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -50,12 +49,6 @@ pub enum CatalogError {
     ForeignDatabase(RelFileNode),
     #[error("relation not found by oid {0}")]
     NotFoundByOid(Oid),
-    #[error("timeout after {elapsed:?} waiting for replay ≥ {target:#X} (last observed: {last:?})")]
-    ReplayTimeout {
-        target: u64,
-        last: Option<u64>,
-        elapsed: Duration,
-    },
     #[error("parse: {0}")]
     Parse(String),
 }
@@ -83,46 +76,17 @@ impl ParkedAt {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ShadowCatalogConfig {
-    /// `pg_last_wal_replay_lsn()` poll interval
-    pub replay_poll: Duration,
-    /// [`ShadowCatalog::wait_for_replay`] gives up after this; also bounds
-    /// [`with_transient_retry`]'s window
-    pub replay_timeout: Duration,
-    pub reconnect_backoff_initial: Duration,
-    pub reconnect_backoff_max: Duration,
-}
-
-impl Default for ShadowCatalogConfig {
-    fn default() -> Self {
-        Self {
-            // 1 ms, not 50 ms: at 50 ms the fixed tick dominated worker
-            // throughput in `pgbench_acceptance` when shadow apply lagged
-            // pump dispatch by O(records); 1 ms keeps each wait_for_replay
-            // miss bounded by SQL round-trip cost instead
-            replay_poll: Duration::from_millis(1),
-            replay_timeout: Duration::from_secs(30),
-            reconnect_backoff_initial: Duration::from_millis(100),
-            reconnect_backoff_max: Duration::from_secs(1),
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ShadowCatalogStats {
     pub fetches: u64,
     /// Committed reads answered off the mirroring statement, not the worker
     pub mirror_fetches: u64,
-    pub replay_waits: u64,
     pub reconnects: u64,
 }
 
 pub struct ShadowCatalog {
     client: Client,
     conninfo: String,
-    config: ShadowCatalogConfig,
-    last_replay_lsn: Option<u64>,
     /// DB oid this client is connected to; survives `reconnect` since
     /// `conninfo` pins the DB
     current_db_oid: Option<Oid>,
@@ -164,11 +128,7 @@ impl ShadowCatalog {
     /// Connect over a libpq key=value conninfo. One-shot; wrap in
     /// [`with_transient_retry`] for retry-on-PG-coming-up. `conninfo` is stashed
     /// so the client can be rebuilt when shadow PG bounces.
-    pub async fn connect(
-        conninfo: &str,
-        config: ShadowCatalogConfig,
-        bridge: Arc<Bridge>,
-    ) -> Result<Self> {
+    pub async fn connect(conninfo: &str, bridge: Arc<Bridge>) -> Result<Self> {
         let (client, conn) = tokio_postgres::connect(conninfo, NoTls).await?;
         tokio::spawn(async move {
             let _ = conn.await;
@@ -176,8 +136,6 @@ impl ShadowCatalog {
         Ok(Self {
             client,
             conninfo: conninfo.to_string(),
-            config,
-            last_replay_lsn: None,
             current_db_oid: None,
             default_tablespace: None,
             bridge,
@@ -261,8 +219,7 @@ impl ShadowCatalog {
     }
 
     /// Rebuild the client from stashed `conninfo`. One-shot; retry via
-    /// [`with_transient_retry`]. Resets `last_replay_lsn` since a restarted
-    /// instance's replay LSN starts fresh.
+    /// [`with_transient_retry`].
     async fn reconnect(&mut self) -> Result<()> {
         let (client, conn) = tokio_postgres::connect(&self.conninfo, NoTls).await?;
         tokio::spawn(async move {
@@ -270,7 +227,6 @@ impl ShadowCatalog {
         });
         self.client = client;
         self.stats.reconnects += 1;
-        self.last_replay_lsn = None;
         Ok(())
     }
 
@@ -297,46 +253,6 @@ impl ShadowCatalog {
         query_with_reconnect!(self, query, statement, params)
     }
 
-    /// Wait until shadow's replay LSN ≥ `target`, returning the deciding poll's
-    /// LSN. `target = 0` returns on the first non-zero LSN.
-    ///
-    /// Polls the bridge worker, not SQL. `SELECT pg_last_wal_replay_lsn()`
-    /// needs no lock of its own but its *parse* opens `pg_type`, so it blocks
-    /// whenever replay is holding an AccessExclusiveLock on a catalog — and the
-    /// release for such a lock can be in WAL this very wait is what unblocks.
-    /// The worker reads the position out of shared memory instead, and it is
-    /// long-lived, so it parses nothing here.
-    pub async fn wait_for_replay(&mut self, target: u64) -> Result<u64> {
-        if let Some(seen) = self.last_replay_lsn
-            && seen >= target
-            && target != 0
-        {
-            return Ok(seen);
-        }
-        self.stats.replay_waits += 1;
-        let start = Instant::now();
-        let bridge = self.bridge.clone();
-        loop {
-            // Worker reports 0 off a standby, same as the SQL function's NULL
-            let lsn = NonZeroU64::new(bridge.replay_lsn().await?).map(NonZeroU64::get);
-            if let Some(lsn) = lsn {
-                self.last_replay_lsn = Some(self.last_replay_lsn.map_or(lsn, |old| old.max(lsn)));
-                if lsn >= target {
-                    return Ok(lsn);
-                }
-            }
-            let elapsed = start.elapsed();
-            if elapsed >= self.config.replay_timeout {
-                return Err(CatalogError::ReplayTimeout {
-                    target,
-                    last: self.last_replay_lsn,
-                    elapsed,
-                });
-            }
-            tokio::time::sleep(self.config.replay_poll).await;
-        }
-    }
-
     /// Batched descriptor fetch: N oids plus the shadow's replay position.
     /// Oids absent from pg_class are absent from the result (dropped rels).
     /// Zero-column rels yield empty attribute vecs.
@@ -353,7 +269,8 @@ impl ShadowCatalog {
     }
 
     /// [`fetch_descriptors_batch`](Self::fetch_descriptors_batch) pinned at
-    /// a [`ParkedAt`] position.
+    /// a [`ParkedAt`] position. Worker answers for that position or fails
+    /// with `ReplayMismatch`, so no replay position comes back.
     ///
     /// Parking is what keeps the read out of the deadlock: the worker checks
     /// the position on both sides and may then read a catalog whose lock replay
@@ -363,18 +280,20 @@ impl ShadowCatalog {
         &mut self,
         oids: &[Oid],
         at: &ParkedAt,
-    ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Oids(oids), Some(at.lsn()))
-            .await
+    ) -> Result<Vec<RelDescriptor>> {
+        let (_, descs) = self
+            .fetch_committed(Scope::Oids(oids), Some(at.lsn()))
+            .await?;
+        Ok(descs)
     }
 
     /// [`fetch_all_descriptors`](Self::fetch_all_descriptors), pinned as in
     /// [`fetch_descriptors_batch_at`](Self::fetch_descriptors_batch_at).
-    pub async fn fetch_all_descriptors_at(
-        &mut self,
-        at: &ParkedAt,
-    ) -> Result<(u64, Vec<RelDescriptor>)> {
-        self.fetch_committed(Scope::Eligible, Some(at.lsn())).await
+    pub async fn fetch_all_descriptors_at(&mut self, at: &ParkedAt) -> Result<Vec<RelDescriptor>> {
+        let (_, descs) = self
+            .fetch_committed(Scope::Eligible, Some(at.lsn()))
+            .await?;
+        Ok(descs)
     }
 
     /// Committed catalog at one replay position.
@@ -548,7 +467,7 @@ impl ShadowCatalog {
             Scope::Oids(oids) => self.query_retry(&MIRROR_BATCH_SQL, &[&oids]).await?,
             Scope::Eligible => self.query_retry(&MIRROR_ALL_SQL, &[]).await?,
         };
-        let mut out = DescriptorRows::from_mirror(&rows)?;
+        let mut out = DescriptorRows::from_mirror(rows.iter().map(|r| (r.get(0), r.get(1))))?;
         if let Scope::Oids(oids) = scope {
             out.requested = Some(oids.iter().copied().collect());
         }
@@ -588,18 +507,8 @@ impl ShadowCatalog {
             let list: Vec<Oid> = wanted.iter().copied().collect();
             let rows = self.query_retry(sql, &[&list]).await?;
             names.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
-            if names.len() == wanted.len() {
-                return Ok(names);
-            }
         }
-        let scan = bridge.scan_at(R::CATALOG, top_xid, &[], pin.lsn).await?;
-        for row in scan.parse::<R>()? {
-            let (oid, name) = name_of(row);
-            if wanted.contains(&oid) {
-                names.insert(oid, name);
-            }
-        }
-        Ok(names)
+        complete_names(bridge, wanted, names, name_of, top_xid, pin.lsn).await
     }
 
     pub async fn current_database_oid(&mut self) -> Result<Oid> {
@@ -642,12 +551,8 @@ impl ShadowCatalog {
 }
 
 /// Exponential-backoff retry on transient PG errors (closed connection, "system
-/// is starting up", connect refused). Non-PG errors (parse, not-found, replay
-/// timeout) surface immediately.
-///
-/// Outside `ShadowCatalog` on purpose: the catalog's invalidation and
-/// replay-LSN bookkeeping stay unaware of in-flight retries, seeing only the
-/// final outcome.
+/// is starting up", connect refused). Non-PG errors (parse, not-found) surface
+/// immediately.
 pub async fn with_transient_retry<R, F>(
     timeout: Duration,
     initial_backoff: Duration,
@@ -773,6 +678,28 @@ static MIRROR_ALL_SQL: LazyLock<String> = LazyLock::new(|| {
         "c.oid >= {FIRST_NORMAL_OBJECT_ID} AND c.relkind IN ('r', 'p', 'm', 't')"
     ))
 });
+
+/// Fill names the committed read lacks from one worker scan at `lsn`
+async fn complete_names<R: ScanRow>(
+    bridge: &Bridge,
+    wanted: &BTreeSet<Oid>,
+    mut names: HashMap<Oid, String>,
+    name_of: fn(R) -> (Oid, String),
+    top_xid: u32,
+    lsn: u64,
+) -> Result<HashMap<Oid, String>> {
+    if names.len() == wanted.len() {
+        return Ok(names);
+    }
+    let scan = bridge.scan_at(R::CATALOG, top_xid, &[], lsn).await?;
+    for row in scan.parse::<R>()? {
+        let (oid, name) = name_of(row);
+        if wanted.contains(&oid) {
+            names.insert(oid, name);
+        }
+    }
+    Ok(names)
+}
 
 /// Swap each fast default the statement marked present for its on-disk bytes
 /// off the worker, the one encoding decode reads. The bytes hold still while
@@ -911,12 +838,10 @@ struct DescriptorRows {
 impl DescriptorRows {
     /// Rows off [`mirror_sql`], keyed by the catalog ids `SCAN` requests carry
     /// in their own header.
-    fn from_mirror(rows: &[Row]) -> Result<Self> {
+    fn from_mirror(rows: impl IntoIterator<Item = (i32, Vec<Option<String>>)>) -> Result<Self> {
         let mut out = Self::default();
         let mut position = None;
-        for row in rows {
-            let id: i32 = row.get(0);
-            let cols: Vec<Option<String>> = row.get(1);
+        for (id, cols) in rows {
             if id == MIRROR_POSITION {
                 let text = cols.first().and_then(Option::as_deref).unwrap_or(NO_REPLAY);
                 let lsn: PgLsn = text
@@ -1134,13 +1059,6 @@ mod tests {
         assert!(s.contains("port=55434"));
         assert!(s.contains("user=postgres"));
         assert!(s.contains("dbname=postgres"));
-    }
-
-    #[test]
-    fn config_default_is_sane() {
-        let c = ShadowCatalogConfig::default();
-        assert!(c.replay_poll < c.replay_timeout);
-        assert!(c.reconnect_backoff_initial < c.reconnect_backoff_max);
     }
 
     #[test]
@@ -1392,11 +1310,6 @@ mod tests {
     fn is_transient_classifies_known_variants() {
         assert!(!is_transient(&CatalogError::Parse("x".into())));
         assert!(!is_transient(&CatalogError::NotFoundByOid(42)));
-        assert!(!is_transient(&CatalogError::ReplayTimeout {
-            target: 0,
-            last: None,
-            elapsed: Duration::from_secs(0),
-        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1436,6 +1349,153 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "non-transient must not retry",
+        );
+    }
+
+    #[test]
+    fn mirror_rows_need_one_valid_position() {
+        let position = |text: &str| (MIRROR_POSITION, vec![Some(text.to_owned())]);
+        let rows = DescriptorRows::from_mirror([position("0/10")]).unwrap();
+        assert_eq!(rows.replay_lsn, 0x10);
+        for (rows, want) in [
+            (vec![position("bogus")], "mirror replay position"),
+            (
+                vec![position("0/10"), (99, Vec::new())],
+                "mirror catalog id 99",
+            ),
+            (Vec::new(), "carried no position"),
+        ] {
+            let err = DescriptorRows::from_mirror(rows).err().unwrap();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn assemble_resolves_tablespace_and_rejects_duplicate_class_rows() {
+        let spaced = ClassRow {
+            reltablespace: 1700,
+            ..class_row()
+        };
+        let rows = |class| DescriptorRows {
+            class,
+            namespaces: names(&[(2200, "public")]),
+            ..DescriptorRows::default()
+        };
+        let descs = rows(vec![spaced.clone()])
+            .assemble(5, DEFAULT_TABLESPACE)
+            .unwrap();
+        assert_eq!(descs[0].rfn.spc_node, 1700);
+        let err = rows(vec![spaced.clone(), spaced])
+            .assemble(5, DEFAULT_TABLESPACE)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("two pg_class rows for oid 16384"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn odd_length_hex_rejects() {
+        assert_eq!(decode_hex("0a1"), None);
+        assert_eq!(decode_hex("0a1b"), Some(vec![0x0a, 0x1b]));
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_replica_identity() {
+        let class = ClassRow {
+            relreplident: 'x',
+            ..class_row()
+        };
+        let err = overlay(&class, &[], &[], &names(&[(2200, "public")])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "parse: unknown relreplident 'x' (expected one of d/n/f/i) for relation 16384"
+        );
+    }
+
+    /// Worker `SCAN` answer pinned at `lsn`; `None` is SQL null
+    fn scan_answer(lsn: u64, ncols: u16, rows: &[&[Option<&str>]]) -> Vec<u8> {
+        let mut b = vec![0u8];
+        b.extend_from_slice(&lsn.to_be_bytes());
+        b.extend_from_slice(&lsn.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+        b.extend_from_slice(&ncols.to_be_bytes());
+        for value in rows.iter().flat_map(|r| r.iter()) {
+            match value {
+                Some(v) => {
+                    b.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                    b.extend_from_slice(v.as_bytes());
+                }
+                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        b
+    }
+
+    async fn scripted_bridge(answers: Vec<Vec<u8>>) -> (tempfile::TempDir, Bridge) {
+        use crate::ops::bridge::{PROJECTION_VERSION, PROTO_VERSION, tests};
+        let script = std::iter::once(tests::hello_body(PROTO_VERSION, PROJECTION_VERSION))
+            .chain(answers)
+            .map(Some)
+            .collect();
+        let (tmp, path) = tests::spawn_worker(script);
+        (tmp, Bridge::connect(&path).await.unwrap())
+    }
+
+    /// Committed read short a name (dropped since the class scan, or never
+    /// committed) takes the rest from the worker at the pinned position
+    #[tokio::test(flavor = "current_thread")]
+    async fn names_committed_read_lacks_come_from_worker() {
+        let rows: [&[Option<&str>]; 3] = [
+            &[Some("2200"), Some("public")],
+            &[Some("16500"), Some("s")],
+            &[Some("16600"), Some("unwanted")],
+        ];
+        let (_tmp, bridge) = scripted_bridge(vec![scan_answer(0x5000, 2, &rows)]).await;
+        let wanted = BTreeSet::from([2200, 16500]);
+        let got = complete_names(
+            &bridge,
+            &wanted,
+            names(&[(2200, "public")]),
+            |r: NamespaceRow| (r.oid, r.nspname),
+            0,
+            0x5000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, names(&[(2200, "public"), (16500, "s")]));
+    }
+
+    /// `ALTER TABLE` rewrite between statement and worker scan clears
+    /// `atthasmissing`, so the bytes decode needs are gone
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_default_lost_by_worker_fails_the_read() {
+        let row: [Option<&str>; 12] = [
+            Some("16384"),
+            Some("2"),
+            Some("v"),
+            Some("23"),
+            Some("-1"),
+            Some("f"),
+            Some("f"),
+            Some("t"),
+            Some("4"),
+            Some("i"),
+            Some("p"),
+            None,
+        ];
+        let (_tmp, bridge) = scripted_bridge(vec![scan_answer(0x5000, 12, &[&row])]).await;
+        let mut attrs = [AttributeRow {
+            attmissingval: Some("{7}".into()),
+            ..attr_row(2, "v", 23)
+        }];
+        let err = raw_missing_values(&bridge, &mut attrs).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "parse: worker lost fast default of relation 16384 attnum 2 since the statement read it"
         );
     }
 }

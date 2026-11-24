@@ -19,12 +19,6 @@ use walshadow::wal_stream::WalStream;
 
 use crate::args::{Args, cli_base};
 
-/// How long the fork proofs wait for the pump-side queue to drain. Past it the
-/// buffer's own view answers, which reads a still-queued record as a
-/// transaction open at the fork and refuses the crossing — the fail-closed
-/// direction.
-pub(crate) const FORK_FENCE_DRAIN: Duration = Duration::from_secs(30);
-
 /// Branch the stream is reading, as a reconnect has to name it: number plus the
 /// switchpoint the proved chain places it at.
 pub(crate) fn stream_branch(
@@ -105,40 +99,25 @@ pub(crate) const PROMOTION_POLL: Duration = Duration::from_secs(1);
 /// paused: `pause_received` is the frozen head the target has to reach, and an
 /// unfrozen one moves under the decision.
 pub(crate) async fn promotion_gate(feed: &mut SourceFeed, pause_received: u64) -> PromotionGate {
-    let client = match feed.sql_client().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(target: "walshadow", error = %format!("{e:#}"), "promotion gate");
-            return PromotionGate::unreachable();
-        }
-    };
-    let row = client
-        .query_one(
-            "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()",
-            &[],
-        )
-        .await;
-    let row = match row {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::debug!(target: "walshadow", error = %e, "promotion gate");
-            feed.drop_sql_client();
-            return PromotionGate::unreachable();
-        }
+    let row = tokio::time::timeout(PROMOTION_POLL, async {
+        let client = feed.sql_client().await?;
+        let sql = "SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn()";
+        anyhow::Ok(client.query_one(sql, &[]).await?)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .flatten()
+    .inspect_err(
+        |e| tracing::debug!(target: "walshadow", error = %format!("{e:#}"), "promotion gate"),
+    );
+    let Ok(row) = row else {
+        feed.drop_sql_client();
+        return PromotionGate::unreachable();
     };
     let in_recovery: bool = row.get(0);
     let replay_lsn = row.get::<_, Option<PgLsn>>(1).map(u64::from).unwrap_or(0);
     let receive_lsn = row.get::<_, Option<PgLsn>>(2).map(u64::from).unwrap_or(0);
-    // Order names the first term to fix, not every one that fails
-    let blocked_on = if !in_recovery {
-        "not_a_standby"
-    } else if replay_lsn < pause_received {
-        "replay_below_pause_received"
-    } else if receive_lsn > replay_lsn {
-        "received_not_replayed"
-    } else {
-        ""
-    };
+    let blocked_on = promotion_blocked_on(in_recovery, replay_lsn, receive_lsn, pause_received);
     PromotionGate {
         blocked_on,
         in_recovery,
@@ -254,10 +233,29 @@ pub(crate) async fn commit_fork_resume(
 /// (architecture/recovery.md): every restart there dials a server
 /// that is down. `ctl` and `/metrics` are bound before this, so the repoint
 /// that ends the wait can be applied to the daemon doing the waiting.
+/// Order names the first term to fix, not every one that fails
+fn promotion_blocked_on(
+    in_recovery: bool,
+    replay_lsn: u64,
+    receive_lsn: u64,
+    pause_received: u64,
+) -> &'static str {
+    if !in_recovery {
+        "not_a_standby"
+    } else if replay_lsn < pause_received {
+        "replay_below_pause_received"
+    } else if receive_lsn > replay_lsn {
+        "received_not_replayed"
+    } else {
+        ""
+    }
+}
+
 pub(crate) async fn connect_source_waiting(
     args: &Args,
     source_conn: &mut SourceConn,
     cfg: &mut PgConfig,
+    retry: Duration,
 ) -> Result<SourceFeed> {
     loop {
         match SourceFeed::connect(cfg).await {
@@ -271,7 +269,7 @@ pub(crate) async fn connect_source_waiting(
                 "source unreachable — waiting for it, or for a repoint",
             ),
         }
-        tokio::time::sleep(SOURCE_SWAP_RETRY).await;
+        tokio::time::sleep(retry).await;
         let Some(path) = args.ch_config.as_deref() else {
             continue;
         };
@@ -381,7 +379,7 @@ pub(crate) async fn resume_source_feed(
     }
     feed.start_physical_replication(slot, resume_lsn.get(), branch.timeline)
         .await
-        .with_context(|| format!("START_REPLICATION at {resume_lsn}"))?;
+        .context(format!("START_REPLICATION at {resume_lsn}"))?;
     Ok((feed, point))
 }
 
@@ -712,6 +710,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unparsable_archive_history_falls_back_to_the_proved_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = walrus::config::Settings {
+            storage: walrus::config::StorageSettings::Fs {
+                path: tmp.path().join("archive").display().to_string(),
+            },
+            ..Default::default()
+        };
+        let history_file = tmp.path().join("00000002.history");
+        std::fs::write(&history_file, "not a history\n").unwrap();
+        walrus::pg::wal::push::handle(&settings, settings.build_storage().unwrap(), &history_file)
+            .await
+            .unwrap();
+        let floor = Monotone::new(Pos::new(0x6200_0000));
+        let archive = Archive::open(settings).unwrap();
+        let mut recovery = recovery(Some(&archive), &floor);
+        let mut path = recovery
+            .fall_back(slot_too_new(), &TimelineHistory::root(1), 1, floor.get())
+            .await
+            .unwrap();
+        let error = path.archive().unwrap().next().await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("000000010000000000000062"));
+    }
+
+    /// Identity, timeline and history gates refuse a source before streaming
+    #[tokio::test]
+    async fn resume_refuses_a_source_that_cannot_serve_the_branch() {
+        use walshadow::shadow_stream::{ShadowStreamState, fake_source};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ShadowStreamState::new(2, "7".into(), 0, 1 << 20);
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let cfg = fake_source::listen_in(tmp.path(), state).await;
+        let resume = async |system_id, timeline| {
+            let branch = SourceBranch {
+                system_id,
+                timeline,
+                begin: 0,
+            };
+            let res = resume_source_feed(
+                &cfg,
+                None,
+                Pos::new(0x100),
+                branch,
+                Pos::ZERO,
+                Duration::from_secs(10),
+            )
+            .await;
+            res.err().unwrap().to_string()
+        };
+        assert_eq!(
+            resume(8, 2).await,
+            "source is system 7, artifacts belong to 8"
+        );
+        assert_eq!(
+            resume(7, 3).await,
+            "source is on timeline 2, below the stream's 3; an older branch cannot \
+             serve what has already been read",
+        );
+        let missing = resume(7, 1).await;
+        let want = TransitionError::HistoryMissing { tli: 2 }.to_string();
+        assert_eq!(missing, want);
+    }
+
+    #[tokio::test]
     async fn removed_wal_without_archive_requires_operator() {
         let floor = Monotone::new(Pos::new(0x6200_0000));
         let mut recovery = recovery(None, &floor);
@@ -836,5 +898,78 @@ mod tests {
             swap_reason(&anyhow::anyhow!("connection refused")),
             "source"
         );
+    }
+
+    #[test]
+    fn promotion_names_first_blocker() {
+        assert_eq!(promotion_blocked_on(false, 0, 0, 0), "not_a_standby");
+        assert_eq!(
+            promotion_blocked_on(true, 5, 5, 9),
+            "replay_below_pause_received"
+        );
+        assert_eq!(
+            promotion_blocked_on(true, 9, 12, 9),
+            "received_not_replayed"
+        );
+        assert_eq!(promotion_blocked_on(true, 9, 9, 9), "");
+    }
+
+    /// `connect_source_waiting` logging into `messages` until `stop` fires
+    fn spawn_wait(
+        args: Args,
+        messages: &crate::housekeeping::tests::Messages,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let stop = stop.clone();
+        let wait = async move {
+            let mut conn = SourceConn::from_table(&cli_base(&args)).unwrap();
+            let mut cfg = conn.to_pg_config();
+            let retry = Duration::from_millis(1);
+            let connect = connect_source_waiting(&args, &mut conn, &mut cfg, retry);
+            let _ = futures::future::select(Box::pin(connect), Box::pin(stop.cancelled())).await;
+        };
+        tokio::spawn(wait.with_subscriber(tracing_subscriber::registry().with(messages.clone())))
+    }
+
+    #[tokio::test]
+    async fn unreachable_source_waits_and_follows_config_repoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let source = |host: &str| {
+            format!(
+                "[source]\nhost = \"{}/{host}\"\nport = 1\n",
+                tmp.path().display()
+            )
+        };
+        std::fs::write(&config, source("a")).unwrap();
+        let unreachable = ["--host", "/nonexistent", "--port", "1"];
+        let stop = tokio_util::sync::CancellationToken::new();
+        let messages = crate::housekeeping::tests::Messages::default();
+        let task = spawn_wait(crate::args::args_from(&unreachable), &messages, &stop);
+        messages
+            .wait("source unreachable — waiting for it, or for a repoint", 2)
+            .await;
+        stop.cancel();
+        task.await.unwrap();
+
+        let reloads = [
+            &unreachable[..],
+            &["--ch-config", config.to_str().unwrap(), "--slot", "s"],
+        ]
+        .concat();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let messages = crate::housekeeping::tests::Messages::default();
+        let task = spawn_wait(crate::args::args_from(&reloads), &messages, &stop);
+        messages.wait("source moved while waiting", 1).await;
+        std::fs::write(&config, source("b")).unwrap();
+        messages.wait("source moved while waiting", 2).await;
+        std::fs::write(&config, "[source]\nport = \"one\"\n").unwrap();
+        messages.wait("[source] reload", 1).await;
+        std::fs::write(&config, "[[[").unwrap();
+        messages.wait("config reload", 1).await;
+        stop.cancel();
+        task.await.unwrap();
     }
 }

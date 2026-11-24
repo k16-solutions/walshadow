@@ -32,10 +32,6 @@ use std::time::Duration;
 
 use walshadow::mapping::NamespaceMapping;
 
-fn skip_gate() -> bool {
-    !fx::tools::requirements_available()
-}
-
 struct Drill {
     source: fx::ClusterGuard,
     shadow: fx::ClusterGuard,
@@ -134,7 +130,7 @@ fn load(c: &std::sync::atomic::AtomicU64) -> u64 {
 /// cover it and stop the stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_timeline_decodes_the_post_ddl_row() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -201,7 +197,7 @@ async fn pending_timeline_decodes_the_post_ddl_row() {
 /// so both land in the batch instead of collapsing onto one position.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relation_born_in_xact_keeps_a_slot_per_boundary() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -257,7 +253,7 @@ async fn relation_born_in_xact_keeps_a_slot_per_boundary() {
 /// nor CH.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn savepoint_rollback_drops_its_pending_slots() {
-    if skip_gate() {
+    if !fx::tools::requirements_available() {
         return;
     }
     let mut drill = build_drill(
@@ -314,4 +310,48 @@ async fn savepoint_rollback_drops_its_pending_slots() {
         0,
         "nothing from the aborted subtree became durable",
     );
+}
+
+/// Namespace writes name no relation, so each such boundary would need a
+/// whole-catalog scan: the first degrades the transaction to commit-time
+/// capture and counts, the second finds it degraded already
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespace_boundaries_degrade_the_xact_once() {
+    if !fx::tools::requirements_available() {
+        return;
+    }
+    let mut drill = build_drill(
+        fx::Ports::alloc(),
+        "CREATE SCHEMA pc;\n",
+        "walshadow-pending-capture-all",
+    )
+    .await;
+    let capture = capture_stats(&drill);
+
+    let driver = spawn_txn(
+        &drill.source,
+        "BEGIN;\n\
+         CREATE SCHEMA pc_a;\n\
+         CREATE SCHEMA pc_b;\n\
+         CREATE TABLE pc.t (id bigint PRIMARY KEY, v text);\n\
+         INSERT INTO pc.t VALUES (1, 'commit-time');\n\
+         COMMIT;\n\
+         SELECT pg_switch_wal();\n",
+    );
+    pump_and_drain(&mut drill).await;
+    let _ = driver.join();
+
+    drill.pipeline.shutdown().await.expect("pipeline drains");
+    let _ = drill.shadow.stop();
+    let _ = drill.source.stop();
+
+    fx::wait_query(
+        &drill.ch,
+        "SELECT argMax(v, _lsn) FROM walshadow_test.t WHERE id = 1 AND _is_deleted = 0",
+        "commit-time",
+        "commit-time capture still delivers the table",
+    )
+    .await;
+    let degraded: Vec<u64> = capture.pending_degraded.iter().map(load).collect();
+    assert_eq!(degraded, [1, 0, 0, 0, 0], "one CaptureAll degrade");
 }

@@ -8,7 +8,7 @@ use crate::column_rules::{ColumnRule, ColumnRules};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{RelAttr, RelDescriptor, RelName, SchemaDiff, replident_key_attnums};
 use crate::table_rules::set_if;
-use ahash::HashMap;
+use foldhash::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMapping {
@@ -566,16 +566,16 @@ pub fn map_column(
     attr: &RelAttr,
     pk_member: bool,
     rules: &ColumnRules,
-) -> Option<ColumnMapping> {
-    let resolved = type_bridge::map(attr, pk_member).ok()?;
+) -> ColumnMapping {
+    let resolved = type_bridge::map(attr, pk_member);
     let (target_name, resolved) =
         apply_column_rule(&attr.name, resolved, rules.settings(rel, &attr.name));
-    Some(ColumnMapping {
+    ColumnMapping {
         src_attnum: attr.attnum,
         target_name,
         target_type: resolved.ch_type,
         type_pinned: false,
-    })
+    }
 }
 
 pub fn derive_columns_for_mapping(desc: &RelDescriptor, rules: &ColumnRules) -> Vec<ColumnMapping> {
@@ -583,7 +583,7 @@ pub fn derive_columns_for_mapping(desc: &RelDescriptor, rules: &ColumnRules) -> 
     desc.attributes
         .iter()
         .filter(|attr| !attr.dropped)
-        .filter_map(|attr| map_column(&desc.rel_name, attr, keys.contains(&attr.attnum), rules))
+        .map(|attr| map_column(&desc.rel_name, attr, keys.contains(&attr.attnum), rules))
         .collect()
 }
 
@@ -595,7 +595,7 @@ pub fn retyped_target(
     key: bool,
     rules: &ColumnRules,
 ) -> Option<String> {
-    let mut ty = map_column(rel, new, key, rules)?.target_type;
+    let mut ty = map_column(rel, new, key, rules).target_type;
     // ClickHouse cannot cast retained NULLs after PostgreSQL SET NOT NULL
     if types::is_nullable(&column.target_type) && !types::is_nullable(&ty) {
         ty = format!("Nullable({ty})");
@@ -653,9 +653,9 @@ pub fn fold_diff_into_mapping(
             continue;
         }
         let key = replident_key_attnums(new).contains(&attr.attnum);
-        if let Some(column) = map_column(&new.rel_name, attr, key, rules) {
-            target.columns.push(column);
-        }
+        target
+            .columns
+            .push(map_column(&new.rel_name, attr, key, rules));
     }
 }
 
@@ -1080,5 +1080,31 @@ mod tests {
             &rules,
         );
         assert_eq!(mapping.columns[0].target_name, "id");
+    }
+
+    #[test]
+    fn predeclared_added_column_keeps_operator_mapping() {
+        let added = attr(1, "legacy_id", crate::schema::INT4OID);
+        let pinned = ColumnMapping {
+            src_attnum: 1,
+            target_name: "pinned".into(),
+            target_type: "Int64".into(),
+            type_pinned: true,
+        };
+        let mut mapping = TableMapping {
+            target: TableTarget::new("db", "events"),
+            columns: vec![pinned.clone()],
+            tees: Vec::new(),
+        };
+        let diff = SchemaDiff {
+            added_columns: vec![added.clone()],
+            dropped_columns: vec![],
+            renamed_columns: vec![],
+            type_changes: vec![],
+        };
+        let new = events_desc(vec![added]);
+        fold_diff_into_mapping(&mut mapping, &new, &diff, &[], &amount_rules());
+        assert_eq!(mapping.columns, vec![pinned]);
+        assert_eq!(mapping.target.to_string(), "db.events");
     }
 }

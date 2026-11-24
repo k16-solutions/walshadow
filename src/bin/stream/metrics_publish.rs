@@ -203,7 +203,6 @@ impl DbMetricSources {
             pending_hold_seconds_total: cap_seconds(|s| &s.pending_hold_nanos),
             pending_entries_promoted_total: cap(|s| &s.pending_entries_promoted),
             pending_entries_dropped_abort_total: cap(|s| &s.pending_entries_dropped_abort),
-            pending_ambiguities_suppressed_total: cap(|s| &s.ambiguities_suppressed),
             pending_degraded_by_reason: std::array::from_fn(|i| {
                 self.capture
                     .as_ref()
@@ -439,6 +438,7 @@ pub(crate) async fn populate_pipeline_metrics(
         catalog_boundary_holds_total: boundary_hold.holds.load(Ordering::Relaxed),
         catalog_boundary_hold_failures_total: boundary_hold.failures.load(Ordering::Relaxed),
         catalog_boundary_hold_seconds_total: boundary_hold.hold_seconds_total(),
+        catalog_boundary_stalled_lsn: boundary_hold.stalled_lsn.load(Ordering::Relaxed),
         // `ctl status` reports one number for the daemon; the scrape
         // splits it by database
         config_backfills_pending: by_database
@@ -487,7 +487,7 @@ fn skipped_by_rel(
     stats: &walshadow::decoder_sink::DecoderStats,
     db_name: &(dyn Fn(u32) -> String + Sync),
 ) -> Vec<walshadow::metrics::SkippedRel> {
-    let mut per_reason = ahash::HashMap::<_, usize>::default();
+    let mut per_reason = foldhash::HashMap::<_, usize>::default();
     stats
         .skipped_by_rel
         .snapshot()
@@ -821,6 +821,34 @@ mod tests {
             snap.unmapped_rows_by_table,
             vec![("db9".to_owned(), "public.noise".to_owned(), 3)],
             "an oid the config does not name still has to be reportable",
+        );
+    }
+
+    #[test]
+    fn skipped_rows_cap_per_reason() {
+        use walrus::pg::walparser::{RmId, XLogRecordHeader};
+        use walshadow::decoder_sink::{DecoderStats, SkipReason};
+        let stats = DecoderStats::default();
+        let header = XLogRecordHeader {
+            resource_manager_id: RmId::Heap as u8,
+            info: walshadow::heap_decoder::XLOG_HEAP_INSERT,
+            ..Default::default()
+        };
+        let skip = |reason, rel_node| stats.skip(reason, &header, 0x1000, 5, rel_node);
+        for rel_node in 1..=25 {
+            skip(SkipReason::NotCovered, rel_node);
+        }
+        skip(SkipReason::NotCovered, 25);
+        skip(SkipReason::Unresolvable, 30);
+        let rows = skipped_by_rel(&stats, &db_label);
+        let not_covered: Vec<_> = rows.iter().filter(|r| r.reason == "not_covered").collect();
+        assert_eq!(not_covered.len(), UNMAPPED_STATUS_ROWS);
+        let top = not_covered[0];
+        assert_eq!((top.rel_node.as_str(), top.records), ("25", 2));
+        assert!(rows.iter().all(|r| r.database == "db5" && r.op == "insert"));
+        assert!(
+            rows.iter()
+                .any(|r| r.reason == "unresolvable" && r.rel_node == "30")
         );
     }
 

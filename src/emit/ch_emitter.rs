@@ -51,7 +51,7 @@ use crate::source::queueing_record_sink::{
     DEFAULT_QUEUEING_BATCH_SIZE, DEFAULT_QUEUEING_RECORD_SINK_CAPACITY,
 };
 use crate::table_rules::{MatchKind, PartitionRoute, TableRule};
-use ahash::{HashMap, HashMapExt};
+use foldhash::{HashMap, HashMapExt};
 
 /// Microseconds between PG `TimestampTz` epoch (2000-01-01 UTC) and Unix
 /// epoch. CH `DateTime64(6)` is Unix microseconds; PG commit-record
@@ -146,7 +146,7 @@ pub struct EmitterConfig {
     pub tables: HashMap<RelName, TableMapping>,
     /// Per-table initial-load mode from TOML `[table.*]` blocks. Applies at
     /// boot for pinned mappings; SQL opt-ins carry their own mode.
-    pub table_initial_loads: HashMap<RelName, String>,
+    pub table_initial_loads: HashMap<RelName, InitialLoadMode>,
     /// Table rules in declaration order
     pub table_entries: Vec<(RelName, MatchKind, TableRule)>,
     /// Column rules in declaration order
@@ -179,15 +179,10 @@ pub struct EmitterConfig {
     /// destination, overridable per namespace
     pub detach_strategy: DropTableStrategy,
     pub retry: RetryConfig,
-    /// Wall-clock limit for one INSERT attempt. If connection stalls
-    /// mid-INSERT, return retryable [`EmitterError::Timeout`] so inserter
-    /// reconnects and resends without blocking durable watermark
-    /// Set well above healthy round-trip time
-    pub insert_timeout: Duration,
     /// A CH connection idle longer than this may be half-open (NAT/LB/CH
-    /// idle-reap); reconnect before the next op instead of blocking the
-    /// full `insert_timeout` on a dead socket. Guards the start of a run,
-    /// when connections sat idle since the previous one.
+    /// idle-reap); reconnect before the next op instead of waiting for TCP
+    /// keepalive to fail it. Guards the start of a run, when connections sat
+    /// idle since the previous one.
     pub idle_reconnect: Duration,
     /// Keep the delete marker out of `ReplacingMergeTree`'s args so delete
     /// tombstones stay queryable instead of collapsing on FINAL. Column
@@ -399,7 +394,6 @@ fn vcpus() -> usize {
         .unwrap_or(DEFAULT_POOL_FLOOR)
 }
 
-pub(crate) const DEFAULT_INSERT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_IDLE_RECONNECT_SECS: u64 = 30;
 
 /// Bounded-retry knobs. Retryable error (IO, clickhouse-c protocol,
@@ -1042,7 +1036,6 @@ impl EmitterConfig {
             drop_table_strategy: ch.drop_table_strategy,
             detach_strategy: ch.detach_strategy,
             retry: ch.retry,
-            insert_timeout: Duration::from_secs(DEFAULT_INSERT_TIMEOUT_SECS),
             idle_reconnect: Duration::from_secs(DEFAULT_IDLE_RECONNECT_SECS),
             soft_delete: ch.soft_delete,
             system_columns: Arc::default(),
@@ -1259,6 +1252,7 @@ impl EmitterConfig {
                 kind.as_str()
             )));
         }
+        let initial_load = t.initial_load;
         let rule = TableRule {
             target_instance: t.target_instance,
             system,
@@ -1397,7 +1391,7 @@ impl EmitterConfig {
                 tees: rule.tee.unwrap_or_default(),
             },
         );
-        if let Some(mode) = rule.initial_load {
+        if let Some(mode) = initial_load {
             self.table_initial_loads.insert(rel, mode);
         }
         Ok(())
@@ -1433,7 +1427,7 @@ pub(crate) struct ColumnPlan {
     pub(crate) type_repr: String,
     pub(crate) ast: TypeAst,
     pub(crate) decimal: Option<DecimalWire>,
-    pub(crate) datetime64_scale: i32,
+    pub(crate) datetime64_scale: u32,
     pub(crate) non_finite: NonFinite,
     pub(crate) encoding: ColumnEncoding,
 }
@@ -1456,8 +1450,7 @@ impl NonFinite {
         if decimal.is_none() && !matches!(inner.kind(), Some(Kind::Date32 | Kind::DateTime64)) {
             return Ok(Self::default());
         }
-        let precision =
-            usize::try_from(inner.decimal_precision()).map_err(|_| "bad Decimal precision")?;
+        let precision = inner.decimal_precision().unwrap_or(0) as usize;
         let scale = usize::from(decimal.map_or(0, |w| w.scale));
         let bound = format!("{}.{}", "9".repeat(precision - scale), "9".repeat(scale));
         let cell = |key: &str, sub: &Option<Substitute>| {
@@ -1669,7 +1662,9 @@ impl TablePlan {
                 name: c.target_name.clone(),
                 type_repr: canonical_type(&ast, &c.target_type),
                 encoding: ColumnEncoding::choose(att, &ast),
-                datetime64_scale: types::strip_nullable(ast.view()).datetime64_scale(),
+                datetime64_scale: types::strip_nullable(ast.view())
+                    .datetime64_scale()
+                    .unwrap_or(0),
                 ast,
                 decimal,
                 non_finite: NonFinite::default(),
@@ -1686,7 +1681,8 @@ impl TablePlan {
                                 type_repr: canonical_type(&oast, ty),
                                 encoding: ColumnEncoding::choose(att, &oast),
                                 datetime64_scale: types::strip_nullable(oast.view())
-                                    .datetime64_scale(),
+                                    .datetime64_scale()
+                                    .unwrap_or(0),
                                 ast: oast,
                                 decimal,
                                 non_finite: NonFinite::default(),
@@ -1738,27 +1734,20 @@ impl TablePlan {
             columns.push(plan);
             col_sql.push(quote_ident(&c.target_name));
         }
-        let mk = |name: &str, ty: &str| -> Result<ColumnPlan, EmitterError> {
-            Ok(ColumnPlan {
-                name: name.into(),
-                type_repr: ty.into(),
-                ast: TypeAst::parse(ty, alloc)
-                    .map_err(|e| EmitterError::Type(format!("{ty}: {e}")))?,
-                decimal: None,
-                datetime64_scale: 0,
-                non_finite: NonFinite::default(),
-                encoding: ColumnEncoding::Local,
-            })
+        let mk = |name: &str, ty: &str| ColumnPlan {
+            name: name.into(),
+            type_repr: ty.into(),
+            ast: TypeAst::parse(ty, alloc).expect("synthetic column type parses"),
+            decimal: None,
+            datetime64_scale: 0,
+            non_finite: NonFinite::default(),
+            encoding: ColumnEncoding::Local,
         };
-        let synth_lsn = mk(&system.lsn, "UInt64")?;
-        let synth_xid = mk(&system.xid, "UInt32")?;
-        let synth_commit_ts = mk(&system.commit_ts, "DateTime64(6, 'UTC')")?;
-        let synth_is_deleted = system
-            .is_deleted
-            .as_deref()
-            .map(|name| mk(name, "Bool"))
-            .transpose()?;
-        let synth_leaf = leaf.map(|name| mk(name, "UInt32")).transpose()?;
+        let synth_lsn = mk(&system.lsn, "UInt64");
+        let synth_xid = mk(&system.xid, "UInt32");
+        let synth_commit_ts = mk(&system.commit_ts, "DateTime64(6, 'UTC')");
+        let synth_is_deleted = system.is_deleted.as_deref().map(|name| mk(name, "Bool"));
+        let synth_leaf = leaf.map(|name| mk(name, "UInt32"));
         col_sql.push(quote_ident(&synth_lsn.name));
         col_sql.push(quote_ident(&synth_xid.name));
         col_sql.push(quote_ident(&synth_commit_ts.name));
@@ -2271,7 +2260,7 @@ fn decimal_wire_of(ast: &TypeAst) -> Option<DecimalWire> {
         _ => return None,
     };
     Some(DecimalWire {
-        scale: u8::try_from(inner.decimal_scale()).ok()?,
+        scale: u8::try_from(inner.decimal_scale()?).ok()?,
         width,
     })
 }
@@ -2411,10 +2400,6 @@ fn decimal_oob() -> EmitterError {
     unsupported("numeric out of range for Decimal column")
 }
 
-fn decimal_type_error(msg: &str) -> EmitterError {
-    EmitterError::Type(msg.into())
-}
-
 /// PG `numeric_out` text (eg `-12.340`) to the scaled integer a CH
 /// `Decimal(_, scale)` stores: `value * 10^scale`, two's-complement
 /// little-endian at the Decimal wire width. PG values conform to column
@@ -2422,13 +2407,11 @@ fn decimal_type_error(msg: &str) -> EmitterError {
 /// integer-valued numerics and defensive target-scale overrides.
 fn decimal_text_to_scaled_le(
     text: &str,
-    scale: i32,
+    scale: u8,
     width: DecimalWidth,
 ) -> Result<[u8; 32], EmitterError> {
     let width = width.bytes();
-    if scale < 0 {
-        return Err(decimal_type_error("Decimal column has negative scale"));
-    }
+    let scale = i32::from(scale);
 
     let neg = text.starts_with('-');
     // numeric_out emits a single optional '-'; a residual sign in `body`
@@ -2508,7 +2491,7 @@ fn unsupported(kind: &'static str) -> EmitterError {
     }
 }
 
-fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
+fn timestamp_ticks(pg_us: i64, scale: u32) -> Result<i64, EmitterError> {
     micros_to_ticks(
         i128::from(pg_us) + i128::from(DATETIME64_PG_EPOCH_US),
         scale,
@@ -2516,15 +2499,15 @@ fn timestamp_ticks(pg_us: i64, scale: i32) -> Result<i64, EmitterError> {
 }
 
 /// Convert microseconds to `DateTime64(scale)` or `Time64(scale)` ticks
-fn micros_to_ticks(us: i128, scale: i32) -> Result<i64, EmitterError> {
-    if !(0..=9).contains(&scale) {
+fn micros_to_ticks(us: i128, scale: u32) -> Result<i64, EmitterError> {
+    if scale > 9 {
         return Err(EmitterError::Type("invalid temporal precision".into()));
     }
     let ticks = if scale < 6 {
-        let divisor = 10i128.pow((6 - scale) as u32);
+        let divisor = 10i128.pow(6 - scale);
         us / divisor
     } else {
-        us * 10i128.pow((scale - 6) as u32)
+        us * 10i128.pow(scale - 6)
     };
     i64::try_from(ticks).map_err(|_| unsupported("finite temporal value overflows storage"))
 }
@@ -2533,7 +2516,7 @@ fn encode_value(
     buf: &mut ColumnBuf,
     v: &ColumnValue,
     decimal: Option<DecimalWire>,
-    timestamp_scale: i32,
+    timestamp_scale: u32,
 ) -> Result<(), EmitterError> {
     match v {
         // Non-Nullable target takes type default
@@ -2587,8 +2570,7 @@ fn encode_value(
                 // substitute or maps to String
                 Some(decimal) => match n {
                     NumericKind::Finite(s) => {
-                        let scaled =
-                            decimal_text_to_scaled_le(s, i32::from(decimal.scale), decimal.width)?;
+                        let scaled = decimal_text_to_scaled_le(s, decimal.scale, decimal.width)?;
                         buf.append_fixed_bytes(&scaled[..decimal.width.bytes()])
                     }
                     NumericKind::NaN | NumericKind::PInf | NumericKind::NInf => Err(unsupported(
@@ -3132,12 +3114,6 @@ mod tests {
     }
 
     #[test]
-    fn decimal_type_error_wraps_message_in_type_variant() {
-        let e = decimal_type_error("scale out of range");
-        assert_eq!(format!("{e:?}"), r#"Type("scale out of range")"#);
-    }
-
-    #[test]
     fn is_retryable_only_for_transport_and_server_faults() {
         assert!(is_retryable(&EmitterError::Io(std::io::Error::other(
             "reset"
@@ -3488,7 +3464,7 @@ mod tests {
 
     #[test]
     fn decimal_text_scales_to_integer() {
-        fn le_i64(text: &str, scale: i32) -> [u8; 8] {
+        fn le_i64(text: &str, scale: u8) -> [u8; 8] {
             let le = decimal_text_to_scaled_le(text, scale, DecimalWidth::D64).unwrap();
             le[..8].try_into().unwrap()
         }
@@ -3658,6 +3634,224 @@ mod tests {
     }
 
     #[test]
+    fn decimal_text_rejects_u256_overflow() {
+        let mut max = U256([u64::MAX; 4]);
+        assert!(!max.checked_add_small(1));
+        let wide78 = "9".repeat(78);
+        assert!(decimal_text_to_scaled_le(&wide78, 0, DecimalWidth::D256).is_err());
+        let wide76 = "9".repeat(76);
+        assert!(decimal_text_to_scaled_le(&wide76, 4, DecimalWidth::D256).is_err());
+    }
+
+    #[test]
+    fn micros_to_ticks_rejects_precision_past_nanoseconds() {
+        assert!(matches!(micros_to_ticks(1, 10), Err(EmitterError::Type(_))));
+        assert_eq!(micros_to_ticks(1, 9).unwrap(), 1_000);
+    }
+
+    fn buf(ty: &str) -> ColumnBuf {
+        let ast = TypeAst::parse(ty, Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        ColumnBuf::new_for_ast(&ast).unwrap()
+    }
+
+    fn rejects(r: Result<(), EmitterError>, needle: &str) -> bool {
+        matches!(r, Err(EmitterError::UnsupportedValue { kind, .. }) if kind.contains(needle))
+    }
+
+    #[test]
+    fn column_buffers_reject_mismatched_shapes() {
+        let mut fixed = buf("Int8");
+        encode_value(&mut fixed, &ColumnValue::Char(-3), None, 0).unwrap();
+        fixed.append_default();
+        assert_eq!(format!("{fixed:?}"), "Fixed { width: 1, bytes_len: 2 }");
+        assert!(matches!(
+            fixed.append_fixed_bytes(&[0; 4]),
+            Err(EmitterError::Type(_))
+        ));
+        let mut nullable = buf("Nullable(Int32)");
+        assert!(matches!(
+            nullable.append_fixed_bytes(&[0; 2]),
+            Err(EmitterError::Type(_))
+        ));
+        let mut string = buf("String");
+        assert!(rejects(string.append_fixed_bytes(&[0; 4]), "string-shaped"));
+        assert!(rejects(fixed.append_string_bytes(b"x"), "fixed-shaped"));
+        let mut date = buf("Date32");
+        let overflow = encode_value(&mut date, &ColumnValue::Date(i32::MAX - 1), None, 0);
+        assert!(rejects(overflow, "Date32"));
+        let toast = ColumnValue::ExternalToast(crate::decode::heap_decoder::ToastPointer {
+            va_rawsize: 0,
+            va_extinfo: 0,
+            va_valueid: 0,
+            va_toastrelid: 0,
+        });
+        assert!(rejects(encode_value(&mut string, &toast, None, 0), "TOAST"));
+        let pending = ColumnValue::PgPending {
+            type_oid: 600,
+            raw: vec![1],
+        };
+        let r = encode_value(&mut string, &pending, None, 0);
+        assert!(rejects(r, "unresolved source value"));
+    }
+
+    #[test]
+    fn oracle_column_defaults_and_debug_shape() {
+        let ast = TypeAst::parse("Array(Int32)", Allocator::global(&mimalloc::MiMalloc)).unwrap();
+        let mut oracle = ColumnBuf::Oracle(OracleColumnBuf::new(1007, -1, ast.view()));
+        oracle.append_default();
+        let shape = format!("{oracle:?}");
+        assert!(
+            shape.starts_with("Oracle { rows: 1, source_oid: 1007,"),
+            "{shape}"
+        );
+    }
+
+    #[test]
+    fn oracle_cell_rejects_values_off_the_planned_type() {
+        let rejects = |v: ColumnValue, want: &str| matches!(oracle_cell(Some(&v), 1007), Err(EmitterError::UnsupportedValue { kind, .. }) if kind == want);
+        let raw = vec![0u8; 4];
+        let moved = "source type oid differs from the planned one";
+        assert!(rejects(ColumnValue::PgPending { type_oid: 23, raw }, moved));
+        let text = "{1}".into();
+        assert!(rejects(
+            ColumnValue::PgPendingText { type_oid: 23, text },
+            moved
+        ));
+        assert!(rejects(
+            ColumnValue::Int4(1),
+            "decoded value on an oracle column"
+        ));
+        let text = ColumnValue::PgPendingText {
+            type_oid: 1007,
+            text: "{1}".into(),
+        };
+        assert!(
+            matches!(oracle_cell(Some(&text), 1007), Ok(OracleCell::TextInput(t)) if t == b"{1}")
+        );
+    }
+
+    #[test]
+    fn table_plan_rejects_local_temporal_on_other_kind() {
+        let mut rel = mk_rel();
+        rel.attributes[0].type_oid = crate::schema::DATEOID;
+        let result = TablePlan::build(
+            Allocator::global(&mimalloc::MiMalloc),
+            &rel,
+            &mk_mapping(),
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        );
+        assert!(matches!(result, Err(EmitterError::Config(e)) if e.contains("local temporal")));
+    }
+
+    #[test]
+    fn table_plan_keeps_default_on_unparseable_override() {
+        let rules = col_rules(&[("id", "Nope(((")]);
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let plan = TablePlan::build(
+            alloc,
+            &mk_rel(),
+            &mk_mapping(),
+            &rules,
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.columns[0].type_repr, "Int32");
+    }
+
+    #[test]
+    fn predeclared_composite_column_plans_oracle_without_source_type() {
+        let mut m = mk_mapping();
+        m.columns.push(ColumnMapping {
+            src_attnum: 3,
+            target_name: "tags".into(),
+            target_type: "Array(String)".into(),
+            type_pinned: false,
+        });
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let plan = TablePlan::build(
+            alloc,
+            &mk_rel(),
+            &m,
+            &ColumnRules::default(),
+            &SystemColumns::default(),
+        )
+        .unwrap();
+        let oracle = ColumnEncoding::Oracle {
+            source_type_oid: 0,
+            source_typmod: -1,
+        };
+        assert_eq!(plan.columns[2].encoding, oracle);
+    }
+
+    #[test]
+    fn table_entries_skip_non_table_namespace_values() {
+        let root: toml::Table = toml::from_str(
+            "[source]\ndbname = \"app\"\n[table]\npublic = 1\n[table.s.t]\nreplicate = true\n",
+        )
+        .unwrap();
+        let entries = table_entries_for(&root, "app");
+        assert_eq!(entries.len(), 1);
+        assert_eq!((entries[0].0, entries[0].1), ("s", "t"));
+    }
+
+    #[test]
+    fn pinned_columns_without_namespace_template_use_default_name() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n[table.app.events]\ncolumns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let m = &c.tables[&RelName::new("app", "events")];
+        assert_eq!(m.target.table, "app_events");
+    }
+
+    #[test]
+    fn pinned_columns_follow_namespace_template_and_opt_out() {
+        let c = EmitterConfig::from_toml_str(
+            "[ch]\n[namespace.app]\nauto_create_name = \"wh_\"\n\
+             [table.app.events]\ncolumns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n\
+             [table.app.skipped]\nreplicate = false\n\
+             columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }]\n",
+        )
+        .unwrap();
+        let m = &c.tables[&RelName::new("app", "events")];
+        assert_eq!(m.target.table, "wh_events");
+        assert!(!c.tables.contains_key(&RelName::new("app", "skipped")));
+    }
+
+    #[tokio::test]
+    async fn load_merged_names_unreadable_and_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ch-config.toml");
+        tokio::fs::create_dir(&base).await.unwrap();
+        let e = load_merged(&base).await.unwrap_err().to_string();
+        assert!(e.contains("read "), "{e}");
+        tokio::fs::remove_dir(&base).await.unwrap();
+        tokio::fs::write(&base, "[ch\n").await.unwrap();
+        let e = load_merged(&base).await.unwrap_err().to_string();
+        assert!(e.contains("parse "), "{e}");
+        tokio::fs::write(&base, "[ch]\n").await.unwrap();
+        let confd = dir.path().join("ch-config.d");
+        tokio::fs::create_dir(&confd).await.unwrap();
+        tokio::fs::write(confd.join("README"), "not toml")
+            .await
+            .unwrap();
+        tokio::fs::write(confd.join("10-bad.toml"), "[ch\n")
+            .await
+            .unwrap();
+        let e = load_merged(&base).await.unwrap_err().to_string();
+        assert!(e.contains("10-bad.toml"), "{e}");
+        tokio::fs::remove_file(confd.join("10-bad.toml"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(confd.join("20-dir.toml"))
+            .await
+            .unwrap();
+        let e = load_merged(&base).await.unwrap_err().to_string();
+        assert!(e.contains("read ") && e.contains("20-dir.toml"), "{e}");
+    }
+
+    #[test]
     fn quote_ident_escapes_backticks() {
         assert_eq!(quote_ident("foo"), "`foo`");
         assert_eq!(quote_ident("a`b"), "`a``b`");
@@ -3678,9 +3872,8 @@ mod tests {
             &SystemColumns::default(),
         )
         .expect("plan builds");
-        let [insert_sql] = plan.inserts.as_slice() else {
-            panic!("one target: {:?}", plan.inserts)
-        };
+        assert_eq!(plan.inserts.len(), 1);
+        let insert_sql = &plan.inserts[0];
         assert!(insert_sql.sql.contains("INSERT INTO `default`.`foo`"));
         assert!(insert_sql.sql.contains("`id`"));
         assert!(insert_sql.sql.contains("`name`"));
@@ -3715,9 +3908,7 @@ mod tests {
             &SystemColumns::default(),
         )
         .unwrap();
-        let [primary, tees @ ..] = plan.inserts.as_slice() else {
-            panic!("primary first")
-        };
+        let (primary, tees) = plan.inserts.split_first().expect("primary first");
         let cols = primary.sql.strip_prefix("INSERT INTO `default`.`foo` ");
         assert_eq!(
             tees.iter()
@@ -4112,6 +4303,14 @@ mod tests {
         // Unsigned wraps negatives, floats reinterpret bits: rejected
         assert!(override_wire(&dec, &p("UInt128")).is_none());
         assert!(override_wire(&dec, &p("Float32")).is_none());
+        for (ty, width) in [
+            ("Int32", DecimalWidth::D32),
+            ("Int64", DecimalWidth::D64),
+            ("Int256", DecimalWidth::D256),
+        ] {
+            let wire = DecimalWire { scale: 0, width };
+            assert_eq!(override_wire(&dec, &p(ty)), Some(Some(wire)), "{ty}");
+        }
         // Fixed-width source: same-width reinterpretation only, no Decimal
         // (a nonzero scale would silently rescale)
         let i = p("Int32");
@@ -4242,6 +4441,29 @@ mod tests {
             Append::Done
         );
         assert_eq!(enc.rows, 1);
+    }
+
+    /// Encode faults name the column only when the value is unsupported
+    #[test]
+    fn append_errors_name_unsupported_columns() {
+        let alloc = Allocator::global(&mimalloc::MiMalloc);
+        let (rules, sys) = (ColumnRules::default(), SystemColumns::default());
+        let mut m = mk_mapping();
+        m.columns[0].target_type = "Array(Int32)".into();
+        let plan = TablePlan::build(alloc, &mk_rel(), &m, &rules, &sys).unwrap();
+        let mut enc = TableEncoder::new(plan).unwrap();
+        let r = enc.append_row(&committed(1, None), &m, OP_INSERT);
+        assert!(
+            matches!(r, Err(EmitterError::UnsupportedValue { target_column, .. }) if target_column == "id")
+        );
+
+        let m = mk_mapping();
+        let plan = TablePlan::build(alloc, &mk_rel(), &m, &rules, &sys).unwrap();
+        let mut enc = TableEncoder::new(plan).unwrap();
+        let mut wide = committed(1, None);
+        wide.decoded.new.as_mut().unwrap().columns[0] = Some(ColumnValue::Int8(1));
+        let r = enc.append_row(&wide, &m, OP_INSERT);
+        assert!(matches!(r, Err(EmitterError::Type(_))), "{r:?}");
     }
 
     fn committed_delete(id: i32) -> CommittedTuple {
@@ -4473,8 +4695,8 @@ mod tests {
         assert_eq!(t.columns[0].src_attnum, 1);
         assert_eq!(t.columns[1].target_type, "Nullable(String)");
         assert_eq!(
-            c.table_initial_loads.get(&rel).map(String::as_str),
-            Some("copy")
+            c.table_initial_loads.get(&rel).copied(),
+            Some(InitialLoadMode::Copy)
         );
         // soft_delete defaults off when the key is absent
         assert!(!c.soft_delete);
@@ -4632,6 +4854,8 @@ mod tests {
             "columns = [{ attnum = 1, match = \"glob\", target = \"id\", type = \"UInt64\" }]",
             "columns = [{ name = \"*_at\", match = \"glob\", target = \"ts\" }]",
             "columns = [{ name = \"id\" }]",
+            "columns = [{ attnum = 1, type = \"UInt64\" }]",
+            "columns = [{ attnum = 1, target = \"id\" }]",
             "columns = [{ attnum = 1, target = \"id\", type = \"UInt64\" }, \
              { name = \"ts\", type = \"DateTime\" }]",
         ];
@@ -5115,7 +5339,7 @@ mod tests {
                  [database.billing.table.public.orders]\n\
                  {distinct}\n"
             ))
-            .unwrap_or_else(|e| panic!("{distinct}: {e}"));
+            .expect(distinct);
         }
     }
 

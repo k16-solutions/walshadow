@@ -230,7 +230,7 @@ mod tests {
         inject_ordinary, int4_descriptor, multi_insert_raw,
     };
     use crate::xact::xact_buffer::{FailClosedReason, StashResolved, XactBuffer, XactBufferConfig};
-    use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+    use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
     use walrus::pg::walparser::RelFileNode;
 
     /// Pins the `reason=` vocabulary `bump_plan_failure` and the metrics
@@ -242,6 +242,8 @@ mod tests {
             "partial_update"
         );
         assert_eq!(PlanError::View("x".into()).reason(), "view");
+        let spool = PlanSpoolError::DiskBudget { needed: 2, cap: 1 };
+        assert_eq!(PlanError::Spool(spool).reason(), "spool");
         let fail_closed = |reason| XactBufferError::OrdinaryFailClosed {
             relid: 1,
             lsn: 2,
@@ -868,12 +870,10 @@ mod tests {
             .drain_committed(stash, 0, commit, &[], false)
             .await
             .unwrap();
-        while let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
-            let is_final = batch.is_final;
+        let mut done = false;
+        while !done && let Some(batch) = drain.next_batch(1, usize::MAX, None).await.unwrap() {
+            done = batch.is_final;
             planner.plan_batch(batch).await.unwrap();
-            if is_final {
-                break;
-            }
         }
         drain.finish().await.unwrap();
         let plan = planner.seal(commit, 0).unwrap();
