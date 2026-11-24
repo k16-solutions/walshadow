@@ -30,10 +30,10 @@ Merge everything pending unless one of these upstream commits is in range.
 Each needs a port, not just a conflict resolution:
 
 - a commit that deletes or renames a type, module or function that
-  `src/destination/**`, `src/fork/**` or `src/bin/stream/tenant.rs` uses
+  `src/snowflake/**`, `src/tenant/**` or `src/standby/**` uses
   (`git log -p origin/main..upstream/main` and grep for the removed names)
 - a change to how `src/bin/stream/session.rs` builds per-database pipelines
-  (the fork builds those in `tenant.rs`)
+  (the fork builds those in `src/tenant/bin/stream/tenant.rs`)
 
 When one is in range, merge only up to the commit before it (`git merge
 <sha>~1`), and say in the PR that the next sync starts with that commit.
@@ -50,12 +50,14 @@ Resolve conflicts with these rules:
 - **Fork-owned files** (FORK.md's table): keep ours, then adapt them to
   upstream's API changes.
 - **Upstream-owned files**: take upstream's version, then re-add the fork's
-  hook lines. A hook is a `fork::...` call, a `mod fork;` declaration, a
-  `pub use fork::...` line or a fork-added struct field. Never keep an older
-  copy of upstream's own code.
+  hook lines. A hook is a `snowflake::...`, `tenant::...` or `standby::...`
+  call into a feature's `ext/` child, a `#[path] mod <feature>;` declaration,
+  a `pub use <feature>::...` line or a fork-added struct field. Never keep an
+  older copy of upstream's own code.
 - **Code the fork moved elsewhere**: when upstream edits a block the fork
-  deleted (per-database setup in `session.rs`, which moved to `tenant.rs`),
-  keep it deleted and port upstream's change to the fork's copy.
+  deleted (per-database setup in `session.rs`, which moved to
+  `src/tenant/bin/stream/tenant.rs`), keep it deleted and port upstream's
+  change to the fork's copy.
 - **Duplicate fixes**: when both sides fixed the same thing, take upstream's.
 - **`Cargo.lock`**: `git checkout --theirs Cargo.lock`, then build so cargo
   re-adds the fork's dependencies.
