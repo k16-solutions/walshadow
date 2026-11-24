@@ -87,38 +87,6 @@ pub async fn apply_table_opt_in(
     Ok(())
 }
 
-/// Backfills opt-ins requested, started only once every mapping of a batch
-/// of opt-ins is published: a running backfill guards the mapping while it
-/// prepares and publishes, so starting each one as its opt-in lands would
-/// make every later opt-in wait on the earlier loads
-#[derive(Default)]
-pub struct DeferredBackfills {
-    starts: Vec<(Arc<RelDescriptor>, InitialLoadMode, u64)>,
-    opt_outs: Vec<RelName>,
-}
-
-impl DeferredBackfills {
-    pub fn len(&self) -> usize {
-        self.starts.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.starts.is_empty() && self.opt_outs.is_empty()
-    }
-
-    pub async fn start(self, backfiller: Option<&Arc<dyn Backfiller>>) {
-        let Some(b) = backfiller else {
-            return;
-        };
-        for rel in &self.opt_outs {
-            b.note_opt_out(rel).await;
-        }
-        for (desc, mode, lsn) in self.starts {
-            b.clone().note_opt_in(desc, mode, lsn).await;
-        }
-    }
-}
-
 /// [`apply_table_opt_in`] that queues the backfill into `deferred`
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_table_opt_in_deferred(
@@ -282,3 +250,8 @@ async fn opt_in_known(
     }
     Ok(())
 }
+
+// k16 fork: batched opt-in backfill starts (see FORK.md)
+#[path = "../tenant/ext/backfill/opt_in.rs"]
+mod tenant;
+pub use tenant::DeferredBackfills;

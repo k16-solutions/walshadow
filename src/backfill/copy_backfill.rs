@@ -68,7 +68,6 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_postgres::binary_copy::BinaryCopyOutStream;
 use tokio_postgres::types::Type;
@@ -85,16 +84,13 @@ use crate::catalog::shadow_catalog::ShadowCatalog;
 use crate::config::{DestEmitter, ResolvedConfig};
 use crate::decode::codecs::NumericKind;
 use crate::decode::heap_decoder::ColumnValue;
-use crate::destination::snowflake::runtime::SnowflakeRuntime;
-use crate::destination::snowflake::state::GenerationPhase;
-use crate::destination::snowflake::types::{SnowflakeRow, TableSchema};
-use crate::emit::ch_emitter::{EmitterConfig, EmitterStats, ToastMode};
+use crate::emit::ch_emitter::{EmitterStats, ToastMode};
 use crate::emit::pipeline::tail::OwnedTail;
 use crate::emit::pipeline::{Fatal, bootstrap};
-use crate::emit::route::{RouteSnapshot, Routing, freeze_routes, routing};
+use crate::emit::route::{Routing, freeze_routes, routing};
 use crate::mapping::{MappingHandle, TableTarget};
 use crate::ops::oracle::Oracle;
-use crate::pg::{await_replay, is_recovery_conflict, quote_ident, snapshot_wal_lsn};
+use crate::pg::{await_replay, quote_ident, snapshot_wal_lsn};
 use crate::pos::{Pos, Snapshot};
 use crate::runtime_config::InitialLoadMode;
 use crate::schema::{
@@ -115,12 +111,6 @@ pub const COPY_SLAB_BYTES: usize = 1 << 20;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 const LEDGER_FILENAME: &str = "backfills.toml";
-/// COPY initial loads in flight when `[bootstrap] copy_concurrency` is unset
-const DEFAULT_COPY_CONCURRENCY: usize = 8;
-/// A standby this far behind `S` is not one to load from
-const REPLICA_REPLAY_WAIT: Duration = Duration::from_secs(600);
-/// Loads a standby's recovery conflicts cancel, re-run in place
-const RECOVERY_CONFLICT_ATTEMPTS: u32 = 5;
 const LEDGER_VERSION: u32 = 1;
 
 /// Output settings `pgext/worker.c` pins for typoutput, plus row security:
@@ -143,17 +133,6 @@ const BACKUP_COALESCE_WINDOW: Duration = Duration::from_millis(1000);
 // ---------------------------------------------------------------------------
 // Resume ledger
 // ---------------------------------------------------------------------------
-
-/// Record relations a completed greenfield bootstrap loaded at `s_lsn` as
-/// finished initial loads. Returns how many new ledger entries were written.
-pub async fn record_bootstrap_loaded(
-    spill_dir: &Path,
-    system_id: u64,
-    rels: impl IntoIterator<Item = RelName>,
-    s_lsn: u64,
-) -> std::io::Result<usize> {
-    Ledger::record_bootstrap_loaded(spill_dir, system_id, rels, s_lsn).await
-}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LedgerFile {
@@ -362,34 +341,6 @@ impl Ledger {
         };
         let text = toml::to_string(&file).expect("ledger serialize");
         crate::fs::write_atomic(&self.dir, LEDGER_FILENAME, text.as_bytes()).await
-    }
-
-    /// Mark relations a greenfield bootstrap already loaded at `s_lsn` as
-    /// done, so boot's opt-in seed does not load them a second time. An
-    /// existing entry is newer intent and stays untouched.
-    pub(crate) async fn record_bootstrap_loaded(
-        spill_dir: &Path,
-        system_id: u64,
-        rels: impl IntoIterator<Item = RelName>,
-        s_lsn: u64,
-    ) -> std::io::Result<usize> {
-        let mut ledger = Self::load(spill_dir, system_id).await?;
-        let mut added = 0;
-        for rel in rels {
-            ledger.entries.entry(rel).or_insert_with(|| {
-                added += 1;
-                LedgerRec {
-                    s_lsn: Pos::new(s_lsn),
-                    mode: InitialLoadMode::BaseBackup,
-                    phase: Phase::Done,
-                    toast_seeded: false,
-                }
-            });
-        }
-        if added > 0 {
-            ledger.persist().await?;
-        }
-        Ok(added)
     }
 
     async fn fallback_to_copy(
@@ -904,7 +855,7 @@ impl CopyBackfiller {
             pending_by_mode,
             coalesce_window: BACKUP_COALESCE_WINDOW,
             copy_slots: tokio::sync::Semaphore::new(
-                emitter_copy_concurrency.unwrap_or(DEFAULT_COPY_CONCURRENCY),
+                emitter_copy_concurrency.unwrap_or(tenant::DEFAULT_COPY_CONCURRENCY),
             ),
             pending_rows,
         })
@@ -932,19 +883,6 @@ impl CopyBackfiller {
         match live {
             Some(conn) if !conn.host.is_empty() => conn.to_pg_config(),
             _ => self.pg.clone(),
-        }
-    }
-
-    /// Endpoint COPY reads from: the live `[source]` replica when one is set,
-    /// else the boot replica, else [`Self::source_pg`]
-    fn copy_pg(&self) -> PgConfig {
-        let live = self.config_rx.as_ref().map(|rx| rx.borrow().source.clone());
-        match live {
-            Some(conn) if !conn.host.is_empty() => conn
-                .replica_pg_config()
-                .or_else(|| self.replica_pg.clone())
-                .unwrap_or_else(|| conn.to_pg_config()),
-            _ => self.replica_pg.clone().unwrap_or_else(|| self.pg.clone()),
         }
     }
 
@@ -1120,13 +1058,6 @@ impl CopyBackfiller {
                 }
             }
         }
-    }
-
-    /// COPY reads this standby instead of the primary: `[source]
-    /// replica_host` / `replica_user` for this backfiller's database
-    pub fn with_replica(mut self, replica: Option<PgConfig>) -> Self {
-        self.replica_pg = replica;
-        self
     }
 
     /// A cluster backup covers one database, so every other one loads by COPY
@@ -1330,107 +1261,6 @@ impl CopyBackfiller {
         tokio::fs::remove_file(ctx.scratch_dir.join("bootstrap_deferred.bin"))
             .await
             .ok();
-        Ok(outcome)
-    }
-
-    async fn staged_pass_snowflake(
-        &self,
-        mode: InitialLoadMode,
-        reqs: &[BackupRequest],
-        dest: Arc<EmitterConfig>,
-        runtime: Arc<SnowflakeRuntime>,
-    ) -> anyhow::Result<PassOutcome> {
-        let config = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
-        let plan = backfill_staging::prepare_snowflake(
-            &runtime,
-            &dest,
-            &self.mapping,
-            reqs,
-            mode,
-            config.as_ref(),
-            self.config_rx.as_ref(),
-        )
-        .await?;
-        let mut outcome = PassOutcome::default();
-        if !plan.operations.is_empty() {
-            let active_reqs: Vec<BackupRequest> = reqs
-                .iter()
-                .filter(|r| plan.operations.contains_key(&r.desc.rel_name))
-                .cloned()
-                .collect();
-            let mut pass_emitter = (*dest).clone();
-            pass_emitter.snowflake_snapshots = Arc::new(plan.operations.clone());
-            // Snowflake generations make a rerun idempotent, so the pass
-            // never resumes from a backup checkpoint
-            let scratch_dir = self.spill_dir.join("backup_backfill");
-            BackupCheckpoint::discard(&scratch_dir).await?;
-            let checkpoint = BackupCheckpoint::new(
-                mode,
-                &active_reqs,
-                &plan.mapping.snapshot(),
-                &pass_emitter,
-                config.as_deref(),
-            );
-            let ctx = PassContext {
-                pg: self.source_pg(),
-                dest: DestEmitter::new(Arc::new(pass_emitter), None),
-                mapping: plan.mapping,
-                published: self.mapping.clone(),
-                stats: self.stats.clone(),
-                catalog: self.catalog.clone(),
-                log: self.log.clone(),
-                scratch_dir,
-                config_rx: self.config_rx.clone(),
-                history_rx: self.history_rx.clone(),
-                budget: self.budget.clone(),
-                oracle: self.oracle.clone(),
-                source_major: self.source_major,
-                checkpoint,
-            };
-            outcome = crate::backfill::backup_backfill::run_pass(&ctx, mode, &active_reqs).await?;
-            BackupCheckpoint::discard(&ctx.scratch_dir).await?;
-        }
-        // Pending visibility rows are durable before publication. Their xid
-        // manifest must be durable too, so a crash after a view swap cannot
-        // leave undecided rows with no settlement path.
-        self.pending_rows
-            .lock()
-            .await
-            .reconcile_snowflake(&runtime)
-            .await
-            .map_err(anyhow::Error::msg)
-            .context("Snowflake pending visibility reconciliation")?;
-        let selected = plan
-            .rels
-            .iter()
-            .map(|r| r.desc.rel_name.clone())
-            .collect::<Vec<_>>();
-        let _mapping_guard = self
-            .mapping
-            .guard_matches(&plan.source_mapping, &selected)
-            .await
-            .context("Snowflake snapshot mapping changed before publication")?;
-        if let (Some(expected), Some(rx)) = (&config, &self.config_rx) {
-            let current = rx.borrow();
-            anyhow::ensure!(
-                plan.rels
-                    .iter()
-                    .all(|r| backfill_staging::route_config_matches(expected, &current, &r.desc)),
-                "Snowflake snapshot routing config changed before publication"
-            );
-        }
-        crate::backfill::backfill_bootstrap::publish_snapshot_rels(&runtime, &plan.rels).await?;
-        let mut ledger = self.pending_rows.lock().await;
-        if !ledger.is_empty() {
-            let mut session = StagingSession::connect(self.dest.clone()).await?;
-            crate::backfill::visibility_pending::settle(&mut ledger, &mut session, &self.stats)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-        drop(ledger);
-        for rel in &plan.rels {
-            self.mark_done_entry(&rel.desc.rel_name).await;
-        }
         Ok(outcome)
     }
 
@@ -1837,30 +1667,7 @@ impl CopyBackfiller {
     }
 
     async fn run(self: Arc<Self>, desc: Arc<RelDescriptor>, s_lsn: Pos<Snapshot>) {
-        let res = match self.copy_slots.acquire().await {
-            Ok(_slot) => {
-                let mut attempt = 1;
-                loop {
-                    match self.copy_once(&desc, s_lsn).await {
-                        Err(e)
-                            if attempt < RECOVERY_CONFLICT_ATTEMPTS && is_recovery_conflict(&e) =>
-                        {
-                            tracing::warn!(
-                                target: "walshadow::backfill",
-                                qname = %desc.rel_name,
-                                attempt,
-                                error = %format!("{e:#}"),
-                                "standby cancelled COPY for replay; re-running the load",
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                        res => break res,
-                    }
-                }
-            }
-            Err(e) => Err(anyhow::anyhow!("COPY slots closed: {e}")),
-        };
+        let res = self.copy_in_slot(&desc, s_lsn).await;
         let dropped = res.is_err() && self.source_dropped(desc.oid).await;
         let mut inner = self.inner.lock().await;
         inner.active.remove(&desc.rel_name);
@@ -2107,131 +1914,6 @@ impl CopyBackfiller {
         Ok(rows)
     }
 
-    async fn copy_once_snowflake(
-        &self,
-        client: &tokio_postgres::Client,
-        desc: &Arc<RelDescriptor>,
-        s_lsn: Pos<Snapshot>,
-        runtime: Arc<SnowflakeRuntime>,
-    ) -> anyhow::Result<CopyOutcome> {
-        let mapping = self.mapping.snapshot();
-        let table = mapping.get(&desc.rel_name).with_context(|| {
-            format!(
-                "Snowflake COPY relation {} is no longer mapped",
-                desc.rel_name
-            )
-        })?;
-        let config = self.config_rx.as_ref().map(|rx| rx.borrow().clone());
-        let route = RouteSnapshot::freeze(
-            table.clone(),
-            config
-                .as_ref()
-                .map_or_else(Arc::default, |rc| rc.column_rules.clone()),
-            self.dest
-                .current()
-                .row_policy()
-                .for_rel(config.as_deref(), &desc.rel_name),
-        );
-        let preparation_guard = self
-            .mapping
-            .guard_matches(&mapping, std::slice::from_ref(&desc.rel_name))
-            .await
-            .context("Snowflake COPY mapping changed before preparation")?;
-        if let (Some(expected), Some(rx)) = (&config, &self.config_rx) {
-            let current = rx.borrow();
-            anyhow::ensure!(
-                backfill_staging::route_config_matches(expected, &current, desc),
-                "Snowflake COPY routing config changed before preparation"
-            );
-        }
-        runtime.defer_publication(desc)?;
-        let schema = runtime.schema_for(desc, &route).await?;
-        let logical_id = snowflake_copy_operation_id(&runtime.source_identity, desc, s_lsn.get());
-        let generation = runtime
-            .begin_snapshot_attempt(desc, s_lsn.get(), &logical_id)
-            .await?;
-        drop(preparation_guard);
-        if generation.phase == GenerationPhase::Replayed {
-            return Ok(CopyOutcome {
-                rows: 0,
-                skipped_empty: false,
-                p_hi: snapshot_wal_lsn(client).await?,
-            });
-        }
-        anyhow::ensure!(
-            generation.phase == GenerationPhase::Prepared,
-            "Snowflake snapshot attempt is not prepared"
-        );
-        let operation_id = generation.operation_id;
-        let (incarnation, _) = runtime.lineage(desc)?;
-
-        let qtable = format!(
-            "{}.{}",
-            quote_ident(&desc.rel_name.namespace),
-            quote_ident(&desc.rel_name.name)
-        );
-        let nonempty: bool = client
-            .query_one(&format!("SELECT EXISTS (SELECT 1 FROM ONLY {qtable})"), &[])
-            .await
-            .context("Snowflake COPY emptiness probe")?
-            .get(0);
-        let (rows, batch_ids) = if nonempty {
-            let (tx, rx) = mpsc::channel::<Vec<BackfillTuple>>(BOOTSTRAP_TUPLE_CHANNEL_CAP);
-            let copy = async {
-                let result = crate::ops::stages::COPY
-                    .measure(copy_rows_into(
-                        client,
-                        desc,
-                        s_lsn.get(),
-                        &tx,
-                        &self.stats,
-                        BlockRange {
-                            start: 0,
-                            end: None,
-                        },
-                    ))
-                    .await;
-                drop(tx);
-                result
-            };
-            let drain = drain_snowflake_copy(
-                rx,
-                runtime.clone(),
-                schema,
-                desc.clone(),
-                self.oracle.clone(),
-                operation_id.clone(),
-                generation.generation_id,
-                incarnation,
-            );
-            tokio::try_join!(copy, drain)?
-        } else {
-            (0, Vec::new())
-        };
-        let _mapping_guard = self
-            .mapping
-            .guard_matches(&mapping, std::slice::from_ref(&desc.rel_name))
-            .await
-            .context("Snowflake COPY mapping changed before publication")?;
-        if let (Some(expected), Some(rx)) = (&config, &self.config_rx) {
-            let current = rx.borrow();
-            anyhow::ensure!(
-                backfill_staging::route_config_matches(expected, &current, desc),
-                "Snowflake COPY routing config changed before publication"
-            );
-        }
-        runtime
-            .mark_snapshot_loaded(desc, &operation_id, &batch_ids, rows == 0)
-            .await?;
-        runtime.publish_snapshot(desc, &operation_id).await?;
-        let p_hi = snapshot_wal_lsn(client).await?;
-        Ok(CopyOutcome {
-            rows,
-            skipped_empty: rows == 0,
-            p_hi,
-        })
-    }
-
     /// Session for one load's reads. On a standby it first waits for replay
     /// to pass `S`: the load's rows stand in for every change at or below it
     async fn open_copy_client(
@@ -2245,7 +1927,7 @@ impl CopyBackfiller {
             .batch_execute(COPY_SESSION_SETUP)
             .await
             .context("backfill: source session setup")?;
-        await_replay(&client, s_lsn.get(), REPLICA_REPLAY_WAIT)
+        await_replay(&client, s_lsn.get(), standby::REPLICA_REPLAY_WAIT)
             .await
             .context("backfill: standby replay")?;
         Ok(client)
@@ -2362,119 +2044,6 @@ async fn relation_extent(client: &tokio_postgres::Client, oid: u32) -> anyhow::R
     ))
 }
 
-fn snowflake_copy_operation_id(source_identity: &str, desc: &RelDescriptor, s_lsn: u64) -> String {
-    snowflake_snapshot_logical_id("copy", source_identity, desc, s_lsn)
-}
-
-pub(super) fn snowflake_snapshot_logical_id(
-    kind: &str,
-    source_identity: &str,
-    desc: &RelDescriptor,
-    s_lsn: u64,
-) -> String {
-    let mut digest = Sha256::new();
-    for part in [
-        b"snowflake-snapshot-v1".as_slice(),
-        kind.as_bytes(),
-        source_identity.as_bytes(),
-        &desc.oid.to_be_bytes(),
-        &desc.rfn.spc_node.to_be_bytes(),
-        &desc.rfn.db_node.to_be_bytes(),
-        &desc.rfn.rel_node.to_be_bytes(),
-        &s_lsn.to_be_bytes(),
-    ] {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    format!("{kind}-{}", hex::encode(digest.finalize()))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn drain_snowflake_copy(
-    mut rx: mpsc::Receiver<Vec<BackfillTuple>>,
-    runtime: Arc<SnowflakeRuntime>,
-    schema: TableSchema,
-    desc: Arc<RelDescriptor>,
-    oracle: Option<Arc<Oracle>>,
-    operation_id: String,
-    generation_id: u64,
-    incarnation: u64,
-) -> anyhow::Result<Vec<String>> {
-    // Snapshot batches land as Parquet through COPY INTO, which favors larger
-    // files than live streaming, and several stay in flight so verified
-    // batches of the generation share one grouped MERGE instead of each
-    // paying a full round trip before the next seals
-    let row_limit = runtime.config.batch_rows.max(SNAPSHOT_BATCH_ROWS);
-    let byte_limit = runtime.config.batch_bytes.max(SNAPSHOT_BATCH_BYTES);
-    let in_flight = runtime.config.channels_per_table.clamp(1, 4);
-    let mut deliveries = tokio::task::JoinSet::new();
-    let mut batch = Vec::new();
-    let mut batch_bytes = 0usize;
-    let mut ids = Vec::new();
-    let send = |batch: Vec<SnowflakeRow>,
-                deliveries: &mut tokio::task::JoinSet<anyhow::Result<String>>| {
-        let runtime = runtime.clone();
-        let schema = schema.clone();
-        let operation_id = operation_id.clone();
-        deliveries
-            .spawn(async move { runtime.deliver_snapshot(schema, batch, &operation_id).await });
-    };
-    while let Some(slab) = rx.recv().await {
-        for tuple in slab {
-            let mut committed = tuple.into_committed_insert();
-            if let Some(oracle) = &oracle {
-                crate::destination::snowflake::types::render_source_text(
-                    oracle,
-                    &mut committed,
-                    &desc,
-                )
-                .await?;
-            }
-            batch_bytes = batch_bytes.saturating_add(committed.decoded.approx_bytes());
-            batch.push(
-                SnowflakeRow::from_committed_with_lineage(
-                    &schema,
-                    &committed,
-                    0,
-                    false,
-                    &runtime.source_identity,
-                    incarnation,
-                    generation_id,
-                )
-                .map_err(anyhow::Error::msg)?,
-            );
-            if batch.len() >= row_limit || batch_bytes >= byte_limit {
-                while deliveries.len() >= in_flight {
-                    ids.push(joined(deliveries.join_next().await)?);
-                }
-                send(std::mem::take(&mut batch), &mut deliveries);
-                batch_bytes = 0;
-            }
-        }
-    }
-    if !batch.is_empty() {
-        send(batch, &mut deliveries);
-    }
-    while let Some(done) = deliveries.join_next().await {
-        ids.push(joined(Some(done))?);
-    }
-    Ok(ids)
-}
-
-/// Snapshot batch floors; live batches keep `[snowflake] batch_rows/bytes`
-const SNAPSHOT_BATCH_ROWS: usize = 200_000;
-const SNAPSHOT_BATCH_BYTES: usize = 32 << 20;
-
-fn joined(
-    done: Option<Result<anyhow::Result<String>, tokio::task::JoinError>>,
-) -> anyhow::Result<String> {
-    match done {
-        Some(Ok(result)) => result,
-        Some(Err(e)) => Err(anyhow::anyhow!("snapshot delivery task failed: {e}")),
-        None => Err(anyhow::anyhow!("snapshot delivery task disappeared")),
-    }
-}
-
 #[async_trait]
 impl Backfiller for CopyBackfiller {
     async fn note_opt_in(
@@ -2548,21 +2117,6 @@ mod tests {
             replident: ReplIdent::Default { pk_attnums: None },
             attributes: attrs,
         }
-    }
-
-    #[test]
-    fn snowflake_copy_operation_is_stable_and_source_qualified() {
-        let d = desc(vec![attr(1, "id", INT8OID, false)]);
-        let id = snowflake_copy_operation_id("source-a", &d, 42);
-        assert_eq!(id, snowflake_copy_operation_id("source-a", &d, 42));
-        assert_ne!(id, snowflake_copy_operation_id("source-b", &d, 42));
-        assert_ne!(id, snowflake_copy_operation_id("source-a", &d, 43));
-        let mut reincarnated = d;
-        reincarnated.rfn.rel_node += 1;
-        assert_ne!(
-            id,
-            snowflake_copy_operation_id("source-a", &reincarnated, 42)
-        );
     }
 
     #[test]
@@ -2845,3 +2399,13 @@ mod tests {
         assert!(Ledger::load(tmp.path(), 8).await.is_err());
     }
 }
+
+// k16 fork: Snowflake COPY, standby reads and COPY concurrency (see FORK.md)
+#[path = "../snowflake/ext/backfill/copy_backfill.rs"]
+mod snowflake;
+pub use snowflake::record_bootstrap_loaded;
+pub(super) use snowflake::snowflake_snapshot_logical_id;
+#[path = "../standby/ext/backfill/copy_backfill.rs"]
+mod standby;
+#[path = "../tenant/ext/backfill/copy_backfill.rs"]
+mod tenant;

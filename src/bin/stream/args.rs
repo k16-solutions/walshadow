@@ -506,7 +506,7 @@ pub(crate) async fn build_emitter_config(
     pools: Option<(usize, usize)>,
 ) -> Result<Option<EmitterConfig>> {
     use anyhow::Context;
-    let destination = walshadow::destination::config::DestinationConfig::from_table(merged)
+    let destination = walshadow::snowflake::config::DestinationConfig::from_table(merged)
         .context("parse destination config")?;
     if !merged.contains_key("ch") && destination.snowflake.is_none() {
         return Ok(None);
@@ -523,15 +523,12 @@ pub(crate) async fn build_emitter_config(
         }
     }
     if let Some(snowflake) = destination.snowflake {
-        walshadow::destination::config::check_snowflake_routing(&cfg)?;
+        walshadow::snowflake::config::check_snowflake_routing(&cfg)?;
         cfg.row_budget = snowflake.batch_rows;
         cfg.byte_budget = snowflake.batch_bytes;
         cfg.flush_timeout = std::time::Duration::from_millis(snowflake.flush_interval_ms);
         cfg.snowflake = Some(
-            walshadow::destination::snowflake::runtime::SnowflakeRuntime::open(
-                snowflake, sysid, dbname,
-            )
-            .await?,
+            walshadow::snowflake::runtime::SnowflakeRuntime::open(snowflake, sysid, dbname).await?,
         );
     }
     Ok(Some(finish_ch_config(cfg, args)))

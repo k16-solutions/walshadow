@@ -1031,7 +1031,7 @@ async fn ctl_introspects_source_catalog() {
             &["id integer not null", "v text"],
         )?;
 
-        // Replicating another database takes a tenant (multi_tenant_e2e), so
+        // Replicating another database takes a tenant (tenant_e2e), so
         // here it is only read: unselected
         ensure_lines(
             "tables other",

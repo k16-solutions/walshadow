@@ -72,7 +72,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // A tenant's ClickHouse scopes come from its whole file config, before
     // priming narrows the table rules
     let reserved = (input.tenant.is_some() && cfg.snowflake.is_none())
-        .then(|| Arc::new(walshadow::tenants::clickhouse_scopes(&cfg)));
+        .then(|| Arc::new(walshadow::tenant::clickhouse_scopes(&cfg)));
     let priming = input.activation.priming;
     if priming {
         // Nothing in scope until every transaction the tenant saw only
@@ -235,7 +235,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // `raw_start` is the backfill boundary S for a first-seen
     // `initial_load` row: COPY covers commits before it, WAL the rest;
     // the ledger resumes/no-ops rows seen on an earlier boot.
-    prewarm_snowflake_opt_ins(
+    walshadow::snowflake::prewarm::prewarm_opt_ins(
         &cfg,
         &mut applicator,
         &conn.catalog,
@@ -355,67 +355,6 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
         applicator: Some(applicator),
         backfiller: Some(backfiller),
     })
-}
-
-/// Create the Snowflake storage of every exact `replicate = true` opt-in
-/// concurrently before boot's serial opt-in seed, which then finds each
-/// table ready. Validation and publication deferral match the seed's own
-/// order, so a pending initial load stays hidden. Best effort: a failure
-/// here resurfaces, with context, from the seed.
-async fn prewarm_snowflake_opt_ins<'a>(
-    emitter_cfg: &EmitterConfig,
-    applicator: &mut walshadow::ch_ddl::DdlApplicator,
-    catalog: &Arc<Mutex<ShadowCatalog>>,
-    rows: impl Iterator<Item = (&'a RelName, &'a walshadow::runtime_config::TableRow)>,
-) {
-    use futures::StreamExt;
-    let Some(runtime) = emitter_cfg.snowflake.clone() else {
-        return;
-    };
-    let started = std::time::Instant::now();
-    let mut seen = HashSet::default();
-    let mut descs = Vec::new();
-    for (rel, row) in rows {
-        if row.replicate != Some(true) || !seen.insert(rel.clone()) {
-            continue;
-        }
-        let Ok(Some(desc)) = catalog.lock().await.descriptor_by_name(rel).await else {
-            continue;
-        };
-        let Ok(Some(_)) = applicator.snowflake_opt_in_mapping(
-            &desc,
-            row.target_database.as_deref(),
-            row.target_table.as_deref(),
-        ) else {
-            continue;
-        };
-        if row
-            .initial_load
-            .as_deref()
-            .is_some_and(|mode| mode != "none")
-            && applicator.defer_snowflake_publication(&desc).is_err()
-        {
-            continue;
-        }
-        descs.push(desc);
-    }
-    let total = descs.len();
-    let failed = futures::stream::iter(descs)
-        .map(|desc| {
-            let runtime = runtime.clone();
-            async move { runtime.ensure_table(&desc).await.is_err() }
-        })
-        .buffer_unordered(runtime.config.metadata_concurrency)
-        .filter(|failed| std::future::ready(*failed))
-        .count()
-        .await;
-    tracing::info!(
-        target: "walshadow::config",
-        tables = total,
-        failed,
-        elapsed_secs = started.elapsed().as_secs_f64(),
-        "Snowflake opt-in storage prewarmed",
-    );
 }
 
 /// Without `[ch]` a database routes nothing, so it needs no mapping or resolver

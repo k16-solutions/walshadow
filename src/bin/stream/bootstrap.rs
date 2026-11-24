@@ -326,7 +326,7 @@ pub(crate) async fn run_bootstrap(
             // but don't page-walk its existing rows.
             let skip_initial: HashSet<_> = drain_catalog
                 .descriptors()
-                .filter(|d| bootstrap_skips_initial(&emitter_cfg, &resolved, d))
+                .filter(|d| snowflake::bootstrap_skips_initial(&emitter_cfg, &resolved, d))
                 .map(|d| d.rel_name.clone())
                 .collect();
             Some((emitter_cfg, mapping, resolved, skip_initial))
@@ -413,52 +413,18 @@ pub(crate) async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
-    let mut snowflake_plan = None;
-    let mut snowflake_runtime = None;
-    let mut snowflake_floor = 0u64;
-    let mut snowflake_emitter = None;
-    let mut snowflake_mapping = None;
-    if let Some((emitter, mapping, resolved, skip_initial)) = ch_target.as_mut()
-        && let Some(runtime) = emitter.snowflake.clone()
-    {
-        let floor = marker
-            .pin_snapshot_lsn(
-                &shadow_data_dir,
-                object_store_start_lsn
-                    .map(|b: u64| b.min(source_ident.xlogpos))
-                    .unwrap_or(source_ident.xlogpos),
-            )
-            .await
-            .context("pin Snowflake greenfield WAL floor")?;
-        snowflake_floor = floor;
-        if resume.take().is_some() {
-            bootstrap_marker::restart_extraction(&shadow_data_dir)
-                .await
-                .context("restart Snowflake greenfield extraction")?;
-        }
-        let plan = walshadow::backfill_bootstrap::prepare_greenfield_snapshots(
-            &runtime,
-            emitter,
-            mapping,
-            &drain_catalog,
-            skip_initial,
-            resolved,
-            floor,
-        )
-        .await
-        .context("prepare Snowflake greenfield generations")?;
-        for rel in &plan.rels {
-            if rel.phase == walshadow::destination::snowflake::state::GenerationPhase::Replayed {
-                skip_initial.insert(rel.desc.rel_name.clone());
-            }
-        }
-        routes = plan.mapping.snapshot();
-        emitter.snowflake_snapshots = Arc::new(plan.operations.clone());
-        snowflake_plan = Some(plan);
-        snowflake_runtime = Some(runtime);
-        snowflake_emitter = Some(Arc::new(emitter.clone()));
-        snowflake_mapping = Some(mapping.clone());
-    }
+    let snowflake_greenfield = snowflake::prepare_snowflake_greenfield(
+        &mut ch_target,
+        &mut marker,
+        &mut resume,
+        &mut routes,
+        &shadow_data_dir,
+        object_store_start_lsn
+            .map(|b: u64| b.min(source_ident.xlogpos))
+            .unwrap_or(source_ident.xlogpos),
+        &drain_catalog,
+    )
+    .await?;
 
     let mut cfg = BootstrapConfig::new(shadow_data_dir.clone()).with_catalog_filenodes(
         catalog_filenodes
@@ -1191,7 +1157,7 @@ pub(crate) async fn run_bootstrap(
             .await
             .context("bootstrap: load pending visibility ledger")?;
         // Snowflake keeps pending tables in its runtime state, not this ledger
-        let recorded = if let Some(runtime) = &snowflake_runtime {
+        let recorded = if let Some(runtime) = snowflake_greenfield.as_ref().map(|g| &g.runtime) {
             ledger
                 .reconcile_snowflake(runtime)
                 .await
@@ -1219,47 +1185,14 @@ pub(crate) async fn run_bootstrap(
         PendingRecorded::nothing_pending()
     };
 
-    if let (Some(runtime), Some(plan), Some(emitter), Some(mapping)) = (
-        &snowflake_runtime,
-        &snowflake_plan,
-        snowflake_emitter,
-        snowflake_mapping,
-    ) {
-        let system_id: u64 = source_ident.system_id;
-        walshadow::backfill_bootstrap::publish_greenfield_snapshots(runtime, plan, &mapping)
-            .await
-            .context("publish Snowflake greenfield generations")?;
-        // Published generations are the tables' initial load; without a done
-        // ledger entry boot's `initial_load` opt-in seed would copy them again
-        let recorded = walshadow::copy_backfill::record_bootstrap_loaded(
-            &args.spill_dir,
-            system_id,
-            plan.rels.iter().map(|rel| rel.desc.rel_name.clone()),
-            snowflake_floor,
+    if let Some(greenfield) = &snowflake_greenfield {
+        snowflake::publish_snowflake_greenfield(
+            args,
+            source_ident.system_id,
+            greenfield,
+            &bootstrap_stats,
         )
-        .await
-        .context("record Snowflake greenfield loads in backfill ledger")?;
-        tracing::info!(target: "walshadow::bootstrap", recorded,
-            "greenfield loads recorded as completed initial loads");
-        let mut ledger =
-            walshadow::visibility_pending::PendingLedger::load(&args.spill_dir, system_id)
-                .await
-                .context("load Snowflake greenfield pending ledger")?;
-        ledger
-            .reconcile_snowflake(runtime)
-            .await
-            .map_err(anyhow::Error::msg)
-            .context("reconcile Snowflake greenfield pending rows")?;
-        if !ledger.is_empty() {
-            let mut session = walshadow::backfill_staging::StagingSession::connect(
-                walshadow::config::DestEmitter::new(emitter, None),
-            )
-            .await
-            .context("open Snowflake pending settlement")?;
-            walshadow::visibility_pending::settle(&mut ledger, &mut session, &bootstrap_stats)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
+        .await?;
     }
 
     // PG refuses to start on a data dir whose mode isn't 0700 or 0750.
@@ -1328,41 +1261,6 @@ impl BootstrapHandoff {
     }
 }
 
-/// `initial_load = "none"` (table override, else namespace) opts a relation
-/// out of the greenfield snapshot: create it and stream CDC, but don't
-/// page-walk its existing rows
-fn bootstrap_skips_initial(
-    emitter: &EmitterConfig,
-    resolved: &walshadow::config::ResolvedConfig,
-    desc: &RelDescriptor,
-) -> bool {
-    // A partition loads as its root's `initial_load` says
-    let relation = &routing(desc, Some(&resolved.rules))
-        .owner(desc)
-        .unwrap_or(desc)
-        .rel_name;
-    let table_mode = emitter
-        .table_opt_ins
-        .get(relation)
-        .and_then(|row| row.initial_load.as_deref())
-        .or_else(|| {
-            emitter
-                .table_initial_loads
-                .get(relation)
-                .map(String::as_str)
-        });
-    match table_mode {
-        Some(mode) => mode.parse::<InitialLoadMode>() == Ok(InitialLoadMode::None),
-        None => {
-            resolved
-                .namespaces
-                .get(relation.namespace.as_ref())
-                .and_then(|ns| ns.initial_load)
-                == Some(InitialLoadMode::None)
-        }
-    }
-}
-
 /// Routing map for the bootstrap drain: explicit `[table.*]` seeded up front,
 /// then every seeded relation run through the DDL applicator's `Added` path so
 /// `auto_create` namespaces get their CH table created and mapping registered.
@@ -1405,41 +1303,17 @@ pub(crate) async fn bootstrap_build_mapping(
     let dest =
         walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
     if let Some(runtime) = &emitter_cfg.snowflake {
-        use futures::{StreamExt, TryStreamExt};
-        // Relations have independent storage and durable journals. Bound remote
-        // setup without serializing thousands of SQL round trips on one lane.
-        futures::stream::iter(catalog.descriptors())
-            .map(|desc| {
-                let dest = dest.clone();
-                let ddl_cfg = ddl_cfg.clone();
-                let config_rx = config_rx.clone();
-                let mapping = mapping.clone();
-                let resolved = resolved.clone();
-                async move {
-                    let mut applicator = walshadow::ch_ddl::DdlApplicator::new(
-                        dest,
-                        ddl_cfg,
-                        mapping.clone(),
-                        config_rx,
-                    )
-                    .await?;
-                    if !bootstrap_skips_initial(emitter_cfg, &resolved, desc)
-                        && mapping.with(|m| m.contains_key(&desc.rel_name))
-                    {
-                        runtime.defer_publication(desc)?;
-                    }
-                    applicator.add(desc).await.with_context(|| {
-                        format!("bootstrap: ensure Snowflake table {}", desc.rel_name)
-                    })
-                }
-            })
-            .buffer_unordered(runtime.config.metadata_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
-        tracing::info!(target: "walshadow::bootstrap",
-            tables = mapping.with(|m| m.len()),
-            "Snowflake bootstrap table setup complete");
-        return Ok((mapping, resolved));
+        return snowflake::snowflake_build_mapping(
+            emitter_cfg,
+            catalog,
+            runtime,
+            dest,
+            ddl_cfg,
+            mapping,
+            config_rx,
+            resolved,
+        )
+        .await;
     }
     let mut applicator =
         walshadow::ch_ddl::DdlApplicator::new(dest, ddl_cfg, mapping.clone(), config_rx)
@@ -1822,3 +1696,7 @@ mod tests {
         );
     }
 }
+
+// k16 fork: Snowflake greenfield bootstrap and initial-load skips (see FORK.md)
+#[path = "../../snowflake/ext/bin/stream/bootstrap.rs"]
+mod snowflake;
