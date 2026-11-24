@@ -80,7 +80,7 @@ pub(crate) struct DaemonSinks {
     /// publication hold: at a catalog-mutating commit the pump parks there
     /// until shadow replays through the commit's `next_lsn`, so successor
     /// bytes reach neither the shadow wire nor the archive while held.
-    pub(crate) decoder_xact: walshadow::tenant_router::TenantRouter,
+    pub(crate) decoder_xact: walshadow::tenant::router::TenantRouter,
     /// Per-txn span map; `Some` only with OTLP on. Registering at WAL read
     /// (here) makes the `txn` span cover the pump→worker channel wait.
     pub(crate) span_registry: Option<walshadow::trace::TxnSpanRegistry>,

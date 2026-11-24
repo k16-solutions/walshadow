@@ -271,11 +271,11 @@ async fn dispatch(buf: &[u8], ctx: &SharedCtx) -> String {
         "tables" => tables_list(ctx, &req).await,
         "schemas" => schemas_list(ctx, &req).await,
         "columns" => columns_list(ctx, &req).await,
-        "tenants" => crate::ops::tenant_ctl::list(ctx).await,
-        "tenant-show" => crate::ops::tenant_ctl::show(ctx, &req.config).await,
-        "tenant-put" => crate::ops::tenant_ctl::put(ctx, &req.config).await,
-        "tenant-remove" => crate::ops::tenant_ctl::remove(ctx, &req.config).await,
-        "tenant-state" => crate::ops::tenant_ctl::set_state(ctx, &req.config).await,
+        "tenants" => crate::tenant::ctl::list(ctx).await,
+        "tenant-show" => crate::tenant::ctl::show(ctx, &req.config).await,
+        "tenant-put" => crate::tenant::ctl::put(ctx, &req.config).await,
+        "tenant-remove" => crate::tenant::ctl::remove(ctx, &req.config).await,
+        "tenant-state" => crate::tenant::ctl::set_state(ctx, &req.config).await,
         other => Err(anyhow::anyhow!("unknown command {other}")),
     };
     res.unwrap_or_else(|e| err(format!("{e:#}")))
@@ -335,7 +335,7 @@ async fn validate(ctx: &SharedCtx, frag: &Path, root: &Table) -> Result<()> {
     crate::ch_emitter::EmitterConfig::from_table(&merged)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    crate::ops::tenant_ctl::validate(&merged)
+    crate::tenant::ctl::validate(&merged)
 }
 
 /// A request naming `tenant = "<id>"` reads through that tenant's view:
@@ -345,7 +345,7 @@ fn scoped(root: Table, req: &Request<'_>) -> Result<Table> {
         return Ok(root);
     };
     let tenants =
-        crate::tenants::TenantsConfig::from_table(&root)?.context("no tenants configured")?;
+        crate::tenant::TenantsConfig::from_table(&root)?.context("no tenants configured")?;
     let decl = tenants.get(id).with_context(|| format!("no tenant {id}"))?;
     Ok(decl.effective_table(&root))
 }

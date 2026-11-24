@@ -2,9 +2,8 @@
 use crate::Destination;
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
-use walshadow::destination::{
-    config::DestinationConfig,
-    snowflake::{http::SnowflakeHttp, sql::quote_qualified_ident},
+use walshadow::snowflake::{
+    config::DestinationConfig, http::SnowflakeHttp, sql::quote_qualified_ident,
 };
 
 pub struct SnowflakeDest {

@@ -41,7 +41,7 @@ Physical WAL carries every database of the cluster, and shadow replays all
 their catalogs, so one pump and one slot can serve many source databases.
 Each [tenant](../docs/tenants.md) owns a descriptor log, transaction buffer,
 catalog capture, bridge pool, pipeline and destination for one database. The
-[router](../src/source/tenant_router.rs) sends each record to the tenant
+[router](../src/tenant/router.rs) sends each record to the tenant
 whose database wrote it (block locators, truncate payloads, commit dbinfo,
 boundary database) and broadcasts records that name none; idle tenants get
 position heartbeats so their acks move. The session's resume floor is the

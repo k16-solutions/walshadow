@@ -92,7 +92,7 @@ impl BackupSource for DirectSource {
                     sink.start(&s).await?;
                     if let Some(wal_leg) = &wal_leg {
                         leg = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
-                            fork::stream_window(
+                            standby::stream_window(
                                 wal_leg.source.clone(),
                                 s.timeline,
                                 s.start_lsn,
@@ -176,7 +176,7 @@ async fn drive_archive(
     Ok(())
 }
 
-// k16 fork: the standby WAL leg lives in src/fork/ (see FORK.md)
-#[path = "../fork/backfill/backup_source_direct.rs"]
-mod fork;
-pub use fork::WalLeg;
+// k16 fork: the standby WAL leg (see FORK.md)
+#[path = "../standby/ext/backfill/backup_source_direct.rs"]
+mod standby;
+pub use standby::WalLeg;

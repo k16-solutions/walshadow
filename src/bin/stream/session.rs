@@ -151,8 +151,8 @@ async fn session_body(
         "source identified",
     );
 
-    walshadow::ops::tenant_ctl::validate(&merged)?;
-    let mut tenants_cfg = walshadow::tenants::TenantsConfig::from_table(&merged)
+    walshadow::tenant::ctl::validate(&merged)?;
+    let mut tenants_cfg = walshadow::tenant::TenantsConfig::from_table(&merged)
         .context("parse [tenants] / [tenant.*]")?;
     if let Some(tcfg) = &tenants_cfg {
         let _ = TENANT_BRIDGES.set((tcfg.bridge_workers, tcfg.capacity));
@@ -814,7 +814,7 @@ async fn session_body(
         io: io.clone(),
     };
     drop(history_rx);
-    let mut router = walshadow::tenant_router::TenantRouter::new(
+    let mut router = walshadow::tenant::router::TenantRouter::new(
         tenants_cfg
             .as_ref()
             .map_or(NO_STALL_LIMIT, |t| t.stall_timeout),
@@ -853,7 +853,7 @@ async fn session_body(
             let pending_oids: Vec<u32> = pending_dbs.iter().map(|p| p.oid).collect();
             let boot = tenant::TenantBoot {
                 args,
-                id: walshadow::tenants::LEGACY_TENANT.into(),
+                id: walshadow::tenant::LEGACY_TENANT.into(),
                 databases,
                 primary: primary_index,
                 dir: args.spill_dir.clone(),
@@ -909,7 +909,7 @@ async fn session_body(
             for db in &t.db_oids {
                 stream.filter_mut().add_target_db(*db);
             }
-            router.attach(walshadow::tenant_router::RoutedTenant::new(
+            router.attach(walshadow::tenant::router::RoutedTenant::new(
                 t.id.clone(),
                 t.db_oids.iter().copied().chain(pending_oids).collect(),
                 0,
@@ -933,7 +933,7 @@ async fn session_body(
             );
             reloader.set_resolvers(vec![resolver.clone()]).await;
             cluster_resolver = Some(resolver);
-            if let (walshadow::tenants::Registry::Sql { schema, poll }, Some(path)) =
+            if let (walshadow::tenant::Registry::Sql { schema, poll }, Some(path)) =
                 (&tcfg.registry, args.ch_config.clone())
             {
                 registry_poller = Some(tenant::spawn_registry_poller(
@@ -947,7 +947,7 @@ async fn session_body(
             let active: Vec<_> = tcfg
                 .decls
                 .iter()
-                .filter(|d| d.desired == walshadow::tenants::Desired::Active)
+                .filter(|d| d.desired == walshadow::tenant::Desired::Active)
                 .collect();
             tenant::publish_tenant_bridges(
                 &shadow_lifecycle,
@@ -965,7 +965,7 @@ async fn session_body(
                         for db in &t.db_oids {
                             stream.filter_mut().add_target_db(*db);
                         }
-                        router.attach(walshadow::tenant_router::RoutedTenant::new(
+                        router.attach(walshadow::tenant::router::RoutedTenant::new(
                             t.id.clone(),
                             t.db_oids.clone(),
                             from_lsn,
@@ -1333,8 +1333,8 @@ async fn session_body(
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
                     .and_then(|m| {
-                        walshadow::ops::tenant_ctl::validate(&m)?;
-                        walshadow::tenants::TenantsConfig::from_table(&m).map(|t| (m, t))
+                        walshadow::tenant::ctl::validate(&m)?;
+                        walshadow::tenant::TenantsConfig::from_table(&m).map(|t| (m, t))
                     }) {
                     Ok((next_merged, Some(next))) => {
                         let old = tenants_cfg.take().expect("tenants mode");
@@ -1431,7 +1431,7 @@ async fn session_body(
                 && let Some(id) = supervisor.next_attach()
                 && let Some(decl) = tcfg
                     .get(&id)
-                    .filter(|d| d.desired == walshadow::tenants::Desired::Active)
+                    .filter(|d| d.desired == walshadow::tenant::Desired::Active)
                 && !tenants.iter().any(|t| t.id == id)
             {
                 let attached = async {
@@ -1480,7 +1480,7 @@ async fn session_body(
                             stream.filter_mut().add_target_db(*db);
                         }
                         record_sink.decoder_xact.attach(
-                            walshadow::tenant_router::RoutedTenant::new(
+                            walshadow::tenant::router::RoutedTenant::new(
                                 t.id.clone(),
                                 t.db_oids.clone(),
                                 p0,

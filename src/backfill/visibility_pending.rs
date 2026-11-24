@@ -257,10 +257,10 @@ pub async fn ship(
     oracle: Option<Arc<Oracle>>,
     scratch_dir: &Path,
 ) -> Result<Vec<PendingManifest>, String> {
-    if let Some(emitter) = fork::snowflake_emitter(&dest)
+    if let Some(emitter) = snowflake::snowflake_emitter(&dest)
         && let Some(runtime) = &emitter.snowflake
     {
-        return fork::ship_snowflake(
+        return snowflake::ship_snowflake(
             pending,
             live,
             runtime,
@@ -788,7 +788,7 @@ pub async fn settle(
     stats: &EmitterStats,
 ) -> Result<(), String> {
     if let Some(runtime) = sess.snowflake_runtime().cloned() {
-        return fork::settle_snowflake(ledger, &runtime, stats).await;
+        return snowflake::settle_snowflake(ledger, &runtime, stats).await;
     }
     let mut done = Vec::new();
     for (i, e) in ledger.entries.iter_mut().enumerate() {
@@ -1238,7 +1238,6 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake pending-visibility capture and settlement live in
-// src/fork/ (see FORK.md)
-#[path = "../fork/backfill/visibility_pending.rs"]
-mod fork;
+// k16 fork: Snowflake pending-visibility capture and settlement (see FORK.md)
+#[path = "../snowflake/ext/backfill/visibility_pending.rs"]
+mod snowflake;

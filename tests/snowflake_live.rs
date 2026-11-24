@@ -3,17 +3,15 @@
 use anyhow::{Context, Result, ensure};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
-use walshadow::destination::{
-    config::DestinationConfig,
-    snowflake::{
-        http::SnowflakeHttp,
-        runtime::SnowflakeRuntime,
-        sql::{TableSqlPlan, quote_ident},
-        types::{SnowflakeColumn, SnowflakeRow, SnowflakeType, SnowflakeValue, TableSchema},
-    },
-};
 use walshadow::schema::{
     INT8OID, JSONBOID, RelAttr, RelDescriptor, RelName, ReplIdent, TEXTOID, TIMESTAMPTZOID,
+};
+use walshadow::snowflake::{
+    config::DestinationConfig,
+    http::SnowflakeHttp,
+    runtime::SnowflakeRuntime,
+    sql::{TableSqlPlan, quote_ident},
+    types::{SnowflakeColumn, SnowflakeRow, SnowflakeType, SnowflakeValue, TableSchema},
 };
 
 #[test]
@@ -216,7 +214,7 @@ async fn runtime_stream_copy_restart_snapshot_and_truncate() -> Result<()> {
 }
 
 async fn run_runtime_case(
-    config: walshadow::destination::config::SnowflakeConfig,
+    config: walshadow::snowflake::config::SnowflakeConfig,
     http: &SnowflakeHttp,
     public_schema: &str,
 ) -> Result<()> {

@@ -10,7 +10,6 @@ pub mod segment_sink;
 pub mod shadow_stream;
 pub mod source_feed;
 pub(super) mod streaming_walker;
-pub mod tenant_router;
 pub mod timeline;
 pub mod transition;
 pub(super) mod wal_page;
