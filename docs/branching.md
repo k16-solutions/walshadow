@@ -39,15 +39,19 @@ CI to run against the latest `main`.
 
 ## Syncing upstream
 
-Upstream's `main` is merged into ours periodically:
+Upstream's `main` is merged into ours every two weeks. The schedule, the
+automation and the review checklist are in [upstream-sync.md](upstream-sync.md).
+`scripts/fork/trial-merge.sh` shows what a merge would conflict on without
+touching your checkout. The git steps:
 
 ```bash
 git remote add upstream git@github.com:ClickHouse/walshadow.git   # once
 git config remote.upstream.tagOpt --no-tags                       # once, see Releases
 git fetch origin && git fetch upstream
 git switch -c merge/upstream-$(date +%F) origin/main
+git config rerere.enabled true                                    # once; reuses resolutions
 git merge upstream/main
-# resolve conflicts, build, run the tests
+# resolve conflicts (rules: .claude/skills/upstream-sync/SKILL.md), build, run the tests
 git push -u origin HEAD
 ```
 
