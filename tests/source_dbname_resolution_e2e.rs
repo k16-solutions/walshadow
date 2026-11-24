@@ -11,7 +11,7 @@
 //!
 //! `postgres` holds a same-named table whose rows, pre-boot and live, must
 //! never reach the destination: only `[source] dbname` is followed. Further
-//! databases replicate as tenants (`multi_tenant_e2e`)
+//! databases replicate as tenants (`tenant_e2e`)
 //!
 //! Here the table lives in source database `duptest`, named only by the TOML.
 //! `--dbname postgres` disagrees and `--shadow-dbname postgres` is passed as

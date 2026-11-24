@@ -72,7 +72,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // A tenant's ClickHouse scopes come from its whole file config, before
     // priming narrows the table rules
     let reserved = (input.tenant.is_some() && cfg.snowflake.is_none())
-        .then(|| Arc::new(walshadow::tenants::clickhouse_scopes(&cfg)));
+        .then(|| Arc::new(walshadow::tenant::clickhouse_scopes(&cfg)));
     let priming = input.activation.priming;
     if priming {
         // Nothing in scope until every transaction the tenant saw only
@@ -235,7 +235,7 @@ pub(crate) async fn build_source_db(input: SourceDbInputs<'_>) -> anyhow::Result
     // `raw_start` is the backfill boundary S for a first-seen
     // `initial_load` row: COPY covers commits before it, WAL the rest;
     // the ledger resumes/no-ops rows seen on an earlier boot.
-    walshadow::destination::snowflake::prewarm::prewarm_opt_ins(
+    walshadow::snowflake::prewarm::prewarm_opt_ins(
         &cfg,
         &mut applicator,
         &conn.catalog,

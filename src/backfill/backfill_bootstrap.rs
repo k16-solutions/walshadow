@@ -759,7 +759,9 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake greenfield generations live in src/fork/ (see FORK.md)
-#[path = "../fork/backfill/backfill_bootstrap.rs"]
-mod fork;
-pub use fork::{prepare_greenfield_snapshots, publish_greenfield_snapshots, publish_snapshot_rels};
+// k16 fork: Snowflake greenfield generations (see FORK.md)
+#[path = "../snowflake/ext/backfill/backfill_bootstrap.rs"]
+mod snowflake;
+pub use snowflake::{
+    prepare_greenfield_snapshots, publish_greenfield_snapshots, publish_snapshot_rels,
+};

@@ -540,7 +540,7 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake snapshot-floor helpers live in src/fork/ (see FORK.md)
-#[path = "../fork/backfill/bootstrap_marker.rs"]
-mod fork;
-pub use fork::restart_extraction;
+// k16 fork: Snowflake snapshot-floor helpers (see FORK.md)
+#[path = "../snowflake/ext/backfill/bootstrap_marker.rs"]
+mod snowflake;
+pub use snowflake::restart_extraction;
