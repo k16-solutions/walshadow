@@ -254,7 +254,7 @@ async fn opt_in_known(
     Ok(())
 }
 
-// k16 fork: batched opt-in backfill starts live in src/fork/ (see FORK.md)
-#[path = "../fork/backfill/opt_in.rs"]
-mod fork;
-pub use fork::DeferredBackfills;
+// k16 fork: batched opt-in backfill starts (see FORK.md)
+#[path = "../tenant/ext/backfill/opt_in.rs"]
+mod tenant;
+pub use tenant::DeferredBackfills;

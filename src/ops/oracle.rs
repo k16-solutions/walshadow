@@ -882,6 +882,6 @@ mod tests {
     }
 }
 
-// k16 fork: neutral (Snowflake) text rendering lives in src/fork/ (see FORK.md)
-#[path = "../fork/ops/oracle.rs"]
-mod fork;
+// k16 fork: neutral (Snowflake) text rendering (see FORK.md)
+#[path = "../snowflake/ext/ops/oracle.rs"]
+mod snowflake;

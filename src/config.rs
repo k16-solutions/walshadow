@@ -402,7 +402,7 @@ pub struct ConfigResolver {
     tenant: std::sync::OnceLock<String>,
     /// Scope a tenant attached mid-stream holds over what the file says
     activation: std::sync::Mutex<Activation>,
-    reserved: std::sync::OnceLock<Arc<crate::tenants::ChScopes>>,
+    reserved: std::sync::OnceLock<Arc<crate::tenant::ChScopes>>,
 }
 
 /// State fixed before the pump consumes WAL
@@ -1014,14 +1014,14 @@ impl ConfigResolver {
         };
         let mut inner = self.inner.lock().await;
         let mut merged = crate::ch_emitter::load_effective(path, self.cli_base.clone()).await?;
-        crate::tenants::reject_database_sections(&merged)
+        crate::tenant::reject_database_sections(&merged)
             .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
         if merged.contains_key("tenants") || merged.contains_key("tenant") {
-            crate::ops::tenant_ctl::validate(&merged)
+            crate::tenant::ctl::validate(&merged)
                 .map_err(|e| EmitterError::Config(format!("{e:#}")))?;
         }
         if let Some(id) = self.tenant.get() {
-            let tenants = crate::tenants::TenantsConfig::from_table(&merged)
+            let tenants = crate::tenant::TenantsConfig::from_table(&merged)
                 .map_err(|e| EmitterError::Config(format!("{e:#}")))?
                 .ok_or_else(|| EmitterError::Config("tenants are no longer configured".into()))?;
             // Removal and detach are the tenant supervisor's; this tenant's
@@ -1031,7 +1031,7 @@ impl ConfigResolver {
             };
             merged = decl.effective_table(&merged);
         }
-        let selection = crate::destination::config::DestinationConfig::from_table(&merged)
+        let selection = crate::snowflake::config::DestinationConfig::from_table(&merged)
             .map_err(|e| EmitterError::Config(e.to_string()))?;
         // This resolver's own database, not whichever one `[source]` names
         let mut base = EmitterConfig::for_database(&merged, &self.dbname)?;
@@ -1042,7 +1042,7 @@ impl ConfigResolver {
                 }
                 // Credentials, role, warehouse and timing apply live; what
                 // durable state is bound to, and pool sizes, do not
-                crate::destination::config::check_snowflake_routing(&base)
+                crate::snowflake::config::check_snowflake_routing(&base)
                     .map_err(|e| EmitterError::Config(e.to_string()))?;
                 runtime
                     .update_settings(&config)
@@ -1082,8 +1082,10 @@ mod tests {
     use super::*;
     use crate::runtime_config::{ColumnRow, GlobalRow, NamespaceRow, TableRow};
     use foldhash::HashMapExt;
-    // k16 fork: tenant/Snowflake/standby tests share these fixtures (see FORK.md)
-    include!("fork/config/tests.rs");
+    // k16 fork: feature tests that share these fixtures (see FORK.md)
+    include!("tenant/ext/config/tests.rs");
+    include!("standby/ext/config/tests.rs");
+    include!("snowflake/ext/config/tests.rs");
 
     fn base_with(drop_strategy: &str) -> EmitterConfig {
         EmitterConfig::from_toml_str(&format!(
@@ -2788,8 +2790,11 @@ mod tests {
     }
 }
 
-// k16 fork: tenant activation, reserved destinations and standby endpoints
-// live in src/fork/ (see FORK.md)
-#[path = "fork/config.rs"]
-mod fork;
-pub use fork::Activation;
+// k16 fork: tenant, standby and Snowflake extensions (see FORK.md)
+#[path = "tenant/ext/config.rs"]
+mod tenant;
+pub use tenant::Activation;
+#[path = "snowflake/ext/config.rs"]
+mod snowflake;
+#[path = "standby/ext/config.rs"]
+mod standby;

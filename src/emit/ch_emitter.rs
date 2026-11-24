@@ -121,7 +121,7 @@ pub fn default_database<'a>(
 /// database of the cluster; entries outside `[database.*]` use `[source] dbname`
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
-    pub snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
+    pub snowflake: Option<Arc<crate::snowflake::runtime::SnowflakeRuntime>>,
     pub snowflake_snapshots: Arc<HashMap<RelName, String>>,
     pub instances: BTreeMap<String, InstanceConfig>,
     pub conn: InstanceConfig,

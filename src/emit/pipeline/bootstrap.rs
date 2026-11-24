@@ -3078,7 +3078,7 @@ mod tests {
     }
 }
 
-// k16 fork: per-tuple TOAST resolution lives in src/fork/ (see FORK.md)
-#[path = "../../fork/emit/pipeline/bootstrap.rs"]
-mod fork;
-pub(crate) use fork::resolve_or_fill_toast;
+// k16 fork: per-tuple TOAST resolution for Snowflake (see FORK.md)
+#[path = "../../snowflake/ext/emit/pipeline/bootstrap.rs"]
+mod snowflake;
+pub(crate) use snowflake::resolve_or_fill_toast;

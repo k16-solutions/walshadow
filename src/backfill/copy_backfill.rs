@@ -920,7 +920,7 @@ impl CopyBackfiller {
             pending_by_mode,
             coalesce_window: BACKUP_COALESCE_WINDOW,
             copy_slots: tokio::sync::Semaphore::new(
-                emitter_copy_concurrency.unwrap_or(fork::DEFAULT_COPY_CONCURRENCY),
+                emitter_copy_concurrency.unwrap_or(tenant::DEFAULT_COPY_CONCURRENCY),
             ),
             pending_rows,
         })
@@ -2045,7 +2045,7 @@ impl CopyBackfiller {
             .batch_execute(COPY_SESSION_SETUP)
             .await
             .context("backfill: source session setup")?;
-        await_replay(&client, s_lsn.get(), fork::REPLICA_REPLAY_WAIT)
+        await_replay(&client, s_lsn.get(), standby::REPLICA_REPLAY_WAIT)
             .await
             .context("backfill: standby replay")?;
         Ok(client)
@@ -2788,9 +2788,12 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake COPY, standby reads and ledger seeding live in src/fork/
-// (see FORK.md)
-#[path = "../fork/backfill/copy_backfill.rs"]
-mod fork;
-pub use fork::record_bootstrap_loaded;
-pub(super) use fork::snowflake_snapshot_logical_id;
+// k16 fork: Snowflake COPY, standby reads and COPY concurrency (see FORK.md)
+#[path = "../snowflake/ext/backfill/copy_backfill.rs"]
+mod snowflake;
+pub use snowflake::record_bootstrap_loaded;
+pub(super) use snowflake::snowflake_snapshot_logical_id;
+#[path = "../standby/ext/backfill/copy_backfill.rs"]
+mod standby;
+#[path = "../tenant/ext/backfill/copy_backfill.rs"]
+mod tenant;

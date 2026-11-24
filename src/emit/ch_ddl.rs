@@ -334,7 +334,7 @@ pub fn is_system_namespace(ns: &str, runtime_config_schema: Option<&str>) -> boo
 pub struct DdlApplicator {
     /// `None` for Snowflake, which applies DDL through `snowflake`
     client: Option<ChConn>,
-    snowflake: Option<Arc<crate::destination::snowflake::runtime::SnowflakeRuntime>>,
+    snowflake: Option<Arc<crate::snowflake::runtime::SnowflakeRuntime>>,
     config: DdlConfig,
     /// Live config layers. `refresh_config` folds a republished snapshot
     /// into `config` (namespaces + drop strategy) at each apply, so SIGHUP
@@ -352,7 +352,7 @@ pub struct DdlApplicator {
     ensured_databases: HashMap<(Option<String>, String), Arc<EmitterConfig>>,
     /// ClickHouse `(host:port, database)` scopes a tenant owns; a route
     /// outside them is refused. `None` outside tenants
-    reserved: Option<Arc<crate::tenants::ChScopes>>,
+    reserved: Option<Arc<crate::tenant::ChScopes>>,
     /// Last destination truncated in full, with source record position.
     /// Partitions share this record and need no separate delete markers
     truncated: Option<(u64, TableTarget)>,
@@ -421,7 +421,7 @@ impl DdlApplicator {
             return;
         }
         let snap = self.config_rx.borrow_and_update();
-        self.config = DdlConfig::from_resolved(&snap, fork::live_boot(&self.config, &snap));
+        self.config = DdlConfig::from_resolved(&snap, tenant::live_boot(&self.config, &snap));
     }
 
     /// Create destination for a relation present before streaming
@@ -1021,16 +1021,18 @@ impl DdlApplicator {
         let cfg = self.plan_config(config);
         if let Some(snowflake) = &self.snowflake {
             // Refusals surface from `predict_route_effects` and the apply
-            return fork::predict_snowflake_route_effect(&cfg, mapping, event, excluded, snowflake)
-                .ok()
-                .flatten();
+            return snowflake::predict_snowflake_route_effect(
+                &cfg, mapping, event, excluded, snowflake,
+            )
+            .ok()
+            .flatten();
         }
         predict_route_effect(&cfg, mapping, event, excluded)
     }
 
     fn plan_config(&self, frozen: Option<&ResolvedConfig>) -> DdlConfig {
         frozen
-            .map(|rc| DdlConfig::from_resolved(rc, fork::live_boot(&self.config, rc)))
+            .map(|rc| DdlConfig::from_resolved(rc, tenant::live_boot(&self.config, rc)))
             .unwrap_or_else(|| self.config.clone())
     }
 
@@ -1061,7 +1063,7 @@ impl DdlApplicator {
         client.select(target.instance.as_deref())?;
         let config = client.config();
         if let Some(reserved) = &self.reserved
-            && !reserved.contains(&crate::tenants::ch_scope(&config.conn, &target.database))
+            && !reserved.contains(&crate::tenant::ch_scope(&config.conn, &target.database))
         {
             return Err(EmitterError::Config(format!(
                 "{} on {}:{} is outside this tenant's destinations; tenants write disjoint \
@@ -3669,6 +3671,8 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake DDL and tenant scopes live in src/fork/ (see FORK.md)
-#[path = "../fork/emit/ch_ddl.rs"]
-mod fork;
+// k16 fork: Snowflake DDL and tenant destination scopes (see FORK.md)
+#[path = "../snowflake/ext/emit/ch_ddl.rs"]
+mod snowflake;
+#[path = "../tenant/ext/emit/ch_ddl.rs"]
+mod tenant;

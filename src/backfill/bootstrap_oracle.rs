@@ -567,9 +567,7 @@ pub fn snowflake_needs_oracle(catalog: &CatalogMap, tables: &MappingSnapshot) ->
                 .filter(|attr| !attr.dropped)
                 .any(|attr| {
                     !local_matrix_covers(attr.type_oid, attr.type_len)
-                        || crate::destination::snowflake::types::renders_through_oracle(
-                            attr.type_oid,
-                        )
+                        || crate::snowflake::types::renders_through_oracle(attr.type_oid)
                         || matches!(
                             missing_value_for(attr),
                             ColumnValue::PgPending { .. } | ColumnValue::PgPendingText { .. }

@@ -467,7 +467,7 @@ pub(crate) async fn run_bootstrap(
         .context("bootstrap: sample source write head for the window leg")?;
     let source_major = (feed.server_version_num() / 10000) as u32;
 
-    let snowflake_greenfield = fork::prepare_snowflake_greenfield(
+    let snowflake_greenfield = snowflake::prepare_snowflake_greenfield(
         &mut ch_target,
         &mut marker,
         &mut resume,
@@ -1197,7 +1197,7 @@ pub(crate) async fn run_bootstrap(
     };
 
     if let Some(greenfield) = &snowflake_greenfield {
-        fork::publish_snowflake_greenfield(
+        snowflake::publish_snowflake_greenfield(
             args,
             source_ident.system_id,
             greenfield,
@@ -1347,7 +1347,7 @@ pub(crate) async fn bootstrap_build_mapping(
     let dest =
         walshadow::config::DestEmitter::new(Arc::new(emitter_cfg.clone()), Some(config_rx.clone()));
     if let Some(runtime) = &emitter_cfg.snowflake {
-        return fork::snowflake_build_mapping(
+        return snowflake::snowflake_build_mapping(
             emitter_cfg,
             catalog,
             runtime,
@@ -1816,7 +1816,6 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake greenfield prep/publication and `initial_load = "none"`
-// skips live in src/fork/ (see FORK.md)
-#[path = "../../fork/bin/stream/bootstrap.rs"]
-mod fork;
+// k16 fork: Snowflake greenfield bootstrap and initial-load skips (see FORK.md)
+#[path = "../../snowflake/ext/bin/stream/bootstrap.rs"]
+mod snowflake;

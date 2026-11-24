@@ -930,7 +930,7 @@ impl Collector for SnapshotCollector {
 /// `snapshot!`-declared families, then the `custom` ones
 fn encode_snapshot(snap: &MetricsSnapshot, enc: &mut DescriptorEncoder<'_>) -> fmt::Result {
     encode_fields(snap, enc)?;
-    fork::encode_tenants(&snap.tenants, enc)?;
+    tenant::encode_tenants(&snap.tenants, enc)?;
 
     counter_pairs(
         enc,
@@ -1720,7 +1720,7 @@ mod tests {
     }
 }
 
-// k16 fork: per-tenant series live in src/fork/ (see FORK.md)
-#[path = "../fork/ops/metrics.rs"]
-mod fork;
-pub use fork::TenantMetrics;
+// k16 fork: per-tenant series (see FORK.md)
+#[path = "../tenant/ext/ops/metrics.rs"]
+mod tenant;
+pub use tenant::TenantMetrics;

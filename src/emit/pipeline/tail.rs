@@ -265,7 +265,7 @@ pub async fn spawn_with_config(
     config_rx: Option<watch::Receiver<Arc<ResolvedConfig>>>,
     oracle: Option<Arc<crate::ops::oracle::Oracle>>,
 ) -> Result<(mpsc::Sender<BatcherMsg>, AckHandle, TailParts), EmitterError> {
-    if let Some(tail) = fork::snowflake_tail(&dest, &stats, &emitter_ack, &fatal, &oracle) {
+    if let Some(tail) = snowflake::snowflake_tail(&dest, &stats, &emitter_ack, &fatal, &oracle) {
         return Ok(tail);
     }
     let n = inserter_pool_size.max(1);
@@ -387,6 +387,6 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake tail lives in src/fork/ (see FORK.md)
-#[path = "../../fork/emit/pipeline/tail.rs"]
-mod fork;
+// k16 fork: Snowflake tail (see FORK.md)
+#[path = "../../snowflake/ext/emit/pipeline/tail.rs"]
+mod snowflake;
