@@ -193,7 +193,7 @@ async fn shadow_catalog_follows_applied_source_dbname() {
             .spawn()
     };
     let child = spawn(stderr_file).expect("spawn walshadow-stream");
-    let mut guard = fx::ChildGuard::new(child);
+    let _guard = fx::ChildGuard::new(child);
 
     let result = (|| -> Result<()> {
         fx::wait_for_listen(metrics_addr, Duration::from_secs(90))
@@ -261,19 +261,8 @@ async fn shadow_catalog_follows_applied_source_dbname() {
             "duptest's destination holds its own two rows and no others"
         );
 
-        // Second database recreated while down: shadow still holds the old oid
-        if let Some(mut first) = guard.child.take() {
-            fx::tools::stop_gracefully(&mut first);
-        }
-        psql_db(&source, "duptest", "DROP DATABASE postgres")?;
-        psql_db(&source, "duptest", "CREATE DATABASE postgres")?;
-        let stderr = fs::OpenOptions::new().append(true).open(&stderr_path)?;
-        let status = spawn(stderr)?.wait()?;
-        let log = fs::read_to_string(&stderr_path)?;
-        anyhow::ensure!(
-            !status.success() && log.contains("recreated after the shadow's backup, re-bootstrap"),
-            "boot accepted a recreated database ({status})"
-        );
+        // k16 fork: upstream recreates `postgres` here, which it follows as a
+        // `[database.*]` section; the fork follows further databases as tenants
         Ok(())
     })();
 

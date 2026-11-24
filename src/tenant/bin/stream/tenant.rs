@@ -365,10 +365,12 @@ impl Tenant {
                 .with_context(|| format!("tenant {}: drain queueing decoder sink", self.id))?;
         }
         if let Some(pipeline) = self.pipeline.take() {
-            pipeline
-                .join()
-                .await
-                .map_err(|m| anyhow::anyhow!("tenant {}: pipeline drain failed: {m}", self.id))?;
+            pipeline.join().await.map_err(|m| {
+                anyhow::anyhow!(
+                    "tenant {}: decode+insert pipeline drain failed: {m}",
+                    self.id
+                )
+            })?;
         }
         let resume_safe = self.resume_safe().await;
         // Close the floor channel and join: nothing else may own a
