@@ -69,7 +69,7 @@ person reading the file all follow one procedure.
 - The e2e suites pass. `snowflake_live` needs Snowflake credentials, so run it
   by hand when the sync touched the Snowflake path.
 - Every port the PR lists has a reviewer who knows that code: tenants
-  (`tenant.rs`, `session.rs`) or Snowflake (`src/destination/`).
+  (`src/tenant/`, `session.rs`) or Snowflake (`src/snowflake/`).
 
 ## Automating it with Claude
 

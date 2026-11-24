@@ -9,5 +9,4 @@ pub mod oracle;
 pub mod preflight;
 pub mod retention;
 pub mod stages;
-pub mod tenant_ctl;
 pub mod trace;

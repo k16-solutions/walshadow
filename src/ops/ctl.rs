@@ -44,7 +44,7 @@ impl Cli {
     pub fn into_parts(self) -> Result<(PathBuf, Command)> {
         let mut command = self.command.into_command()?;
         if let Some(id) = self.tenant {
-            command = fork::scope_to_tenant(command, &id);
+            command = tenant::scope_to_tenant(command, &id);
         }
         Ok((self.socket, command))
     }
@@ -106,7 +106,7 @@ enum CtlCommand {
     Unset,
     /// Manage tenants: client databases sharing this daemon's slot
     #[command(subcommand)]
-    Tenant(fork::TenantCommand),
+    Tenant(tenant::TenantCommand),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -245,7 +245,7 @@ pub fn render(verb: &str, payload: &str) -> String {
             })
             .unwrap_or_else(|| payload.into()),
         "columns" => render_columns(&root).unwrap_or_else(|| payload.into()),
-        "tenants" => fork::render_tenants(&root).unwrap_or_else(|| payload.into()),
+        "tenants" => tenant::render_tenants(&root).unwrap_or_else(|| payload.into()),
         _ => payload.into(),
     }
 }
@@ -502,6 +502,6 @@ mod tests {
     }
 }
 
-// k16 fork: `ctl tenant` and tenant scoping live in src/fork/ (see FORK.md)
-#[path = "../fork/ops/ctl.rs"]
-mod fork;
+// k16 fork: `ctl tenant` and tenant scoping (see FORK.md)
+#[path = "../tenant/ext/ops/ctl.rs"]
+mod tenant;

@@ -404,10 +404,10 @@ mod tests {
     }
 }
 
-// k16 fork: Snowflake snapshot generations live in src/fork/ (see FORK.md)
-#[path = "../fork/backfill/backfill_staging.rs"]
-mod fork;
-pub(crate) use fork::route_config_matches;
-pub use fork::{
+// k16 fork: Snowflake snapshot generations (see FORK.md)
+#[path = "../snowflake/ext/backfill/backfill_staging.rs"]
+mod snowflake;
+pub(crate) use snowflake::route_config_matches;
+pub use snowflake::{
     SnowflakeSnapshotPlan, SnowflakeSnapshotRel, prepare_snowflake, prepare_snowflake_with_kind,
 };

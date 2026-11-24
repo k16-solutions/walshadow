@@ -49,8 +49,11 @@ mod shadow_proc;
 mod sinks;
 mod source_db;
 mod source_recovery;
-mod tenant;
 mod tracing_setup;
+
+// k16 fork: the tenant feature's half of the binary; see FORK.md
+#[path = "../../tenant/bin/stream/tenant.rs"]
+mod tenant;
 
 use std::num::NonZeroUsize;
 use std::path::Path;
