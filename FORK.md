@@ -33,7 +33,7 @@ Fork-owned files are ours. Edit them freely; upstream has no copy of them.
 | `tests/snowflake_*.rs`, `tests/tenant_*.rs`, `tests/standby_*.rs` | Fork integration tests |
 | `bench/src/snowflake.rs`, `bench/src/qualification.rs`, `bench/src/bin/snowflake_qualify.rs` | Snowflake benchmarks |
 | `charts/walshadow/**`, `.github/workflows/chart.yml` | Helm chart |
-| `config/snowflake.toml`, `docs/snowflake.md`, `docs/tenants.md`, `docs/branching.md`, `docs/upstream-sync.md`, `plans/snowflake*.md`, `FORK.md` | Fork config examples and docs |
+| `config/snowflake.toml`, `docs/snowflake.md`, `docs/tenants.md`, `docs/branching.md`, `docs/upstream-sync.md`, `plans/snowflake*.md`, `FORK.md`, `AGENTS.md` | Fork config examples and docs. `AGENTS.md` (and `.claude/CLAUDE.md`, which imports it) gives coding agents these rules |
 | `scripts/fork/**`, `.github/workflows/upstream-sync.yml`, `.claude/**` | Upstream sync tooling and agent instructions. Upstream's `.gitignore` ignores `.claude/`, so add new files there with `git add -f` |
 
 Every other file is upstream-owned. Change it only to add a hook, and keep the
